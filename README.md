@@ -21,6 +21,26 @@ cargo test --workspace
 
 Run `hsind run` during development, then open the TUI with `hsin` or use the scriptable commands exposed by `hsin --help`.
 
+For frequent local builds, use the host-aware helper. It defaults to a native
+debug build and copies `hsin` and `hsind` into one directory under `artifacts/`:
+
+```zsh
+./scripts/build.sh
+./scripts/build.sh release
+./scripts/build.sh debug macos-x64
+./scripts/build.sh release linux-x64
+./scripts/build.sh --profile release --platform windows-x64
+```
+
+On Windows PowerShell, use the equivalent script:
+
+```powershell
+./scripts/build.ps1
+./scripts/build.ps1 release
+./scripts/build.ps1 release windows-x64
+./scripts/build.ps1 -Profile release -Platform linux-x64
+```
+
 Release archives are produced for:
 
 - `aarch64-apple-darwin`
