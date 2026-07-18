@@ -1,16 +1,84 @@
-# Repository Guidelines
+# AGENTS.md
 
 @/Users/kitsune/.codex/RTK.md
 
-## Architecture invariants
+## Project
 
-- `hsind` is the only owner of SQLite, keyring access, client configuration writes and upstream provider secrets.
-- `hsin` is an IPC client. Its only local side effect is daemon bootstrap/service lifecycle.
-- Never modify client model, MCP, hooks, permissions, profiles, features or sandbox settings.
-- The proxy is loopback-only in v1. Never log secrets, authorization headers, request bodies, recovery keys or databases.
-- Prefix shell commands with `rtk`; use `apply_patch` for targeted file edits.
+`hsin` is a daemon-first provider switcher for Codex and Claude Code.
 
-## Verification
+The Cargo workspace contains:
 
-Run formatting, Clippy and all workspace tests before committing. Configuration patch changes require preservation tests proving that non-owned fields remain byte-for-byte unchanged.
+- `crates/hsin-core`: domain types, validation rules, and stable error codes.
+- `crates/hsin-ipc`: versioned JSON-RPC types and local IPC transport.
+- `crates/hsind`: the daemon and sole persistent-state owner.
+- `crates/hsin`: the CLI and Ratatui TUI.
 
+Version 1 supports direct and loopback-proxy modes on macOS, Linux, and Windows. Tray UI, Gemini, WebDAV, remote proxy binding, and FoxSwitcher migration are out of scope.
+
+## Required Boundaries
+
+- `hsind` exclusively owns SQLite, migrations, backups, keyring access, encrypted provider secrets, configuration writes, proxy routing, and daemon settings.
+- `hsin` communicates with `hsind` through IPC. Its only non-IPC responsibility is daemon bootstrap and service lifecycle commands.
+- Do not add SQLite, keyring, proxy-server, or client-config parsing dependencies to `hsin`.
+- Keep public provider DTOs free of complete credentials. Only the internal `credential.resolve` flow may return credential material.
+- Preserve stable IPC method names, wire enum values, protocol version checks, frame limits, request IDs, and hello negotiation.
+- `HSIN_HOME` instances must remain isolated across storage, IPC, keyring entries, installation markers, and service identities.
+
+## Configuration Ownership
+
+Configuration writes are strict allowlists:
+
+- Codex: only top-level `model_provider` and the complete `[model_providers.hsin]` subtree.
+- Claude Code: only `env.ANTHROPIC_BASE_URL`, `env.ANTHROPIC_API_KEY`, `env.ANTHROPIC_AUTH_TOKEN`, and root `apiKeyHelper`.
+
+Never modify model selection, `ANTHROPIC_MODEL`, MCP servers, hooks, permissions, profiles, features, approval policy, or sandbox settings.
+
+Use source-preserving edits. Any config patch change must retain non-owned fields, comments, ordering, line endings, and Unicode byte-for-byte. Keep CAS checks, file locking, permission preservation, atomic replacement, and saga recovery intact.
+
+## Security
+
+- Never log or print provider secrets, recovery keys, authorization headers, request bodies, databases, or raw sensitive RPC parameters.
+- Keep the proxy bound to loopback. Do not introduce `0.0.0.0` or remote listening in v1.
+- Use `secrecy` and `zeroize` at sensitive in-memory boundaries where supported.
+- Do not fall back to plaintext secret storage when the system keyring is unavailable. The daemon must remain recoverably locked.
+- Keep credential helpers bound to provider identity and revision so stale client configurations cannot obtain a different provider's key.
+- Proxy requests must capture one immutable provider and credential snapshot at request start.
+
+## Rust Style
+
+- Follow the existing Rust 2024 workspace patterns and shared workspace lints.
+- `unsafe_code` is denied.
+- Prefer existing domain DTOs and error codes over new ad hoc JSON shapes.
+- Keep daemon mutations serialized and SQLite writes transactional.
+- Avoid unrelated refactors, dependency churn, or generated metadata changes.
+- Use `apply_patch` for targeted edits.
+
+## Commands
+
+Prefix shell commands with `rtk` as required by `/Users/kitsune/.codex/RTK.md`.
+
+Required local gates:
+
+```zsh
+rtk cargo fmt --all -- --check
+rtk cargo clippy --workspace --all-targets -- -D warnings
+rtk cargo test --workspace
+```
+
+Relevant cross-target checks:
+
+```zsh
+rtk cargo check --workspace --all-targets --target x86_64-apple-darwin
+rtk cargo zigbuild --workspace --all-targets --target x86_64-unknown-linux-gnu
+rtk cargo zigbuild --workspace --all-targets --target aarch64-unknown-linux-gnu
+rtk cargo xwin check --workspace --all-targets --target x86_64-pc-windows-msvc
+```
+
+Configuration, IPC, crypto, proxy, service, or database changes require focused tests in addition to the workspace gates. Use temporary `HSIN_HOME`, `CODEX_HOME`, and `CLAUDE_CONFIG_DIR` values for integration tests, and remove test keyring entries afterward.
+
+## Git
+
+- Preserve unrelated user changes in a dirty worktree.
+- Do not use destructive reset or checkout commands.
+- Use English Conventional Commit messages, for example `feat: add tui settings menu` or `fix: preserve config comments`.
+- Do not invent a license, repository URL, release tag, or public package metadata without explicit user approval.
