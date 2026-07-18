@@ -1,0 +1,587 @@
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    str::FromStr,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use parking_lot::Mutex;
+use rusqlite::{Connection, DatabaseName, OptionalExtension, TransactionBehavior, params};
+
+use crate::{
+    error::{DaemonError, Result},
+    model::{AuthScheme, ClientKind, ClientState, ConnectionMode, Provider, ProviderInput},
+};
+
+const SCHEMA_VERSION: i64 = 1;
+
+pub struct Database {
+    connection: Mutex<Connection>,
+}
+
+pub type KeyRecord = (u32, Vec<u8>, Vec<u8>);
+pub type PendingOperation = (String, ClientKind, Option<String>, String);
+
+#[derive(Debug, Clone)]
+pub struct EncryptedSecret {
+    pub provider_id: String,
+    pub key_version: u32,
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+}
+
+impl Database {
+    pub fn open(path: &Path, backup_dir: &Path) -> Result<Self> {
+        if path.exists() {
+            let version = database_version(path)?;
+            if version > SCHEMA_VERSION {
+                return Err(DaemonError::UnsupportedDatabaseVersion(version));
+            }
+            backup_before_migration(path, backup_dir)?;
+        }
+        let connection = Connection::open(path)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;",
+        )?;
+        migrate(&connection)?;
+        Ok(Self {
+            connection: Mutex::new(connection),
+        })
+    }
+
+    pub fn list_providers(&self, client: Option<ClientKind>) -> Result<Vec<Provider>> {
+        let connection = self.connection.lock();
+        let mut output = Vec::new();
+        if let Some(client) = client {
+            let mut statement = connection.prepare("SELECT id, client, name, base_url, auth_scheme, revision FROM providers WHERE client=?1 ORDER BY lower(name)")?;
+            let rows = statement.query_map([client.to_string()], provider_from_row)?;
+            for row in rows {
+                output.push(row?);
+            }
+        } else {
+            let mut statement = connection.prepare("SELECT id, client, name, base_url, auth_scheme, revision FROM providers ORDER BY client, lower(name)")?;
+            let rows = statement.query_map([], provider_from_row)?;
+            for row in rows {
+                output.push(row?);
+            }
+        }
+        Ok(output)
+    }
+
+    pub fn get_provider(&self, id: &str) -> Result<Provider> {
+        self.connection.lock().query_row(
+            "SELECT id, client, name, base_url, auth_scheme, revision FROM providers WHERE id=?1",
+            [id], provider_from_row,
+        ).optional()?.ok_or_else(|| DaemonError::NotFound(format!("provider {id}")))
+    }
+
+    pub fn add_provider(&self, input: &ProviderInput) -> Result<Provider> {
+        let provider = Self::new_provider(input)?;
+        self.insert_provider(&provider, None)?;
+        Ok(provider)
+    }
+
+    pub fn new_provider(input: &ProviderInput) -> Result<Provider> {
+        input.validate()?;
+        Ok(Provider {
+            id: uuid::Uuid::new_v4().to_string(),
+            client: input.client,
+            name: input.name.trim().to_owned(),
+            base_url: input.base_url.trim().trim_end_matches('/').to_owned(),
+            auth_scheme: input.auth_scheme,
+            revision: 1,
+        })
+    }
+
+    pub fn insert_provider(
+        &self,
+        provider: &Provider,
+        secret: Option<&EncryptedSecret>,
+    ) -> Result<()> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = unix_time()?;
+        transaction.execute(
+            "INSERT INTO providers(id,client,name,base_url,auth_scheme,revision,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
+            params![provider.id, provider.client.to_string(), provider.name, provider.base_url, provider.auth_scheme.to_string(), provider.revision, now],
+        ).map_err(map_constraint)?;
+        if let Some(secret) = secret {
+            upsert_secret(&transaction, secret, now)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn update_provider(
+        &self,
+        provider: &Provider,
+        expected_revision: u64,
+        secret: Option<&EncryptedSecret>,
+    ) -> Result<()> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = unix_time()?;
+        let changed = transaction.execute(
+            "UPDATE providers SET name=?1,base_url=?2,auth_scheme=?3,revision=revision+1,updated_at=?4 WHERE id=?5 AND client=?6 AND revision=?7",
+            params![provider.name, provider.base_url, provider.auth_scheme.to_string(), now, provider.id, provider.client.to_string(), expected_revision],
+        ).map_err(map_constraint)?;
+        if changed == 0 {
+            return Err(DaemonError::Conflict(
+                "provider changed or was removed".into(),
+            ));
+        }
+        if let Some(secret) = secret {
+            upsert_secret(&transaction, secret, now)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn remove_provider(&self, id: &str) -> Result<()> {
+        let connection = self.connection.lock();
+        let transaction = connection.unchecked_transaction()?;
+        let active: i64 = transaction.query_row(
+            "SELECT count(*) FROM client_state WHERE active_provider_id=?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        if active > 0 {
+            return Err(DaemonError::Conflict(
+                "active provider cannot be removed".into(),
+            ));
+        }
+        if transaction.execute("DELETE FROM providers WHERE id=?1", [id])? == 0 {
+            return Err(DaemonError::NotFound(format!("provider {id}")));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn client_state(&self, client: ClientKind) -> Result<ClientState> {
+        self.connection
+            .lock()
+            .query_row(
+                "SELECT active_provider_id,mode,config_status FROM client_state WHERE client=?1",
+                [client.to_string()],
+                |row| {
+                    let mode: String = row.get(1)?;
+                    let status: String = row.get(2)?;
+                    Ok(ClientState {
+                        client,
+                        active_provider_id: row.get(0)?,
+                        mode: ConnectionMode::from_str(&mode).map_err(parse_to_sql_error)?,
+                        config_status: parse_config_status(&status).map_err(to_sql_error)?,
+                    })
+                },
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn set_active(
+        &self,
+        client: ClientKind,
+        provider_id: &str,
+        config_status: &str,
+    ) -> Result<()> {
+        let provider = self.get_provider(provider_id)?;
+        if provider.client != client {
+            return Err(DaemonError::Invalid(
+                "provider belongs to a different client".into(),
+            ));
+        }
+        self.connection.lock().execute(
+            "UPDATE client_state SET active_provider_id=?1,config_status=?2,updated_at=?3 WHERE client=?4",
+            params![provider_id, config_status, unix_time()?, client.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_mode(&self, client: ClientKind, mode: ConnectionMode) -> Result<()> {
+        self.connection.lock().execute(
+            "UPDATE client_state SET mode=?1,updated_at=?2 WHERE client=?3",
+            params![mode.to_string(), unix_time()?, client.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_config_status(&self, client: ClientKind, status: &str) -> Result<()> {
+        self.connection.lock().execute(
+            "UPDATE client_state SET config_status=?1,updated_at=?2 WHERE client=?3",
+            params![status, unix_time()?, client.to_string()],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn put_secret(&self, secret: &EncryptedSecret) -> Result<()> {
+        self.connection.lock().execute(
+            "INSERT INTO provider_secrets(provider_id,key_version,nonce,ciphertext,updated_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(provider_id) DO UPDATE SET key_version=excluded.key_version,nonce=excluded.nonce,ciphertext=excluded.ciphertext,updated_at=excluded.updated_at",
+            params![secret.provider_id, secret.key_version, secret.nonce, secret.ciphertext, unix_time()?],
+        )?;
+        Ok(())
+    }
+
+    pub fn secret(&self, provider_id: &str) -> Result<EncryptedSecret> {
+        self.connection.lock().query_row(
+            "SELECT provider_id,key_version,nonce,ciphertext FROM provider_secrets WHERE provider_id=?1", [provider_id],
+            |row| Ok(EncryptedSecret { provider_id: row.get(0)?, key_version: row.get(1)?, nonce: row.get(2)?, ciphertext: row.get(3)? }),
+        ).optional()?.ok_or_else(|| DaemonError::NotFound("provider credential".into()))
+    }
+
+    pub fn bound_secret(
+        &self,
+        client: ClientKind,
+        provider_id: &str,
+        revision: u64,
+    ) -> Result<(Provider, EncryptedSecret)> {
+        self.connection
+            .lock()
+            .query_row(
+                "SELECT p.id,p.client,p.name,p.base_url,p.auth_scheme,p.revision,s.provider_id,s.key_version,s.nonce,s.ciphertext FROM providers p JOIN provider_secrets s ON s.provider_id=p.id WHERE p.id=?1 AND p.client=?2 AND p.revision=?3",
+                params![provider_id, client.to_string(), revision],
+                provider_secret_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| DaemonError::Conflict("credential provider binding is stale".into()))
+    }
+
+    pub fn active_secret(&self, client: ClientKind) -> Result<(Provider, EncryptedSecret)> {
+        self.connection
+            .lock()
+            .query_row(
+                "SELECT p.id,p.client,p.name,p.base_url,p.auth_scheme,p.revision,s.provider_id,s.key_version,s.nonce,s.ciphertext FROM client_state c JOIN providers p ON p.id=c.active_provider_id JOIN provider_secrets s ON s.provider_id=p.id WHERE c.client=?1 AND p.client=?1",
+                [client.to_string()],
+                provider_secret_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| DaemonError::NotFound("active provider credential".into()))
+    }
+
+    pub fn all_secrets(&self) -> Result<Vec<EncryptedSecret>> {
+        let connection = self.connection.lock();
+        let mut statement = connection
+            .prepare("SELECT provider_id,key_version,nonce,ciphertext FROM provider_secrets")?;
+        let rows = statement.query_map([], |row| {
+            Ok(EncryptedSecret {
+                provider_id: row.get(0)?,
+                key_version: row.get(1)?,
+                nonce: row.get(2)?,
+                ciphertext: row.get(3)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn replace_secrets_and_key(
+        &self,
+        secrets: &[EncryptedSecret],
+        old_version: u32,
+        version: u32,
+        verifier_nonce: &[u8],
+        verifier: &[u8],
+    ) -> Result<()> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for secret in secrets {
+            transaction.execute("UPDATE provider_secrets SET key_version=?1,nonce=?2,ciphertext=?3,updated_at=?4 WHERE provider_id=?5", params![secret.key_version,secret.nonce,secret.ciphertext,unix_time()?,secret.provider_id])?;
+        }
+        transaction.execute("INSERT INTO encryption_keys(version,verifier_nonce,verifier,created_at,is_current) VALUES(?1,?2,?3,?4,1)", params![version,verifier_nonce,verifier,unix_time()?])?;
+        transaction.execute(
+            "UPDATE encryption_keys SET is_current=0 WHERE version<>?1",
+            [version],
+        )?;
+        transaction.execute(
+            "INSERT INTO settings(key,value,updated_at) VALUES('key_cleanup_pending',?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+            params![old_version.to_string(), unix_time()?],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn current_key_record(&self) -> Result<Option<KeyRecord>> {
+        self.connection
+            .lock()
+            .query_row(
+                "SELECT version,verifier_nonce,verifier FROM encryption_keys WHERE is_current=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn initialize_key_record(&self, version: u32, nonce: &[u8], verifier: &[u8]) -> Result<()> {
+        self.connection.lock().execute("INSERT OR IGNORE INTO encryption_keys(version,verifier_nonce,verifier,created_at,is_current) VALUES(?1,?2,?3,?4,1)", params![version,nonce,verifier,unix_time()?])?;
+        Ok(())
+    }
+
+    pub fn setting(&self, key: &str) -> Result<Option<String>> {
+        self.connection
+            .lock()
+            .query_row("SELECT value FROM settings WHERE key=?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.connection.lock().execute("INSERT INTO settings(key,value,updated_at) VALUES(?1,?2,?3) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", params![key,value,unix_time()?])?;
+        Ok(())
+    }
+
+    pub fn begin_operation(
+        &self,
+        kind: &str,
+        client: ClientKind,
+        before_hash: Option<&str>,
+        target_json: &str,
+    ) -> Result<String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.connection.lock().execute("INSERT INTO operations(id,kind,client,state,before_hash,target_json,created_at,updated_at) VALUES(?1,?2,?3,'pending',?4,?5,?6,?6)", params![id,kind,client.to_string(),before_hash,target_json,unix_time()?])?;
+        Ok(id)
+    }
+
+    pub fn finish_operation(&self, id: &str, state: &str, error: Option<&str>) -> Result<()> {
+        self.connection.lock().execute(
+            "UPDATE operations SET state=?1,error=?2,updated_at=?3 WHERE id=?4",
+            params![state, error, unix_time()?, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn pending_operations(&self) -> Result<Vec<PendingOperation>> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare("SELECT id,client,before_hash,target_json FROM operations WHERE state='pending' ORDER BY created_at")?;
+        let rows = statement.query_map([], |row| {
+            let client: String = row.get(1)?;
+            Ok((
+                row.get(0)?,
+                ClientKind::from_str(&client).map_err(parse_to_sql_error)?,
+                row.get(2)?,
+                row.get(3)?,
+            ))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn integrity_check(&self) -> Result<String> {
+        self.connection
+            .lock()
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .map_err(Into::into)
+    }
+}
+
+fn migrate(connection: &Connection) -> Result<()> {
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        return Err(DaemonError::UnsupportedDatabaseVersion(version));
+    }
+    if version == SCHEMA_VERSION {
+        return Ok(());
+    }
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY,client TEXT NOT NULL CHECK(client IN ('codex','claude')),name TEXT NOT NULL,base_url TEXT NOT NULL,auth_scheme TEXT NOT NULL CHECK(auth_scheme IN ('bearer','x_api_key')),revision INTEGER NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(client,name));
+         CREATE TABLE IF NOT EXISTS provider_secrets(provider_id TEXT PRIMARY KEY REFERENCES providers(id) ON DELETE CASCADE,key_version INTEGER NOT NULL,nonce BLOB NOT NULL,ciphertext BLOB NOT NULL,updated_at INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS client_state(client TEXT PRIMARY KEY CHECK(client IN ('codex','claude')),active_provider_id TEXT REFERENCES providers(id),mode TEXT NOT NULL CHECK(mode IN ('direct','proxy')),config_status TEXT NOT NULL,updated_at INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,kind TEXT NOT NULL,client TEXT NOT NULL,state TEXT NOT NULL,before_hash TEXT,target_json TEXT NOT NULL,error TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS encryption_keys(version INTEGER PRIMARY KEY,verifier_nonce BLOB NOT NULL,verifier BLOB NOT NULL,created_at INTEGER NOT NULL,is_current INTEGER NOT NULL);
+         INSERT OR IGNORE INTO client_state(client,mode,config_status,updated_at) VALUES('codex','direct','unmanaged',0),('claude','direct','unmanaged',0);
+         INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES('language','en-US',0),('proxy_port','9999',0);
+         PRAGMA user_version=1;
+         COMMIT;"
+    )?;
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != SCHEMA_VERSION {
+        return Err(DaemonError::Database(rusqlite::Error::InvalidQuery));
+    }
+    Ok(())
+}
+
+fn database_version(path: &Path) -> Result<i64> {
+    let connection = Connection::open(path)?;
+    connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(Into::into)
+}
+
+fn upsert_secret(
+    transaction: &rusqlite::Transaction<'_>,
+    secret: &EncryptedSecret,
+    now: i64,
+) -> rusqlite::Result<()> {
+    transaction.execute(
+        "INSERT INTO provider_secrets(provider_id,key_version,nonce,ciphertext,updated_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(provider_id) DO UPDATE SET key_version=excluded.key_version,nonce=excluded.nonce,ciphertext=excluded.ciphertext,updated_at=excluded.updated_at",
+        params![secret.provider_id, secret.key_version, secret.nonce, secret.ciphertext, now],
+    )?;
+    Ok(())
+}
+
+fn backup_before_migration(path: &Path, backup_dir: &Path) -> Result<()> {
+    fs::create_dir_all(backup_dir)?;
+    let source = Connection::open(path)?;
+    let version: i64 = source
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap_or(0);
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    let backup = backup_dir.join(format!("hsin-{}.sqlite3", unix_time()?));
+    source.backup(DatabaseName::Main, &backup, None)?;
+    prune_backups(backup_dir)?;
+    Ok(())
+}
+
+fn prune_backups(directory: &Path) -> Result<()> {
+    let mut paths: Vec<PathBuf> = fs::read_dir(directory)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "sqlite3"))
+        .collect();
+    paths.sort();
+    let remove_count = paths.len().saturating_sub(3);
+    for path in paths.into_iter().take(remove_count) {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn provider_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Provider> {
+    let client: String = row.get(1)?;
+    let auth: String = row.get(4)?;
+    Ok(Provider {
+        id: row.get(0)?,
+        client: ClientKind::from_str(&client).map_err(parse_to_sql_error)?,
+        name: row.get(2)?,
+        base_url: row.get(3)?,
+        auth_scheme: AuthScheme::from_str(&auth).map_err(parse_to_sql_error)?,
+        revision: row.get(5)?,
+    })
+}
+
+fn provider_secret_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(Provider, EncryptedSecret)> {
+    let provider = provider_from_row(row)?;
+    let secret = EncryptedSecret {
+        provider_id: row.get(6)?,
+        key_version: row.get(7)?,
+        nonce: row.get(8)?,
+        ciphertext: row.get(9)?,
+    };
+    Ok((provider, secret))
+}
+
+fn to_sql_error(error: DaemonError) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+}
+fn parse_to_sql_error(error: hsin_core::ParseEnumError) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+}
+fn parse_config_status(value: &str) -> Result<crate::model::ConfigStatus> {
+    match value {
+        "unmanaged" => Ok(crate::model::ConfigStatus::Unmanaged),
+        "synchronized" | "managed" => Ok(crate::model::ConfigStatus::Synchronized),
+        "drifted" => Ok(crate::model::ConfigStatus::Drifted),
+        "conflict" => Ok(crate::model::ConfigStatus::Conflict),
+        "unavailable" => Ok(crate::model::ConfigStatus::Unavailable),
+        _ => Err(DaemonError::Database(rusqlite::Error::InvalidQuery)),
+    }
+}
+fn map_constraint(error: rusqlite::Error) -> DaemonError {
+    if matches!(error, rusqlite::Error::SqliteFailure(ref inner, _) if inner.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE)
+    {
+        DaemonError::Conflict("provider name already exists for this client".into())
+    } else {
+        DaemonError::Database(error)
+    }
+}
+fn unix_time() -> Result<i64> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| DaemonError::Internal(error.to_string()))?
+        .as_secs();
+    i64::try_from(seconds)
+        .map_err(|_| DaemonError::Internal("system time exceeds SQLite integer range".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_and_provider_crud() {
+        let root = std::env::temp_dir().join(format!("hsind-db-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let db = Database::open(&root.join("db.sqlite"), &root.join("backups")).unwrap();
+        assert_eq!(db.integrity_check().unwrap(), "ok");
+        let provider = db
+            .add_provider(&ProviderInput {
+                client: ClientKind::Codex,
+                name: "Test".into(),
+                base_url: "https://example.test/v1".into(),
+                auth_scheme: AuthScheme::Bearer,
+            })
+            .unwrap();
+        assert_eq!(provider.revision, 1);
+        let second = Database::new_provider(&ProviderInput {
+            client: ClientKind::Claude,
+            name: "Atomic".into(),
+            base_url: "https://example.test".into(),
+            auth_scheme: AuthScheme::XApiKey,
+        })
+        .unwrap();
+        let encrypted = EncryptedSecret {
+            provider_id: second.id.clone(),
+            key_version: 1,
+            nonce: vec![0; 24],
+            ciphertext: vec![1, 2, 3],
+        };
+        db.insert_provider(&second, Some(&encrypted)).unwrap();
+        assert_eq!(db.secret(&second.id).unwrap().ciphertext, vec![1, 2, 3]);
+        let (_, snapshot) = db.bound_secret(ClientKind::Claude, &second.id, 1).unwrap();
+        assert_eq!(snapshot.ciphertext, vec![1, 2, 3]);
+        let updated = Provider {
+            revision: 2,
+            base_url: "https://updated.example.test".into(),
+            ..second.clone()
+        };
+        let replacement = EncryptedSecret {
+            provider_id: second.id.clone(),
+            key_version: 1,
+            nonce: vec![2; 24],
+            ciphertext: vec![4, 5, 6],
+        };
+        db.update_provider(&updated, 1, Some(&replacement)).unwrap();
+        assert!(db.bound_secret(ClientKind::Claude, &second.id, 1).is_err());
+        let (snapshot_provider, snapshot) =
+            db.bound_secret(ClientKind::Claude, &second.id, 2).unwrap();
+        assert_eq!(snapshot_provider.base_url, updated.base_url);
+        assert_eq!(snapshot.ciphertext, vec![4, 5, 6]);
+        db.set_active(ClientKind::Codex, &provider.id, "managed")
+            .unwrap();
+        assert!(db.remove_provider(&provider.id).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn future_schema_is_rejected_without_downgrade() {
+        let root = std::env::temp_dir().join(format!("hsind-future-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("db.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection.pragma_update(None, "user_version", 99).unwrap();
+        drop(connection);
+        assert!(matches!(
+            Database::open(&path, &root.join("backups")),
+            Err(DaemonError::UnsupportedDatabaseVersion(99))
+        ));
+        assert_eq!(database_version(&path).unwrap(), 99);
+        fs::remove_dir_all(root).unwrap();
+    }
+}

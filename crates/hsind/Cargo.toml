@@ -3,12 +3,41 @@ name = "hsind"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
 
 [dependencies]
 hsin-core = { path = "../hsin-core" }
 hsin-ipc = { path = "../hsin-ipc" }
+anyhow = "1"
+atomic-write-file = "0.3"
+axum = "0.8"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+clap = { version = "4", features = ["derive"] }
+directories = "6"
+fs2 = "0.4"
+futures-util = "0.3"
+hex = "0.4"
+http-body-util = "0.1"
+interprocess = { version = "2.4.2", features = ["tokio"] }
+jsonc-parser = { version = "0.26", features = ["serde"] }
+keyring = "4.1"
+parking_lot = "0.12"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+rusqlite = { version = "0.32", features = ["backup", "bundled"] }
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+toml_edit = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+zeroize = { version = "1", features = ["derive"] }
 
 [[bin]]
 name = "hsind"
@@ -16,4 +45,3 @@ path = "src/main.rs"
 
 [lints]
 workspace = true
-

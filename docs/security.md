@@ -1,0 +1,10 @@
+# Security model
+
+- IPC endpoints are available only to the current operating-system user and validate the peer identity where supported.
+- Provider secrets are encrypted with XChaCha20-Poly1305. SQLite stores ciphertext and key-check metadata; the operating-system keyring stores versioned master keys.
+- Recovery keys are shown only on explicit export, accepted through hidden input or stdin, and never written to logs.
+- Ordinary RPC responses expose masked previews only. The credential-helper RPC is the single narrow API that may return secret material.
+- The proxy binds to IPv4 loopback only and validates a per-client capability token before replacing inbound authentication with the upstream credential.
+- Request bodies, authorization headers, provider secrets, recovery keys and raw IPC parameters are excluded from tracing.
+- If the system keyring is unavailable, the daemon enters a locked state instead of falling back to plaintext storage.
+

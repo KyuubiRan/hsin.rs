@@ -1,5 +1,590 @@
-//! Domain types and business rules shared by hsin processes.
+//! Domain types and business rules shared by the hsin CLI and daemon.
+//!
+//! This crate intentionally contains no storage, operating-system, or transport
+//! code. In particular, [`Provider`] never carries provider credentials.
+
+use std::{collections::BTreeMap, error::Error, fmt, str::FromStr};
+
+use serde::{Deserialize, Serialize};
+use url::Url;
 
 /// Wire protocol version implemented by this workspace.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// A stable identifier for an AI client whose provider hsin can manage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientKind {
+    Codex,
+    #[serde(rename = "claude")]
+    Claude,
+}
+
+impl ClientKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+}
+
+impl fmt::Display for ClientKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ClientKind {
+    type Err = ParseEnumError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "codex" => Ok(Self::Codex),
+            "claude" | "claude-code" | "claude_code" => Ok(Self::Claude),
+            _ => Err(ParseEnumError::new("client", value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionMode {
+    Direct,
+    Proxy,
+}
+
+impl ConnectionMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Proxy => "proxy",
+        }
+    }
+}
+
+impl fmt::Display for ConnectionMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ConnectionMode {
+    type Err = ParseEnumError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "direct" => Ok(Self::Direct),
+            "proxy" => Ok(Self::Proxy),
+            _ => Err(ParseEnumError::new("connection_mode", value)),
+        }
+    }
+}
+
+/// Authentication header style used by an upstream provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthScheme {
+    Bearer,
+    XApiKey,
+}
+
+impl AuthScheme {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bearer => "bearer",
+            Self::XApiKey => "x_api_key",
+        }
+    }
+}
+
+impl fmt::Display for AuthScheme {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for AuthScheme {
+    type Err = ParseEnumError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "bearer" => Ok(Self::Bearer),
+            "x_api_key" | "x-api-key" | "xapikey" => Ok(Self::XApiKey),
+            _ => Err(ParseEnumError::new("auth_scheme", value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigStatus {
+    Unmanaged,
+    Synchronized,
+    Drifted,
+    Conflict,
+    Unavailable,
+}
+
+/// Public provider metadata. Credentials are deliberately stored separately.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provider {
+    pub id: String,
+    pub client: ClientKind,
+    pub name: String,
+    pub base_url: String,
+    pub auth_scheme: AuthScheme,
+    pub revision: u64,
+}
+
+impl Provider {
+    /// Validate untrusted provider data at a process boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] when the ID or provider draft is invalid.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.id.trim().is_empty() {
+            return Err(ValidationError::new("id", "empty"));
+        }
+        ProviderDraft {
+            client: self.client,
+            name: self.name.clone(),
+            base_url: self.base_url.clone(),
+            auth_scheme: self.auth_scheme,
+        }
+        .validate()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderDraft {
+    pub client: ClientKind,
+    pub name: String,
+    pub base_url: String,
+    pub auth_scheme: AuthScheme,
+}
+
+impl ProviderDraft {
+    /// Validate a provider name and upstream HTTP(S) URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] for an empty/oversized name, malformed URL,
+    /// embedded URL credentials, a non-HTTP scheme, or a URL fragment.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let name = self.name.trim();
+        if name.is_empty() {
+            return Err(ValidationError::new("name", "empty"));
+        }
+        if name.chars().count() > 128 {
+            return Err(ValidationError::new("name", "too_long"));
+        }
+
+        let url = Url::parse(self.base_url.trim())
+            .map_err(|_| ValidationError::new("base_url", "invalid_url"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(ValidationError::new("base_url", "unsupported_scheme"));
+        }
+        if url.host_str().is_none() {
+            return Err(ValidationError::new("base_url", "missing_host"));
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(ValidationError::new("base_url", "embedded_credentials"));
+        }
+        if url.fragment().is_some() {
+            return Err(ValidationError::new("base_url", "fragment_not_allowed"));
+        }
+        if url.query().is_some() {
+            return Err(ValidationError::new("base_url", "query_not_allowed"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_scheme: Option<AuthScheme>,
+}
+
+/// How an RPC should update an existing secret.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum SecretInput {
+    Preserve,
+    Replace(String),
+    Clear,
+}
+
+impl fmt::Debug for SecretInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Preserve => f.write_str("Preserve"),
+            Self::Replace(_) => f.write_str("Replace([REDACTED])"),
+            Self::Clear => f.write_str("Clear"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<ClientKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderAddParams {
+    pub provider: ProviderDraft,
+    pub secret: SecretInput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderEditParams {
+    pub id: String,
+    pub expected_revision: u64,
+    pub patch: ProviderPatch,
+    pub secret: SecretInput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRemoveParams {
+    pub id: String,
+    pub expected_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSwitchParams {
+    pub client: ClientKind,
+    pub provider_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportCurrentParams {
+    pub client: ClientKind,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModeSetParams {
+    pub client: ClientKind,
+    pub mode: ConnectionMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientState {
+    pub client: ClientKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_provider_id: Option<String>,
+    pub mode: ConnectionMode,
+    pub config_status: ConfigStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonStatus {
+    pub version: String,
+    pub locked: bool,
+    pub proxy_listening: bool,
+    pub proxy_address: String,
+    pub clients: Vec<ClientState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Settings {
+    pub language: String,
+    pub proxy_host: String,
+    pub proxy_port: u16,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            language: "en-US".into(),
+            proxy_host: "127.0.0.1".into(),
+            proxy_port: 9999,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingsPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyStoreState {
+    Unlocked,
+    Locked,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityStatus {
+    pub key_store: KeyStoreState,
+    pub key_version: u32,
+    pub recovery_key_configured: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoctorSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoctorFinding {
+    pub code: String,
+    pub severity: DoctorSeverity,
+    #[serde(default)]
+    pub args: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoctorReport {
+    pub healthy: bool,
+    pub findings: Vec<DoctorFinding>,
+}
+
+/// Stable, localizable application error codes shared by all frontends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    InvalidArgument,
+    NotFound,
+    AlreadyExists,
+    RevisionConflict,
+    ConfigConflict,
+    ConfigUnavailable,
+    KeyStoreLocked,
+    KeyStoreUnavailable,
+    AuthenticationFailed,
+    PermissionDenied,
+    ProtocolMismatch,
+    FrameTooLarge,
+    Timeout,
+    DaemonUnavailable,
+    Internal,
+}
+
+impl ErrorCode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidArgument => "invalid_argument",
+            Self::NotFound => "not_found",
+            Self::AlreadyExists => "already_exists",
+            Self::RevisionConflict => "revision_conflict",
+            Self::ConfigConflict => "config_conflict",
+            Self::ConfigUnavailable => "config_unavailable",
+            Self::KeyStoreLocked => "key_store_locked",
+            Self::KeyStoreUnavailable => "key_store_unavailable",
+            Self::AuthenticationFailed => "authentication_failed",
+            Self::PermissionDenied => "permission_denied",
+            Self::ProtocolMismatch => "protocol_mismatch",
+            Self::FrameTooLarge => "frame_too_large",
+            Self::Timeout => "timeout",
+            Self::DaemonUnavailable => "daemon_unavailable",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+impl fmt::Display for ErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Error payload suitable for localization at the presentation layer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppError {
+    pub code: ErrorCode,
+    #[serde(default)]
+    pub args: BTreeMap<String, String>,
+    pub retryable: bool,
+}
+
+impl AppError {
+    #[must_use]
+    pub fn new(code: ErrorCode) -> Self {
+        Self {
+            code,
+            args: BTreeMap::new(),
+            retryable: false,
+        }
+    }
+
+    #[must_use]
+    pub fn with_arg(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.args.insert(key.into(), value.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn retryable(mut self, retryable: bool) -> Self {
+        self.retryable = retryable;
+        self
+    }
+}
+
+impl fmt::Display for AppError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.code)
+    }
+}
+
+impl Error for AppError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseEnumError {
+    kind: &'static str,
+    value: String,
+}
+
+impl ParseEnumError {
+    fn new(kind: &'static str, value: &str) -> Self {
+        Self {
+            kind,
+            value: value.into(),
+        }
+    }
+}
+
+impl fmt::Display for ParseEnumError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unknown {} value {:?}", self.kind, self.value)
+    }
+}
+
+impl Error for ParseEnumError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationError {
+    pub field: &'static str,
+    pub reason: &'static str,
+}
+
+impl ValidationError {
+    #[must_use]
+    pub const fn new(field: &'static str, reason: &'static str) -> Self {
+        Self { field, reason }
+    }
+}
+
+impl fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid {}: {}", self.field, self.reason)
+    }
+}
+
+impl Error for ValidationError {}
+
+impl From<ValidationError> for AppError {
+    fn from(value: ValidationError) -> Self {
+        Self::new(ErrorCode::InvalidArgument)
+            .with_arg("field", value.field)
+            .with_arg("reason", value.reason)
+    }
+}
+
+/// Serialize a value to a JSON object, useful for assembling error arguments.
+///
+/// # Errors
+///
+/// Returns [`AppError`] if serialization fails or the value is not an object.
+pub fn json_object<T: Serialize>(
+    value: T,
+) -> Result<BTreeMap<String, serde_json::Value>, AppError> {
+    match serde_json::to_value(value).map_err(|_| AppError::new(ErrorCode::Internal))? {
+        serde_json::Value::Object(object) => Ok(object.into_iter().collect()),
+        _ => {
+            Err(AppError::new(ErrorCode::InvalidArgument)
+                .with_arg("reason", "expected_json_object"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enums_have_stable_wire_and_cli_names() {
+        assert_eq!(ClientKind::from_str("claude-code"), Ok(ClientKind::Claude));
+        assert_eq!(ConnectionMode::from_str("PROXY"), Ok(ConnectionMode::Proxy));
+        assert_eq!(AuthScheme::from_str("x-api-key"), Ok(AuthScheme::XApiKey));
+        assert_eq!(
+            serde_json::to_string(&ClientKind::Claude).unwrap(),
+            "\"claude\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AuthScheme::XApiKey).unwrap(),
+            "\"x_api_key\""
+        );
+    }
+
+    #[test]
+    fn provider_validation_rejects_unsafe_urls() {
+        let valid = ProviderDraft {
+            client: ClientKind::Codex,
+            name: "Example".into(),
+            base_url: "https://api.example.com/v1".into(),
+            auth_scheme: AuthScheme::Bearer,
+        };
+        assert!(valid.validate().is_ok());
+
+        let mut invalid = valid.clone();
+        invalid.base_url = "https://token@example.com/v1".into();
+        assert_eq!(
+            invalid.validate(),
+            Err(ValidationError::new("base_url", "embedded_credentials"))
+        );
+
+        invalid.base_url = "file:///tmp/upstream".into();
+        assert_eq!(
+            invalid.validate(),
+            Err(ValidationError::new("base_url", "unsupported_scheme"))
+        );
+
+        invalid.base_url = "https://api.example.com/v1?tenant=other".into();
+        assert_eq!(
+            invalid.validate(),
+            Err(ValidationError::new("base_url", "query_not_allowed"))
+        );
+    }
+
+    #[test]
+    fn secret_debug_output_is_redacted() {
+        let secret = SecretInput::Replace("never-print-me".into());
+        assert_eq!(format!("{secret:?}"), "Replace([REDACTED])");
+        assert!(!format!("{secret:?}").contains("never-print-me"));
+    }
+
+    #[test]
+    fn app_error_uses_stable_shape() {
+        let error = AppError::new(ErrorCode::RevisionConflict)
+            .with_arg("expected", "3")
+            .retryable(true);
+        assert_eq!(
+            serde_json::to_value(error).unwrap(),
+            serde_json::json!({
+                "code": "revision_conflict",
+                "args": {"expected": "3"},
+                "retryable": true
+            })
+        );
+    }
+}
