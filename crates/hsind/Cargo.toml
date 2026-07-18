@@ -1,0 +1,19 @@
+[package]
+name = "hsind"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hsin-core = { path = "../hsin-core" }
+hsin-ipc = { path = "../hsin-ipc" }
+
+[[bin]]
+name = "hsind"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
