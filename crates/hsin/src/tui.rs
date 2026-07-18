@@ -166,6 +166,9 @@ enum InputMode {
         id: String,
         revision: u64,
     },
+    Settings {
+        selected: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -292,6 +295,39 @@ impl State {
                 }
                 self.input = InputMode::Normal;
             }
+            InputMode::Settings { selected } => match key.code {
+                KeyCode::Esc | KeyCode::Char('o') => self.input = InputMode::Normal,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    *selected = selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *selected = (*selected + 1).min(1);
+                }
+                KeyCode::Enter | KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => {
+                    self.pending_effect = Some(if *selected == 0 {
+                        let mode = match self.client {
+                            ClientKind::Codex => self.status.codex_mode,
+                            ClientKind::Claude => self.status.claude_mode,
+                        };
+                        Effect::SetMode {
+                            client: self.client,
+                            mode: match mode {
+                                ConnectionMode::Direct => ConnectionMode::Proxy,
+                                ConnectionMode::Proxy => ConnectionMode::Direct,
+                            },
+                        }
+                    } else {
+                        Effect::SetLanguage(if self.language.eq_ignore_ascii_case("zh-CN") {
+                            String::from("en-US")
+                        } else {
+                            String::from("zh-CN")
+                        })
+                    });
+                    self.loading = true;
+                    self.notice = None;
+                }
+                _ => {}
+            },
             InputMode::Normal => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Transition::Quit,
                 KeyCode::Tab => {
@@ -309,6 +345,7 @@ impl State {
                 }
                 KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
                 KeyCode::Char('r') => self.queue(Effect::Refresh),
+                KeyCode::Char('o') => self.input = InputMode::Settings { selected: 0 },
                 KeyCode::Char('/') => self.input = InputMode::Search(String::new()),
                 KeyCode::Char('a') => {
                     self.input = InputMode::Form(ProviderForm {
@@ -354,24 +391,6 @@ impl State {
                             id: provider.id.clone(),
                         });
                     }
-                }
-                KeyCode::Char('m') => {
-                    let mode = match self.mode() {
-                        ConnectionMode::Direct => ConnectionMode::Proxy,
-                        ConnectionMode::Proxy => ConnectionMode::Direct,
-                    };
-                    self.queue(Effect::SetMode {
-                        client: self.client,
-                        mode,
-                    });
-                }
-                KeyCode::Char('l') => {
-                    let language = if self.language.eq_ignore_ascii_case("zh-CN") {
-                        String::from("en-US")
-                    } else {
-                        String::from("zh-CN")
-                    };
-                    self.queue(Effect::SetLanguage(language));
                 }
                 _ => {}
             },
@@ -621,6 +640,7 @@ fn draw(frame: &mut Frame<'_>, state: &mut State, i18n: &I18n) {
         InputMode::Search(query) => draw_search(frame, area, query),
         InputMode::Form(form) => draw_form(frame, area, form),
         InputMode::DeleteConfirm { .. } => draw_confirm(frame, area, i18n),
+        InputMode::Settings { selected } => draw_settings(frame, area, state, *selected, i18n),
         InputMode::Normal => {}
     }
 }
@@ -792,6 +812,43 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, i18n: &I18n) {
     );
 }
 
+fn draw_settings(frame: &mut Frame<'_>, area: Rect, state: &State, selected: usize, i18n: &I18n) {
+    let popup = centered(area, 66, 9);
+    frame.render_widget(Clear, popup);
+    let mode = match state.mode() {
+        ConnectionMode::Direct => i18n.text("direct"),
+        ConnectionMode::Proxy => i18n.text("proxy"),
+    };
+    let language = if state.language.eq_ignore_ascii_case("zh-CN") {
+        i18n.text("language_zh_cn")
+    } else {
+        i18n.text("language_en_us")
+    };
+    let items = vec![
+        ListItem::new(format!("{}  ‹ {mode} ›", i18n.text("mode"))),
+        ListItem::new(format!("{}  ‹ {language} ›", i18n.text("language"))),
+    ];
+    let mut list_state = ListState::default().with_selected(Some(selected));
+    let list = List::new(items)
+        .highlight_symbol("› ")
+        .highlight_style(Style::default().fg(RED).add_modifier(Modifier::BOLD))
+        .block(
+            Block::default()
+                .title(format!(
+                    "{} · {}",
+                    i18n.text("settings"),
+                    match state.client {
+                        ClientKind::Codex => i18n.text("codex"),
+                        ClientKind::Claude => i18n.text("claude"),
+                    }
+                ))
+                .title_bottom(Line::from(i18n.text("settings_help")).alignment(Alignment::Center))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(RED)),
+        );
+    frame.render_stateful_widget(list, popup, &mut list_state);
+}
+
 fn centered(area: Rect, width_percent: u16, height: u16) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -829,15 +886,23 @@ mod tests {
     }
 
     #[test]
-    fn reducer_queues_mode_change() {
+    fn settings_menu_queues_mode_and_language_changes() {
         let mut state = State::default();
-        state.reduce(key(KeyCode::Char('m')));
+        state.reduce(key(KeyCode::Char('o')));
+        assert!(matches!(&state.input, InputMode::Settings { selected: 0 }));
+        state.reduce(key(KeyCode::Enter));
         assert!(matches!(
             state.take_effect(),
             Some(Effect::SetMode {
                 mode: ConnectionMode::Proxy,
                 ..
             })
+        ));
+        state.reduce(key(KeyCode::Down));
+        state.reduce(key(KeyCode::Enter));
+        assert!(matches!(
+            state.take_effect(),
+            Some(Effect::SetLanguage(language)) if language == "zh-CN"
         ));
     }
 
@@ -877,6 +942,19 @@ mod tests {
         assert!(rendered.contains("api.example.test"));
         assert!(rendered.contains('心'));
         assert!(!rendered.contains("Provider control plane"));
+
+        state.input = InputMode::Settings { selected: 0 };
+        terminal
+            .draw(|frame| draw(frame, &mut state, &locale))
+            .expect("draw settings");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("Settings"));
 
         let mut compact = Terminal::new(TestBackend::new(30, 8)).expect("compact terminal");
         compact
