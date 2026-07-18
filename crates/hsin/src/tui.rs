@@ -574,14 +574,10 @@ fn draw(frame: &mut Frame<'_>, state: &mut State, i18n: &I18n) {
         ])
         .split(area);
 
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(
-            i18n.text("title"),
-            Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ◆  ", Style::default().fg(RED)),
-        Span::styled(i18n.text("subtitle"), Style::default().fg(MUTED)),
-    ]))
+    let title = Paragraph::new(Line::from(Span::styled(
+        "「 心 」",
+        Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+    )))
     .alignment(Alignment::Center)
     .block(
         Block::default()
@@ -879,6 +875,8 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Example"));
         assert!(rendered.contains("api.example.test"));
+        assert!(rendered.contains('心'));
+        assert!(!rendered.contains("Provider control plane"));
 
         let mut compact = Terminal::new(TestBackend::new(30, 8)).expect("compact terminal");
         compact
