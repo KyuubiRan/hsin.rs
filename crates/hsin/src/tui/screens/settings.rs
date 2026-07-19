@@ -47,6 +47,11 @@ pub(super) fn draw_settings_screen(
     } else {
         i18n.text("disabled")
     };
+    let proxy_switch = if state.proxy_enabled {
+        i18n.text("on")
+    } else {
+        i18n.text("off")
+    };
     let language = match state.language.as_str() {
         LANGUAGE_EN_US => i18n.text("language_en_us"),
         LANGUAGE_ZH_CN => i18n.text("language_zh_cn"),
@@ -72,7 +77,7 @@ pub(super) fn draw_settings_screen(
                     i18n.text("settings_options"),
                     i18n.text("proxy_master"),
                     i18n.text("settings_proxy_master_description"),
-                    proxy,
+                    Some(proxy),
                 ),
                 1 => (
                     items,
@@ -80,7 +85,7 @@ pub(super) fn draw_settings_screen(
                     i18n.text("settings_options"),
                     i18n.text("language"),
                     i18n.text("settings_language_description"),
-                    language,
+                    Some(language),
                 ),
                 _ => (
                     items,
@@ -88,35 +93,43 @@ pub(super) fn draw_settings_screen(
                     i18n.text("settings_options"),
                     i18n.text("import_current"),
                     i18n.text("settings_import_current_description"),
-                    match state.client {
-                        hsin_core::ClientKind::Codex => i18n.text("codex"),
-                        hsin_core::ClientKind::Claude => i18n.text("claude"),
-                    },
+                    None,
                 ),
             }
         }
-        SettingsPage::Proxy { selected } => {
-            let (detail_title, description) = if *selected == 0 {
-                (
-                    i18n.text("disabled"),
-                    i18n.text("settings_proxy_master_off_description"),
-                )
-            } else {
-                (
-                    i18n.text("enabled"),
-                    i18n.text("settings_proxy_master_on_description"),
-                )
+        SettingsPage::Proxy { selected, port, .. } => {
+            let (detail_title, description, current) = match *selected {
+                0 => (
+                    i18n.text("proxy_switch"),
+                    i18n.text("settings_proxy_master_description"),
+                    proxy_switch,
+                ),
+                1 => (
+                    i18n.text("proxy_address"),
+                    i18n.text("settings_proxy_address_description"),
+                    state.proxy_host.as_str(),
+                ),
+                _ => (
+                    i18n.text("proxy_port"),
+                    i18n.text("settings_proxy_port_description"),
+                    port.as_str(),
+                ),
             };
             (
                 vec![
-                    ListItem::new(i18n.text("disabled")),
-                    ListItem::new(i18n.text("enabled")),
+                    settings_option_item(i18n.text("proxy_switch"), proxy_switch, option_width),
+                    settings_option_item(
+                        i18n.text("proxy_address"),
+                        &state.proxy_host,
+                        option_width,
+                    ),
+                    settings_option_item(i18n.text("proxy_port"), port, option_width),
                 ],
                 *selected,
                 i18n.text("proxy_master"),
                 detail_title,
                 description,
-                proxy,
+                Some(current),
             )
         }
         SettingsPage::Language { selected } => {
@@ -144,7 +157,35 @@ pub(super) fn draw_settings_screen(
                 i18n.text("language"),
                 detail_title,
                 description,
-                language,
+                Some(language),
+            )
+        }
+        SettingsPage::Import { selected } => {
+            let (detail_title, description) = match *selected {
+                0 => (
+                    i18n.text("codex"),
+                    i18n.text("settings_import_codex_description"),
+                ),
+                1 => (
+                    i18n.text("claude"),
+                    i18n.text("settings_import_claude_description"),
+                ),
+                _ => (
+                    i18n.text("import_all"),
+                    i18n.text("settings_import_all_description"),
+                ),
+            };
+            (
+                vec![
+                    ListItem::new(i18n.text("codex")),
+                    ListItem::new(i18n.text("claude")),
+                    ListItem::new(i18n.text("import_all")),
+                ],
+                *selected,
+                i18n.text("import_current"),
+                detail_title,
+                description,
+                None,
             )
         }
     };
@@ -167,22 +208,30 @@ pub(super) fn draw_settings_screen(
     frame.render_stateful_widget(list, columns[0], &mut list_state);
 
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(
-                detail_title,
-                Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(description),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled(
-                    format!("{}: ", i18n.text("settings_current")),
-                    Style::default().fg(MUTED),
-                ),
-                Span::styled(current, Style::default().fg(RED)),
-            ]),
-        ])
+        Paragraph::new(
+            [
+                Line::from(Span::styled(
+                    detail_title,
+                    Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(description),
+            ]
+            .into_iter()
+            .chain(current.into_iter().flat_map(|current| {
+                [
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled(
+                            format!("{}: ", i18n.text("settings_current")),
+                            Style::default().fg(MUTED),
+                        ),
+                        Span::styled(current, Style::default().fg(RED)),
+                    ]),
+                ]
+            }))
+            .collect::<Vec<_>>(),
+        )
         .wrap(Wrap { trim: false })
         .block(
             Block::default()

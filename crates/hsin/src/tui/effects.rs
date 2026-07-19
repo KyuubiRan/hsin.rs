@@ -23,7 +23,9 @@ pub(super) enum Effect {
         mode: ConnectionMode,
     },
     SetProxyEnabled(bool),
+    SetProxyPort(u16),
     ImportCurrent(ClientKind),
+    ImportAll,
     Add(FormSubmission),
     Edit(FormSubmission),
     DiscoverModels(FormSubmission),
@@ -129,7 +131,16 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
             Ok(Some("mode_changed"))
         }
         Effect::SetProxyEnabled(enabled) => update_proxy_enabled(client, enabled).await,
-        Effect::ImportCurrent(kind) => import_current(client, kind).await,
+        Effect::SetProxyPort(port) => update_proxy_port(client, port).await,
+        Effect::ImportCurrent(kind) => {
+            let imported = import_current(client, kind).await?;
+            Ok(Some(if imported {
+                "provider_imported"
+            } else {
+                "provider_unchanged"
+            }))
+        }
+        Effect::ImportAll => import_all(client).await,
         Effect::Add(form) => {
             let model = match form.model {
                 ModelUpdate::Set(model) => Some(model),
@@ -197,7 +208,7 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
     }
 }
 
-async fn import_current(client: &DaemonClient, kind: ClientKind) -> Result<Option<&'static str>> {
+async fn import_current(client: &DaemonClient, kind: ClientKind) -> Result<bool> {
     let result: ImportCurrentResult = client
         .call(
             "provider.import_current",
@@ -207,11 +218,21 @@ async fn import_current(client: &DaemonClient, kind: ClientKind) -> Result<Optio
             },
         )
         .await?;
-    Ok(Some(if result.imported {
-        "provider_imported"
-    } else {
-        "provider_unchanged"
-    }))
+    Ok(result.imported)
+}
+
+async fn import_all(client: &DaemonClient) -> Result<Option<&'static str>> {
+    let codex = import_current(client, ClientKind::Codex).await;
+    let claude = import_current(client, ClientKind::Claude).await;
+    match (codex, claude) {
+        (Ok(codex), Ok(claude)) => Ok(Some(if codex || claude {
+            "providers_imported_all"
+        } else {
+            "providers_unchanged_all"
+        })),
+        (Ok(_), Err(_)) | (Err(_), Ok(_)) => Ok(Some("providers_imported_partial")),
+        (Err(error), Err(_)) => Err(error),
+    }
 }
 
 async fn update_proxy_enabled(
@@ -233,6 +254,20 @@ async fn update_proxy_enabled(
     } else {
         "proxy_disabled"
     }))
+}
+
+async fn update_proxy_port(client: &DaemonClient, port: u16) -> Result<Option<&'static str>> {
+    let _: Value = client
+        .call(
+            "settings.set",
+            &SettingsPatch {
+                language: None,
+                proxy_port: Some(port),
+                proxy_enabled: None,
+            },
+        )
+        .await?;
+    Ok(Some("proxy_port_changed"))
 }
 
 async fn update_language(client: &DaemonClient, language: String) -> Result<Option<&'static str>> {

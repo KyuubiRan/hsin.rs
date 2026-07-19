@@ -119,16 +119,16 @@ fn settings_menu_queues_proxy_and_language_changes() {
     assert!(matches!(
         &state.input,
         InputMode::Settings(SettingsScreen {
-            page: SettingsPage::Proxy { selected: 0 },
+            page: SettingsPage::Proxy { selected: 0, .. },
             ..
         })
     ));
-    state.reduce(key(KeyCode::Down));
     state.reduce(key(KeyCode::Enter));
     assert!(matches!(
         state.take_effect(),
         Some(Effect::SetProxyEnabled(true))
     ));
+    state.reduce(key(KeyCode::Esc));
     state.reduce(key(KeyCode::Down));
     state.reduce(key(KeyCode::Enter));
     state.reduce(key(KeyCode::Down));
@@ -141,17 +141,92 @@ fn settings_menu_queues_proxy_and_language_changes() {
 }
 
 #[test]
-fn settings_can_import_the_current_client_configuration() {
+fn proxy_settings_edits_port_only_while_disabled() {
+    let mut state = State::default();
+    state.reduce(key(KeyCode::Char('o')));
+    state.reduce(key(KeyCode::Enter));
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Enter));
+    for character in "1234".chars() {
+        state.reduce(key(KeyCode::Char(character)));
+    }
+    state.reduce(key(KeyCode::Enter));
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::SetProxyPort(1234))
+    ));
+
+    let mut enabled = State {
+        proxy_enabled: true,
+        input: InputMode::Settings(SettingsScreen {
+            selected: 0,
+            page: SettingsPage::Proxy {
+                selected: 2,
+                port: "9999".into(),
+                editing_port: false,
+            },
+        }),
+        ..State::default()
+    };
+    enabled.reduce(key(KeyCode::Enter));
+    assert!(enabled.take_effect().is_none());
+    assert_eq!(enabled.notice.as_deref(), Some("@proxy_port_disable_first"));
+}
+
+#[test]
+fn settings_import_menu_selects_codex_claude_or_all() {
     let mut state = State::default();
     state.reduce(key(KeyCode::Char('o')));
     state.reduce(key(KeyCode::Down));
     state.reduce(key(KeyCode::Down));
     state.reduce(key(KeyCode::Enter));
+    assert!(state.take_effect().is_none());
+    assert!(matches!(
+        &state.input,
+        InputMode::Settings(SettingsScreen {
+            page: SettingsPage::Import { selected: 0 },
+            ..
+        })
+    ));
+    state.reduce(key(KeyCode::Enter));
     assert!(matches!(
         state.take_effect(),
         Some(Effect::ImportCurrent(ClientKind::Codex))
     ));
-    assert!(matches!(state.input, InputMode::Normal));
+    assert!(matches!(
+        state.input,
+        InputMode::Settings(SettingsScreen {
+            page: SettingsPage::Root,
+            ..
+        })
+    ));
+
+    let mut claude = State {
+        input: InputMode::Settings(SettingsScreen {
+            selected: 2,
+            page: SettingsPage::Import { selected: 0 },
+        }),
+        ..State::default()
+    };
+    claude.reduce(key(KeyCode::Down));
+    claude.reduce(key(KeyCode::Enter));
+    assert!(matches!(
+        claude.take_effect(),
+        Some(Effect::ImportCurrent(ClientKind::Claude))
+    ));
+
+    let mut all = State {
+        input: InputMode::Settings(SettingsScreen {
+            selected: 2,
+            page: SettingsPage::Import { selected: 0 },
+        }),
+        ..State::default()
+    };
+    all.reduce(key(KeyCode::Down));
+    all.reduce(key(KeyCode::Down));
+    all.reduce(key(KeyCode::Enter));
+    assert!(matches!(all.take_effect(), Some(Effect::ImportAll)));
 }
 
 #[test]
@@ -712,6 +787,12 @@ fn header_client_switcher_uses_a_selected_background() {
         .expect("draw Codex selection");
     let buffer = terminal.backend().buffer();
     assert!(text_has_background(buffer, 80, "Codex", RED));
+    assert!(text_has_foreground_pattern(
+        buffer,
+        80,
+        "Codex",
+        &[WHITE; 5]
+    ));
     assert!(text_has_background(buffer, 80, "Claude Code", INPUT_BG));
     let rendered = buffer
         .content()
@@ -727,6 +808,12 @@ fn header_client_switcher_uses_a_selected_background() {
     let buffer = terminal.backend().buffer();
     assert!(text_has_background(buffer, 80, "Codex", INPUT_BG));
     assert!(text_has_background(buffer, 80, "Claude Code", RED));
+    assert!(text_has_foreground_pattern(
+        buffer,
+        80,
+        "Claude Code",
+        &[WHITE; 11]
+    ));
 }
 
 #[test]
@@ -879,7 +966,9 @@ fn renders_provider_and_compact_windows() {
     assert!(rendered.contains("Description"));
     assert!(rendered.contains("Import current configuration"));
     assert!(rendered.contains("Control whether hsind"));
-    assert!(!rendered.contains("Example") && rendered.contains("Codex"));
+    assert!(!rendered.contains("Example"));
+    assert!(!rendered.contains("Codex"));
+    assert!(!rendered.contains("Claude Code"));
     let settings_rows = terminal
         .backend()
         .buffer()
@@ -922,12 +1011,119 @@ fn renders_provider_and_compact_windows() {
         .iter()
         .map(ratatui::buffer::Cell::symbol)
         .collect::<String>();
-    assert!(rendered.contains("disabled"));
-    assert!(rendered.contains("enabled"));
-    assert!(rendered.contains("enter apply"));
+    assert!(rendered.contains("Master switch"));
+    assert!(rendered.contains("enter change"));
 
     let mut compact = Terminal::new(TestBackend::new(30, 8)).expect("compact terminal");
     compact
         .draw(|frame| draw(frame, &mut state, &locale))
         .expect("draw compact terminal");
+}
+
+#[test]
+fn proxy_settings_renders_switch_address_and_port() {
+    let mut state = State {
+        loading: false,
+        input: InputMode::Settings(SettingsScreen {
+            selected: 0,
+            page: SettingsPage::Proxy {
+                selected: 0,
+                port: "9999".into(),
+                editing_port: false,
+            },
+        }),
+        ..State::default()
+    };
+    let locale = I18n::new(Some(LANGUAGE_EN_US));
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+    terminal
+        .draw(|frame| draw(frame, &mut state, &locale))
+        .expect("draw proxy settings");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>();
+    for expected in [
+        "Master switch",
+        "[off]",
+        "Address",
+        "[127.0.0.1]",
+        "Port",
+        "[9999]",
+    ] {
+        assert!(rendered.contains(expected), "missing {expected}");
+    }
+}
+
+#[test]
+fn settings_header_hides_clients_at_full_and_compact_sizes() {
+    let mut state = State {
+        loading: false,
+        input: InputMode::Settings(SettingsScreen {
+            selected: 0,
+            page: SettingsPage::Root,
+        }),
+        ..State::default()
+    };
+    let locale = I18n::new(Some(LANGUAGE_EN_US));
+    for (width, height) in [(80, 24), (30, 20)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut state, &locale))
+            .expect("draw settings header");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(!rendered.contains("Codex"));
+        assert!(!rendered.contains("Claude Code"));
+        assert!(rendered.contains(VERSION_LABEL));
+    }
+}
+
+#[test]
+fn settings_import_menu_renders_each_source_and_import_all() {
+    let mut state = State {
+        loading: false,
+        input: InputMode::Settings(SettingsScreen {
+            selected: 2,
+            page: SettingsPage::Import { selected: 2 },
+        }),
+        ..State::default()
+    };
+    let locale = I18n::new(Some(LANGUAGE_EN_US));
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+    terminal
+        .draw(|frame| draw(frame, &mut state, &locale))
+        .expect("draw import settings");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>();
+    let left_column = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks(80)
+        .flat_map(|row| {
+            row.iter()
+                .take(34)
+                .map(ratatui::buffer::Cell::symbol)
+                .chain(std::iter::once("\n"))
+        })
+        .collect::<String>();
+    let positions = ["Codex", "Claude Code", "Import all"]
+        .map(|label| left_column.find(label).expect("import source must render"));
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(rendered.contains("Process both Codex and Claude Code"));
+    assert!(!rendered.contains("Import source"));
 }

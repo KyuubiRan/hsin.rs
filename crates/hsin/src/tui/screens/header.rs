@@ -2,7 +2,7 @@ use hsin_core::ClientKind;
 use ratatui::{
     Frame,
     layout::{Alignment, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
 };
@@ -10,7 +10,7 @@ use ratatui::{
 use crate::i18n::I18n;
 
 use super::super::{
-    state::State,
+    state::{InputMode, State},
     theme::{INPUT_BG, MUTED, RED, WHITE},
     widgets::display_width,
 };
@@ -48,7 +48,9 @@ pub(super) fn draw_header(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
                 ..inner
             },
         );
-        draw_compact_client_switcher(frame, inner, state, i18n, title_width);
+        if !matches!(&state.input, InputMode::Settings(_)) {
+            draw_compact_client_switcher(frame, inner, state, i18n, title_width);
+        }
         return;
     }
 
@@ -95,6 +97,9 @@ pub(super) fn draw_header(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
         height: 1.min(inner.height),
     };
     if controls.width == 0 || controls.height == 0 {
+        return;
+    }
+    if matches!(&state.input, InputMode::Settings(_)) {
         return;
     }
     frame.render_widget(
@@ -174,7 +179,7 @@ fn selected_client_line<'a>(state: &State, i18n: &'a I18n) -> Line<'a> {
 fn client_span(label: &str, selected: bool) -> Span<'_> {
     let style = if selected {
         Style::default()
-            .fg(Color::Black)
+            .fg(WHITE)
             .bg(RED)
             .add_modifier(Modifier::BOLD)
     } else {

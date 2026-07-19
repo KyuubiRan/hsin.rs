@@ -42,6 +42,8 @@ pub(super) struct State {
     pub(super) status: StatusSnapshot,
     pub(super) language: String,
     pub(super) proxy_enabled: bool,
+    pub(super) proxy_host: String,
+    pub(super) proxy_port: u16,
     pub(super) loading: bool,
     pub(super) notice: Option<String>,
     pub(super) input: InputMode,
@@ -57,6 +59,8 @@ impl Default for State {
             status: StatusSnapshot::default(),
             language: LANGUAGE_SYSTEM.into(),
             proxy_enabled: false,
+            proxy_host: "127.0.0.1".into(),
+            proxy_port: 9999,
             loading: true,
             notice: None,
             input: InputMode::Normal,
@@ -86,8 +90,17 @@ pub(super) struct SettingsScreen {
 
 pub(super) enum SettingsPage {
     Root,
-    Proxy { selected: usize },
-    Language { selected: usize },
+    Proxy {
+        selected: usize,
+        port: String,
+        editing_port: bool,
+    },
+    Language {
+        selected: usize,
+    },
+    Import {
+        selected: usize,
+    },
 }
 
 pub(super) struct ProviderForm {
@@ -146,6 +159,20 @@ impl State {
                 self.status = status;
                 self.language = settings.language;
                 self.proxy_enabled = settings.proxy_enabled;
+                self.proxy_host = settings.proxy_host;
+                self.proxy_port = settings.proxy_port;
+                if let InputMode::Settings(SettingsScreen {
+                    page:
+                        SettingsPage::Proxy {
+                            port,
+                            editing_port: false,
+                            ..
+                        },
+                    ..
+                }) = &mut self.input
+                {
+                    *port = self.proxy_port.to_string();
+                }
                 self.loading = false;
                 self.clamp_selection();
                 if let Some(active) = self.active_id()
@@ -205,6 +232,7 @@ impl State {
         }
         let current_mode = self.mode();
         let proxy_enabled = self.proxy_enabled;
+        let proxy_port = self.proxy_port;
         let language_selected = match self.language.as_str() {
             LANGUAGE_EN_US => 1,
             LANGUAGE_ZH_CN => 2,
@@ -386,7 +414,9 @@ impl State {
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => match screen.selected {
                         0 => {
                             screen.page = SettingsPage::Proxy {
-                                selected: usize::from(proxy_enabled),
+                                selected: 0,
+                                port: proxy_port.to_string(),
+                                editing_port: false,
                             };
                         }
                         1 => {
@@ -395,30 +425,76 @@ impl State {
                             };
                         }
                         _ => {
-                            self.pending_effect = Some(Effect::ImportCurrent(self.client));
-                            self.loading = true;
-                            self.input = InputMode::Normal;
+                            screen.page = SettingsPage::Import { selected: 0 };
                         }
                     },
                     _ => {}
                 },
-                SettingsPage::Proxy { selected } => match key.code {
-                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
-                        screen.page = SettingsPage::Root;
+                SettingsPage::Proxy {
+                    selected,
+                    port,
+                    editing_port,
+                } => {
+                    if *editing_port {
+                        match key.code {
+                            KeyCode::Esc => {
+                                *port = proxy_port.to_string();
+                                *editing_port = false;
+                            }
+                            KeyCode::Backspace => {
+                                port.pop();
+                            }
+                            KeyCode::Char(character)
+                                if character.is_ascii_digit() && port.len() < 5 =>
+                            {
+                                port.push(character);
+                            }
+                            KeyCode::Enter => match port.parse::<u16>() {
+                                Ok(value) if value >= 1024 => {
+                                    *editing_port = false;
+                                    if value != proxy_port {
+                                        self.pending_effect = Some(Effect::SetProxyPort(value));
+                                        self.loading = true;
+                                    }
+                                }
+                                _ => self.notice = Some("@validation_proxy_port".into()),
+                            },
+                            _ => {}
+                        }
+                    } else {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
+                                screen.page = SettingsPage::Root;
+                            }
+                            KeyCode::Up | KeyCode::Char('i') => {
+                                *selected = selected.saturating_sub(1);
+                            }
+                            KeyCode::Down | KeyCode::Char('k') => {
+                                *selected = (*selected + 1).min(2);
+                            }
+                            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l' | ' ') => {
+                                match *selected {
+                                    0 => {
+                                        self.pending_effect =
+                                            Some(Effect::SetProxyEnabled(!proxy_enabled));
+                                        self.loading = true;
+                                    }
+                                    1 => {
+                                        self.notice = Some("@proxy_address_read_only".into());
+                                    }
+                                    _ if proxy_enabled => {
+                                        self.notice = Some("@proxy_port_disable_first".into());
+                                    }
+                                    _ => {
+                                        *editing_port = true;
+                                        port.clear();
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                     }
-                    KeyCode::Up | KeyCode::Char('i') => {
-                        *selected = selected.saturating_sub(1);
-                    }
-                    KeyCode::Down | KeyCode::Char('k') => {
-                        *selected = (*selected + 1).min(1);
-                    }
-                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                        self.pending_effect = Some(Effect::SetProxyEnabled(*selected == 1));
-                        self.loading = true;
-                        screen.page = SettingsPage::Root;
-                    }
-                    _ => {}
-                },
+                }
                 SettingsPage::Language { selected } => match key.code {
                     KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
                         screen.page = SettingsPage::Root;
@@ -438,6 +514,27 @@ impl State {
                             }
                             .into(),
                         ));
+                        self.loading = true;
+                        screen.page = SettingsPage::Root;
+                    }
+                    _ => {}
+                },
+                SettingsPage::Import { selected } => match key.code {
+                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
+                        screen.page = SettingsPage::Root;
+                    }
+                    KeyCode::Up | KeyCode::Char('i') => {
+                        *selected = selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('k') => {
+                        *selected = (*selected + 1).min(2);
+                    }
+                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                        self.pending_effect = Some(match *selected {
+                            0 => Effect::ImportCurrent(ClientKind::Codex),
+                            1 => Effect::ImportCurrent(ClientKind::Claude),
+                            _ => Effect::ImportAll,
+                        });
                         self.loading = true;
                         screen.page = SettingsPage::Root;
                     }
