@@ -14,12 +14,13 @@ use crate::{
     paths::Paths,
 };
 use atomic_write_file::AtomicWriteFile;
+use fs2::FileExt;
 
 pub fn install(start: bool) -> Result<()> {
-    let was_running = status().unwrap_or(false);
-    if was_running {
-        stop()?;
-    }
+    let was_running = status()?;
+    // Stop stale service wrappers as well as a currently locked daemon before
+    // replacing binaries. This matters on Windows between restart attempts.
+    stop()?;
     let paths = Paths::discover();
     paths.prepare()?;
     fs::write(
@@ -43,7 +44,7 @@ pub fn install(start: bool) -> Result<()> {
 
 pub fn uninstall(purge: bool) -> Result<()> {
     let paths = Paths::discover();
-    let _ = stop();
+    stop()?;
     uninstall_definition(&paths)?;
     let _ = fs::remove_file(paths.home.join("bin").join(exe_name("hsind")));
     let _ = fs::remove_file(paths.home.join("bin").join(exe_name("hsin")));
@@ -75,15 +76,28 @@ fn stored_key_versions(database: &Path) -> Result<Vec<u32>> {
 
 pub fn start() -> Result<()> {
     let paths = Paths::discover();
+    if instance_running(&paths)? {
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
     {
         let label = service_label(&paths);
         let domain = format!("gui/{}", uid()?);
         let plist = launch_agent_path(&paths)?;
-        let _ = Command::new("launchctl")
+        let bootstrapped = Command::new("launchctl")
             .args(["bootstrap", &domain, &plist.to_string_lossy()])
-            .status();
-        command(Command::new("launchctl").args(["kickstart", "-k", &format!("{domain}/{label}")]))?;
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?
+            .success();
+        if !bootstrapped {
+            command(
+                Command::new("launchctl")
+                    .args(["kickstart", &format!("{domain}/{label}")])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null()),
+            )?;
+        }
     }
     #[cfg(target_os = "linux")]
     {
@@ -110,6 +124,8 @@ pub fn stop() -> Result<()> {
         let plist = launch_agent_path(&paths)?;
         let _ = Command::new("launchctl")
             .args(["bootout", &domain, &plist.to_string_lossy()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status();
     }
     #[cfg(target_os = "linux")]
@@ -118,25 +134,22 @@ pub fn stop() -> Result<()> {
         if systemd_user_available() {
             let _ = Command::new("systemctl")
                 .args(["--user", "stop", &unit])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .status();
-        } else {
-            stop_fallback()?;
         }
+        stop_fallback()?;
     }
     #[cfg(windows)]
     {
         let label = service_label(&paths);
         let _ = Command::new("schtasks")
             .args(["/End", "/TN", &label])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status();
-        for _ in 0..50 {
-            if !status()? {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
     }
-    Ok(())
+    wait_for_instance_stop(&paths)
 }
 
 pub fn restart() -> Result<()> {
@@ -146,49 +159,41 @@ pub fn restart() -> Result<()> {
 
 pub fn status() -> Result<bool> {
     let paths = Paths::discover();
-    #[cfg(target_os = "macos")]
-    {
-        return Ok(Command::new("launchctl")
-            .args([
-                "print",
-                &format!("gui/{}/{}", uid()?, service_label(&paths)),
-            ])
-            .status()
-            .is_ok_and(|status| status.success()));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let unit = service_unit(&paths);
-        return if systemd_user_available() {
-            Ok(Command::new("systemctl")
-                .args(["--user", "is-active", "--quiet", &unit])
-                .status()
-                .is_ok_and(|status| status.success()))
-        } else {
-            fallback_status()
-        };
-    }
-    #[cfg(windows)]
-    {
-        let task_exists = Command::new("schtasks")
-            .args(["/Query", "/TN", &service_label(&paths)])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
-        if !task_exists {
-            return Ok(false);
+    instance_running(&paths)
+}
+
+fn instance_running(paths: &Paths) -> Result<bool> {
+    lock_file_held(&paths.lock)
+}
+
+fn lock_file_held(path: &Path) -> Result<bool> {
+    let file = match File::options().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            FileExt::unlock(&file)?;
+            Ok(false)
         }
-        let output = Command::new("tasklist")
-            .args(["/FI", "IMAGENAME eq hsind.exe", "/NH"])
-            .output()?;
-        return Ok(output.status.success()
-            && String::from_utf8_lossy(&output.stdout)
-                .to_ascii_lowercase()
-                .contains("hsind.exe"));
+        Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+            Ok(true)
+        }
+        Err(error) => Err(error.into()),
     }
-    #[allow(unreachable_code)]
-    Ok(false)
+}
+
+fn wait_for_instance_stop(paths: &Paths) -> Result<()> {
+    for _ in 0..50 {
+        if !instance_running(paths)? {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(DaemonError::Internal(
+        "daemon did not stop before the service timeout".into(),
+    ))
 }
 
 fn install_binary(source: &Path, destination: &Path) -> Result<()> {
@@ -281,9 +286,12 @@ fn install_definition(paths: &Paths, daemon: &Path) -> Result<()> {
         .into_iter()
         .map(|(key, value)| format!("set \"{key}={}\"\r\n", value.replace('%', "%%")))
         .collect::<String>();
+    let daemon = daemon.to_string_lossy().replace('%', "%%");
     fs::write(
         &wrapper,
-        format!("@echo off\r\n{variables}\"{}\" run\r\n", daemon.display()),
+        format!(
+            "@echo off\r\n{variables}:run\r\n\"{daemon}\" run\r\nif not errorlevel 1 exit /b 0\r\n>nul 2>&1 timeout /t 2 /nobreak\r\ngoto run\r\n"
+        ),
     )?;
     let task_command = format!("\"{}\"", wrapper.display());
     command(Command::new("schtasks").args([
@@ -291,6 +299,8 @@ fn install_definition(paths: &Paths, daemon: &Path) -> Result<()> {
         "/F",
         "/SC",
         "ONLOGON",
+        "/RL",
+        "LIMITED",
         "/TN",
         &service_label(paths),
         "/TR",
@@ -304,6 +314,8 @@ fn uninstall_definition(paths: &Paths) -> Result<()> {
     let plist = launch_agent_path(paths)?;
     let _ = Command::new("launchctl")
         .args(["bootout", &domain, &plist.to_string_lossy()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
     let _ = fs::remove_file(plist);
     Ok(())
@@ -314,6 +326,8 @@ fn uninstall_definition(paths: &Paths) -> Result<()> {
     if systemd_user_available() {
         let _ = Command::new("systemctl")
             .args(["--user", "disable", "--now", &unit])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status();
     }
     if let Some(home) = std::env::var_os("HOME") {
@@ -325,6 +339,8 @@ fn uninstall_definition(paths: &Paths) -> Result<()> {
 fn uninstall_definition(paths: &Paths) -> Result<()> {
     let _ = Command::new("schtasks")
         .args(["/Delete", "/F", "/TN", &service_label(paths)])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
     Ok(())
 }
@@ -360,8 +376,13 @@ fn spawn_fallback() -> Result<()> {
         return Ok(());
     }
     let daemon = paths.home.join("bin/hsind");
-    let child = Command::new(daemon)
-        .arg("run")
+    let child = Command::new("sh")
+        .args([
+            "-c",
+            "if command -v setsid >/dev/null 2>&1; then exec setsid \"$1\" run; fi; trap '' HUP; exec \"$1\" run",
+            "hsind-fallback",
+        ])
+        .arg(daemon)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -382,15 +403,19 @@ fn stop_fallback() -> Result<()> {
     }
     let _ = Command::new("kill")
         .args(["-TERM", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
     for _ in 0..50 {
         if !fallback_process_matches(pid, &paths) {
-            break;
+            let _ = fs::remove_file(pid_path);
+            return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    let _ = fs::remove_file(pid_path);
-    Ok(())
+    Err(DaemonError::Internal(
+        "fallback daemon did not stop before the service timeout".into(),
+    ))
 }
 #[cfg(target_os = "linux")]
 fn fallback_status() -> Result<bool> {
@@ -442,18 +467,36 @@ pub fn uses_fallback() -> bool {
     !systemd_user_available()
 }
 fn command(command: &mut Command) -> Result<()> {
-    let status = command.status()?;
-    if status.success() {
+    let output = command.output()?;
+    if output.status.success() {
         Ok(())
     } else {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let detail = if detail.is_empty() {
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        } else {
+            detail
+        };
         Err(DaemonError::Internal(format!(
-            "service command exited with {status}"
+            "service command exited with {}{}",
+            output.status,
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
         )))
     }
 }
 #[cfg(target_os = "linux")]
 fn systemd_quote(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%")
+    )
 }
 fn exe_name(name: &str) -> String {
     if cfg!(windows) {
@@ -490,4 +533,31 @@ fn service_label(paths: &Paths) -> String {
 #[cfg(target_os = "linux")]
 fn service_unit(paths: &Paths) -> String {
     format!("hsind-{}.service", hsin_ipc::home_scope(&paths.home))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instance_status_tracks_the_instance_lock() {
+        let directory = std::env::temp_dir().join(format!("hsin-service-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let lock_path = directory.join("hsind.lock");
+
+        assert!(!lock_file_held(&lock_path).unwrap());
+        let lock = File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        lock.try_lock_exclusive().unwrap();
+        assert!(lock_file_held(&lock_path).unwrap());
+        FileExt::unlock(&lock).unwrap();
+        assert!(!lock_file_held(&lock_path).unwrap());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
 }

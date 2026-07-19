@@ -22,6 +22,7 @@ Version 1 supports direct and loopback-proxy modes on macOS, Linux, and Windows.
 - Do not add SQLite, keyring, proxy-server, or client-config parsing dependencies to `hsin`.
 - Keep public provider DTOs free of complete credentials. Only the internal `credential.resolve` flow may return credential material.
 - Preserve stable IPC method names, wire enum values, protocol version checks, frame limits, request IDs, and hello negotiation.
+- Whenever an updated `hsind` binary is shipped, increment the shared `hsin_core::VERSION_CODE` and ship the matching `hsin` binary with it. Daemon/CLI RPC fields, response shapes, capabilities, or required behavior changes always require this bump. A version-code mismatch must continue to trigger automatic daemon reinstallation; do not rely on the Cargo package version for development-build compatibility.
 - `HSIN_HOME` instances must remain isolated across storage, IPC, keyring entries, installation markers, and service identities.
 
 ## Configuration Ownership
