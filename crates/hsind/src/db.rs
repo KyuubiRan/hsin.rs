@@ -619,6 +619,7 @@ mod tests {
         db.set_active(ClientKind::Codex, &provider.id, "managed")
             .unwrap();
         assert!(db.remove_provider(&provider.id).is_err());
+        drop(db);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -666,6 +667,7 @@ mod tests {
         assert!(!provider.credential_configured);
         assert_eq!(database_version(&path).unwrap(), 3);
         assert_eq!(fs::read_dir(backups).unwrap().count(), 1);
+        drop(db);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -702,6 +704,7 @@ mod tests {
             Some("true")
         );
         assert_eq!(database_version(&path).unwrap(), 3);
+        drop(db);
         fs::remove_dir_all(root).unwrap();
     }
 }

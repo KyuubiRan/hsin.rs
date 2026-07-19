@@ -478,6 +478,8 @@ mod tests {
         let mut bad = db.secret(&provider.id).unwrap();
         bad.ciphertext[0] ^= 1;
         assert!(crypto.decrypt_for(&provider, &bad).is_err());
+        drop(crypto);
+        drop(db);
         fs::remove_dir_all(root).unwrap();
     }
 }

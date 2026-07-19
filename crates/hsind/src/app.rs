@@ -1194,6 +1194,7 @@ mod tests {
         let preview = providers[0].credential_preview.as_deref().unwrap();
         assert_eq!(preview, "sk-abc***yz");
         assert!(!serde_json::to_string(&providers).unwrap().contains(secret));
+        drop(app);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1237,6 +1238,7 @@ mod tests {
             .await;
         assert!(matches!(invalid, Err(DaemonError::Invalid(_))));
         assert_eq!(app.settings().unwrap().clients, clients);
+        drop(app);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1262,6 +1264,7 @@ mod tests {
             app.set_mode(ClientKind::Codex, ConnectionMode::Proxy).await,
             Err(DaemonError::NoActiveProvider)
         ));
+        drop(app);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1328,6 +1331,7 @@ mod tests {
                 .as_deref(),
             Some("true")
         );
+        drop(app);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1416,6 +1420,7 @@ mod tests {
             4
         );
 
+        drop(app);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1556,6 +1561,7 @@ mod tests {
 
         app.notify_shutdown();
         proxy.await.unwrap().unwrap();
+        drop(app);
         fs::remove_dir_all(root).unwrap();
     }
 }
