@@ -31,6 +31,13 @@ impl I18n {
             .map_or(key, String::as_str)
     }
 
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.primary
+            .get(key)
+            .or_else(|| self.fallback.get(key))
+            .map(String::as_str)
+    }
+
     pub fn set_language(&mut self, language: &str) {
         let system = system_locale();
         let language = resolve_language(Some(language), system.as_deref());

@@ -6,7 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = "1.0"
-clap = { version = "4.5", features = ["derive", "env"] }
+clap = { version = "4.5", features = ["derive", "env", "string"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 futures-util = "0.3"
 hsin-core = { path = "../hsin-core" }

@@ -7,12 +7,18 @@ mod tui;
 
 use std::process::ExitCode;
 
-use clap::Parser;
+use hsin_core::Settings;
+use serde_json::json;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = cli::Cli::parse();
-    let mut i18n = i18n::I18n::new(cli.language.as_deref());
+    let args = std::env::args_os().collect::<Vec<_>>();
+    let language = match cli::language_override(&args) {
+        Some(language) => Some(language),
+        None => configured_language().await,
+    };
+    let mut i18n = i18n::I18n::new(language.as_deref());
+    let cli = cli::Cli::parse_localized_from(args, &i18n);
 
     match app::run(cli, &mut i18n).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -21,4 +27,10 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+async fn configured_language() -> Option<String> {
+    let client = rpc::DaemonClient::connect().await.ok()?;
+    let settings: Settings = client.call("settings.get", &json!({})).await.ok()?;
+    Some(settings.language)
 }
