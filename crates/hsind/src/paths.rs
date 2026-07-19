@@ -32,7 +32,10 @@ impl Paths {
         fs::create_dir_all(&self.home)?;
         fs::create_dir_all(&self.logs)?;
         fs::create_dir_all(&self.backups)?;
+        #[cfg(unix)]
         set_private_dir(&self.home)?;
+        #[cfg(not(unix))]
+        set_private_dir(&self.home);
         Ok(())
     }
 }
@@ -64,6 +67,4 @@ fn set_private_dir(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_private_dir(_path: &Path) -> Result<()> {
-    Ok(())
-}
+fn set_private_dir(_path: &Path) {}

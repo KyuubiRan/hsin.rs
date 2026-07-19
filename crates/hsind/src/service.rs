@@ -5,7 +5,7 @@ use std::{
     process::Command,
 };
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use std::fmt::Write as _;
 
 use crate::{
@@ -45,7 +45,10 @@ pub fn install(start: bool) -> Result<()> {
 pub fn uninstall(purge: bool) -> Result<()> {
     let paths = Paths::discover();
     stop()?;
+    #[cfg(target_os = "macos")]
     uninstall_definition(&paths)?;
+    #[cfg(any(target_os = "linux", windows))]
+    uninstall_definition(&paths);
     let _ = fs::remove_file(paths.home.join("bin").join(exe_name("hsind")));
     let _ = fs::remove_file(paths.home.join("bin").join(exe_name("hsin")));
     let _ = fs::remove_file(paths.home.join("bin/run-hsind.cmd"));
@@ -262,11 +265,16 @@ fn install_definition(paths: &Paths, daemon: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let environment = service_environment(paths)?
-            .into_iter()
-            .map(|(key, value)| systemd_quote(&format!("{key}={value}")))
-            .map(|value| format!("Environment={value}\n"))
-            .collect::<String>();
+        let mut environment = String::new();
+        for (key, value) in service_environment(paths)? {
+            let assignment = format!("{key}={value}");
+            writeln!(
+                &mut environment,
+                "Environment={}",
+                systemd_quote(&assignment)
+            )
+            .expect("writing to a String cannot fail");
+        }
         fs::write(
             path,
             format!(
@@ -282,10 +290,15 @@ fn install_definition(paths: &Paths, daemon: &Path) -> Result<()> {
 #[cfg(windows)]
 fn install_definition(paths: &Paths, daemon: &Path) -> Result<()> {
     let wrapper = paths.home.join("bin/run-hsind.cmd");
-    let variables = service_environment(paths)?
-        .into_iter()
-        .map(|(key, value)| format!("set \"{key}={}\"\r\n", value.replace('%', "%%")))
-        .collect::<String>();
+    let mut variables = String::new();
+    for (key, value) in service_environment(paths)? {
+        write!(
+            &mut variables,
+            "set \"{key}={}\"\r\n",
+            value.replace('%', "%%")
+        )
+        .expect("writing to a String cannot fail");
+    }
     let daemon = daemon.to_string_lossy().replace('%', "%%");
     fs::write(
         &wrapper,
@@ -321,7 +334,7 @@ fn uninstall_definition(paths: &Paths) -> Result<()> {
     Ok(())
 }
 #[cfg(target_os = "linux")]
-fn uninstall_definition(paths: &Paths) -> Result<()> {
+fn uninstall_definition(paths: &Paths) {
     let unit = service_unit(paths);
     if systemd_user_available() {
         let _ = Command::new("systemctl")
@@ -333,16 +346,14 @@ fn uninstall_definition(paths: &Paths) -> Result<()> {
     if let Some(home) = std::env::var_os("HOME") {
         let _ = fs::remove_file(PathBuf::from(home).join(".config/systemd/user").join(unit));
     }
-    Ok(())
 }
 #[cfg(windows)]
-fn uninstall_definition(paths: &Paths) -> Result<()> {
+fn uninstall_definition(paths: &Paths) {
     let _ = Command::new("schtasks")
         .args(["/Delete", "/F", "/TN", &service_label(paths)])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
-    Ok(())
 }
 
 #[cfg(target_os = "macos")]

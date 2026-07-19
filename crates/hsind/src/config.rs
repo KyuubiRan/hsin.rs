@@ -567,7 +567,10 @@ fn atomic_patch(
         ));
     }
     output.commit()?;
+    #[cfg(unix)]
     sync_parent_directory(path)?;
+    #[cfg(not(unix))]
+    sync_parent_directory(path);
     FileExt::unlock(&lock)?;
     Ok(hash(after.as_bytes()))
 }
@@ -581,9 +584,7 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn sync_parent_directory(_path: &Path) -> Result<()> {
-    Ok(())
-}
+fn sync_parent_directory(_path: &Path) {}
 
 fn hash(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))

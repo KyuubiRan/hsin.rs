@@ -525,8 +525,7 @@ fn platform_data_home(
         let _ = (xdg_data, home);
         local_app_data
             .map(PathBuf::from)
-            .map(|path| path.join("hsin"))
-            .unwrap_or_else(|| PathBuf::from(r"C:\hsin"))
+            .map_or_else(|| PathBuf::from(r"C:\hsin"), |path| path.join("hsin"))
     }
     #[cfg(target_os = "macos")]
     {
@@ -744,7 +743,10 @@ impl IpcListener {
             // Do not unexpectedly chmod an existing caller-selected parent
             // such as `/tmp`. Directories created for hsin are owner-only.
             if !parent_existed {
+                #[cfg(unix)]
                 set_owner_only_directory(parent)?;
+                #[cfg(not(unix))]
+                set_owner_only_directory(parent);
             }
         }
         let options = ListenerOptions::new().name(endpoint.to_name()?);
@@ -752,7 +754,10 @@ impl IpcListener {
         let options = options.security_descriptor(current_user_security_descriptor()?);
         let listener = options.create_tokio()?;
         if let IpcEndpoint::Filesystem(path) = &endpoint {
+            #[cfg(unix)]
             set_owner_only_socket(path)?;
+            #[cfg(not(unix))]
+            set_owner_only_socket(path);
         }
         Ok(Self { listener, endpoint })
     }
@@ -769,7 +774,10 @@ impl IpcListener {
     /// Returns an I/O error when accepting or authenticating the peer fails.
     pub async fn accept(&self) -> Result<TokioLocalStream, TransportError> {
         let stream = self.listener.accept().await?;
+        #[cfg(unix)]
         validate_peer(&stream)?;
+        #[cfg(not(unix))]
+        validate_peer(&stream);
         Ok(stream)
     }
 }
@@ -781,9 +789,7 @@ fn set_owner_only_directory(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_owner_only_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
+fn set_owner_only_directory(_path: &Path) {}
 
 #[cfg(unix)]
 fn set_owner_only_socket(path: &Path) -> io::Result<()> {
@@ -792,9 +798,7 @@ fn set_owner_only_socket(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_owner_only_socket(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
+fn set_owner_only_socket(_path: &Path) {}
 
 #[cfg(unix)]
 fn validate_peer(stream: &TokioLocalStream) -> io::Result<()> {
@@ -812,10 +816,9 @@ fn validate_peer(stream: &TokioLocalStream) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn validate_peer(_stream: &TokioLocalStream) -> io::Result<()> {
+fn validate_peer(_stream: &TokioLocalStream) {
     // Windows access is enforced by the current-user DACL applied when the
     // named pipe listener is created.
-    Ok(())
 }
 
 #[cfg(windows)]
