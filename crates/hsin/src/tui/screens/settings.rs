@@ -1,0 +1,203 @@
+use hsin_core::{LANGUAGE_EN_US, LANGUAGE_ZH_CN};
+use ratatui::{
+    Frame,
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{
+        Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
+    },
+};
+
+use crate::i18n::I18n;
+
+use super::super::{
+    state::{SettingsPage, SettingsScreen, State},
+    theme::{MUTED, RED, WHITE},
+    widgets::{centered_fixed, content_width, display_width},
+};
+
+pub(super) fn draw_confirm(frame: &mut Frame<'_>, area: Rect, i18n: &I18n) {
+    let width = content_width(area, display_width(i18n.text("confirm_delete")) + 4, 30, 72);
+    let popup = centered_fixed(area, width, 5);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(i18n.text("confirm_delete"))
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .title(i18n.text("confirm"))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(RED)),
+            ),
+        popup,
+    );
+}
+
+#[allow(clippy::too_many_lines)]
+pub(super) fn draw_settings_screen(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &State,
+    screen: &SettingsScreen,
+    i18n: &I18n,
+) {
+    let proxy = if state.proxy_enabled {
+        i18n.text("enabled")
+    } else {
+        i18n.text("disabled")
+    };
+    let language = match state.language.as_str() {
+        LANGUAGE_EN_US => i18n.text("language_en_us"),
+        LANGUAGE_ZH_CN => i18n.text("language_zh_cn"),
+        _ => i18n.text("language_system"),
+    };
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(area);
+    let option_width = usize::from(columns[0].width.saturating_sub(4));
+    let (items, selected, list_title, detail_title, description, current) = match &screen.page {
+        SettingsPage::Root => {
+            let items = vec![
+                settings_option_item(i18n.text("proxy_master"), proxy, option_width),
+                settings_option_item(i18n.text("language"), language, option_width),
+                ListItem::new(i18n.text("import_current")),
+            ];
+            match screen.selected {
+                0 => (
+                    items,
+                    screen.selected,
+                    i18n.text("settings_options"),
+                    i18n.text("proxy_master"),
+                    i18n.text("settings_proxy_master_description"),
+                    proxy,
+                ),
+                1 => (
+                    items,
+                    screen.selected,
+                    i18n.text("settings_options"),
+                    i18n.text("language"),
+                    i18n.text("settings_language_description"),
+                    language,
+                ),
+                _ => (
+                    items,
+                    screen.selected,
+                    i18n.text("settings_options"),
+                    i18n.text("import_current"),
+                    i18n.text("settings_import_current_description"),
+                    match state.client {
+                        hsin_core::ClientKind::Codex => i18n.text("codex"),
+                        hsin_core::ClientKind::Claude => i18n.text("claude"),
+                    },
+                ),
+            }
+        }
+        SettingsPage::Proxy { selected } => {
+            let (detail_title, description) = if *selected == 0 {
+                (
+                    i18n.text("disabled"),
+                    i18n.text("settings_proxy_master_off_description"),
+                )
+            } else {
+                (
+                    i18n.text("enabled"),
+                    i18n.text("settings_proxy_master_on_description"),
+                )
+            };
+            (
+                vec![
+                    ListItem::new(i18n.text("disabled")),
+                    ListItem::new(i18n.text("enabled")),
+                ],
+                *selected,
+                i18n.text("proxy_master"),
+                detail_title,
+                description,
+                proxy,
+            )
+        }
+        SettingsPage::Language { selected } => {
+            let (detail_title, description) = match *selected {
+                0 => (
+                    i18n.text("language_system"),
+                    i18n.text("settings_system_description"),
+                ),
+                1 => (
+                    i18n.text("language_en_us"),
+                    i18n.text("settings_en_us_description"),
+                ),
+                _ => (
+                    i18n.text("language_zh_cn"),
+                    i18n.text("settings_zh_cn_description"),
+                ),
+            };
+            (
+                vec![
+                    ListItem::new(i18n.text("language_system")),
+                    ListItem::new(i18n.text("language_en_us")),
+                    ListItem::new(i18n.text("language_zh_cn")),
+                ],
+                *selected,
+                i18n.text("language"),
+                detail_title,
+                description,
+                language,
+            )
+        }
+    };
+    let mut list_state = ListState::default().with_selected(Some(selected));
+    let list = List::new(items)
+        .highlight_symbol("› ")
+        .highlight_spacing(HighlightSpacing::Always)
+        .highlight_style(
+            Style::default()
+                .fg(RED)
+                .bg(Color::Rgb(55, 28, 32))
+                .add_modifier(Modifier::BOLD),
+        )
+        .block(
+            Block::default()
+                .title(list_title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(MUTED)),
+        );
+    frame.render_stateful_widget(list, columns[0], &mut list_state);
+
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                detail_title,
+                Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(description),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    format!("{}: ", i18n.text("settings_current")),
+                    Style::default().fg(MUTED),
+                ),
+                Span::styled(current, Style::default().fg(RED)),
+            ]),
+        ])
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .title(i18n.text("settings_description"))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(MUTED)),
+        ),
+        columns[1],
+    );
+}
+
+fn settings_option_item(label: &str, current: &str, width: usize) -> ListItem<'static> {
+    let current = format!("[{current}]");
+    let padding = width
+        .saturating_sub(display_width(label) + display_width(&current))
+        .max(1);
+    ListItem::new(format!("{label}{}{current}", " ".repeat(padding)))
+}

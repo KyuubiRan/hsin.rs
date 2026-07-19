@@ -91,6 +91,7 @@ async fn run() -> Result<()> {
     let _instance = InstanceGuard::acquire(&paths.lock)?;
     let app = app::App::open(&paths)?;
     app.recover_operations()?;
+    app.initialize_providers()?;
     let mut rpc = tokio::spawn(rpc::serve(app.clone()));
     tokio::task::yield_now().await;
     let proxy = tokio::spawn(proxy::serve(app.clone()));

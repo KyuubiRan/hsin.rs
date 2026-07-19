@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use hsin_core::LANGUAGE_SYSTEM;
+
 const EN_US: &str = include_str!("../../../locales/en-US.json");
 const ZH_CN: &str = include_str!("../../../locales/zh-CN.json");
 
@@ -12,11 +14,9 @@ pub struct I18n {
 impl I18n {
     pub fn new(requested: Option<&str>) -> Self {
         let fallback = parse(EN_US);
-        let language = requested
-            .map(str::to_owned)
-            .or_else(|| std::env::var("LANG").ok())
-            .unwrap_or_else(|| String::from("en-US"));
-        let primary = if language.to_ascii_lowercase().starts_with("zh") {
+        let system = system_locale();
+        let language = resolve_language(requested, system.as_deref());
+        let primary = if is_chinese(&language) {
             parse(ZH_CN)
         } else {
             fallback.clone()
@@ -32,7 +32,9 @@ impl I18n {
     }
 
     pub fn set_language(&mut self, language: &str) {
-        self.primary = if language.to_ascii_lowercase().starts_with("zh") {
+        let system = system_locale();
+        let language = resolve_language(Some(language), system.as_deref());
+        self.primary = if is_chinese(&language) {
             parse(ZH_CN)
         } else {
             self.fallback.clone()
@@ -66,6 +68,32 @@ impl I18n {
     }
 }
 
+fn system_locale() -> Option<String> {
+    sys_locale::get_locale()
+        .or_else(|| {
+            std::env::var("LC_ALL")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            std::env::var("LC_MESSAGES")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| std::env::var("LANG").ok().filter(|value| !value.is_empty()))
+}
+
+fn resolve_language(requested: Option<&str>, system: Option<&str>) -> String {
+    match requested {
+        None | Some(LANGUAGE_SYSTEM) => system.unwrap_or("en-US").to_owned(),
+        Some(language) => language.to_owned(),
+    }
+}
+
+fn is_chinese(language: &str) -> bool {
+    language.to_ascii_lowercase().starts_with("zh")
+}
+
 fn parse(input: &str) -> BTreeMap<String, String> {
     serde_json::from_str(input).expect("embedded locale must be valid JSON")
 }
@@ -84,6 +112,16 @@ mod tests {
     #[test]
     fn unknown_language_falls_back_to_english() {
         assert_eq!(I18n::new(Some("fr-FR")).text("title"), "Heart / HSIN");
+    }
+
+    #[test]
+    fn system_language_uses_the_detected_locale() {
+        assert_eq!(
+            resolve_language(Some(LANGUAGE_SYSTEM), Some("zh-CN")),
+            "zh-CN"
+        );
+        assert_eq!(resolve_language(None, Some("en-US")), "en-US");
+        assert_eq!(resolve_language(Some("zh-CN"), Some("en-US")), "zh-CN");
     }
 
     #[test]

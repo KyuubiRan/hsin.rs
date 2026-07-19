@@ -29,6 +29,41 @@ struct ProxyState {
 }
 
 pub async fn serve(app: Arc<App>) -> Result<()> {
+    let mut enabled = app.subscribe_proxy_enabled();
+    loop {
+        while !*enabled.borrow() {
+            tokio::select! {
+                () = app.wait_shutdown() => return Ok(()),
+                changed = enabled.changed() => {
+                    if changed.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if let Err(error) = serve_enabled(app.clone(), &mut enabled).await {
+            app.mark_proxy_listening(false);
+            tracing::warn!(%error, "local proxy failed; retrying while enabled");
+            tokio::select! {
+                () = app.wait_shutdown() => return Ok(()),
+                () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                changed = enabled.changed() => {
+                    if changed.is_err() {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if app.is_shutdown_requested() {
+            return Ok(());
+        }
+    }
+}
+
+async fn serve_enabled(
+    app: Arc<App>,
+    enabled: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), app.proxy_port()?);
     let listener = TcpListener::bind(address).await?;
     let state = ProxyState {
@@ -48,8 +83,18 @@ pub async fn serve(app: Arc<App>) -> Result<()> {
     let result = axum::serve(listener, router)
         .with_graceful_shutdown({
             let app = app.clone();
+            let mut enabled = enabled.clone();
             async move {
-                app.wait_shutdown().await;
+                loop {
+                    tokio::select! {
+                        () = app.wait_shutdown() => break,
+                        changed = enabled.changed() => {
+                            if changed.is_err() || !*enabled.borrow() {
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         })
         .await;
@@ -110,6 +155,12 @@ async fn forward(
             } else {
                 return text_response(StatusCode::BAD_GATEWAY, "invalid upstream credential");
             }
+        }
+        AuthScheme::OAuth => {
+            return text_response(
+                StatusCode::BAD_GATEWAY,
+                "Official OAuth providers cannot use the local proxy",
+            );
         }
     }
     let outgoing = state
@@ -278,8 +329,10 @@ mod tests {
                     provider: ProviderDraft {
                         client,
                         name: name.to_owned(),
+                        description: String::new(),
                         base_url,
                         auth_scheme,
+                        model: None,
                     },
                     secret: SecretInput::Replace(secret.to_owned()),
                 })

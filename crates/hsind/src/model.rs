@@ -1,6 +1,6 @@
 pub use hsin_core::{AuthScheme, ClientKind, ClientState, ConfigStatus, ConnectionMode, Provider};
 
-use hsin_core::ProviderDraft;
+use hsin_core::{ProviderDraft, provider_name_from_url};
 
 use crate::error::{DaemonError, Result};
 
@@ -8,17 +8,30 @@ use crate::error::{DaemonError, Result};
 pub struct ProviderInput {
     pub client: ClientKind,
     pub name: String,
+    pub description: String,
     pub base_url: String,
     pub auth_scheme: AuthScheme,
+    pub model: Option<String>,
 }
 
 impl ProviderInput {
+    pub fn normalized_name(&self) -> Result<String> {
+        let name = self.name.trim();
+        if !name.is_empty() {
+            return Ok(name.to_owned());
+        }
+        provider_name_from_url(&self.base_url)
+            .ok_or_else(|| DaemonError::Invalid("provider URL must include a host".into()))
+    }
+
     pub fn validate(&self) -> Result<()> {
         let draft = ProviderDraft {
             client: self.client,
-            name: self.name.clone(),
+            name: self.normalized_name()?,
+            description: self.description.clone(),
             base_url: self.base_url.clone(),
             auth_scheme: self.auth_scheme,
+            model: self.model.clone(),
         };
         draft
             .validate()
@@ -48,8 +61,10 @@ mod tests {
         ProviderInput {
             client: ClientKind::Codex,
             name: "test".into(),
+            description: String::new(),
             base_url: url.into(),
             auth_scheme: AuthScheme::Bearer,
+            model: None,
         }
     }
 
@@ -61,5 +76,15 @@ mod tests {
         assert!(input("http://127.0.0.1.evil.test/v1").validate().is_err());
         assert!(input("http://localhost.evil.test/v1").validate().is_err());
         assert!(input("http://example.test/v1").validate().is_err());
+    }
+
+    #[test]
+    fn empty_name_uses_registrable_domain_label() {
+        let mut provider = input("https://api.example.test/v1");
+        provider.name.clear();
+        assert_eq!(provider.normalized_name().unwrap(), "example");
+        provider.base_url = "https://ai.router.team/v1".into();
+        assert_eq!(provider.normalized_name().unwrap(), "router");
+        assert!(provider.validate().is_ok());
     }
 }

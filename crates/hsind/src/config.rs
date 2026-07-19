@@ -14,11 +14,23 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use toml_edit::{DocumentMut, ImDocument, Item, Table, value};
+use zeroize::Zeroizing;
 
 use crate::{
     error::{DaemonError, Result},
-    model::{ClientKind, ConnectionMode, Provider},
+    model::{AuthScheme, ClientKind, ConnectionMode, Provider},
 };
+
+pub const CODEX_OFFICIAL_URL: &str = "https://api.openai.com/v1";
+pub const CLAUDE_OFFICIAL_URL: &str = "https://api.anthropic.com";
+
+pub struct DetectedProvider {
+    pub name: String,
+    pub base_url: String,
+    pub auth_scheme: AuthScheme,
+    pub secret: Option<Zeroizing<String>>,
+    pub official: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigTarget {
@@ -44,6 +56,161 @@ pub fn default_config_path(client: ClientKind) -> Result<PathBuf> {
     })
 }
 
+pub fn detect_current(path: &Path, client: ClientKind) -> Result<DetectedProvider> {
+    let text = if path.exists() {
+        fs::read_to_string(path).map_err(|error| {
+            DaemonError::Config(format!("cannot read {}: {error}", path.display()))
+        })?
+    } else {
+        String::new()
+    };
+    match client {
+        ClientKind::Codex => detect_codex(&text),
+        ClientKind::Claude => detect_claude(&text),
+    }
+}
+
+fn detect_codex(text: &str) -> Result<DetectedProvider> {
+    let document = text
+        .parse::<DocumentMut>()
+        .map_err(|error| DaemonError::Config(error.to_string()))?;
+    let provider_id = document
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .unwrap_or("openai");
+    if provider_id == "openai" {
+        let base_url = document
+            .get("openai_base_url")
+            .and_then(Item::as_str)
+            .unwrap_or(CODEX_OFFICIAL_URL)
+            .trim_end_matches('/')
+            .to_owned();
+        if same_url(&base_url, CODEX_OFFICIAL_URL) {
+            return Ok(official_provider(ClientKind::Codex));
+        }
+        return Ok(DetectedProvider {
+            name: imported_name("OpenAI", &base_url),
+            base_url,
+            auth_scheme: AuthScheme::Bearer,
+            secret: std::env::var("OPENAI_API_KEY")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(Zeroizing::new),
+            official: false,
+        });
+    }
+
+    let provider = document
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .and_then(|providers| providers.get(provider_id))
+        .and_then(Item::as_table)
+        .ok_or_else(|| {
+            DaemonError::Config(format!("active Codex provider {provider_id} is missing"))
+        })?;
+    let base_url = provider
+        .get("base_url")
+        .and_then(Item::as_str)
+        .ok_or_else(|| DaemonError::Config("active Codex provider has no base_url".into()))?
+        .trim_end_matches('/')
+        .to_owned();
+    if same_url(&base_url, CODEX_OFFICIAL_URL)
+        && provider
+            .get("requires_openai_auth")
+            .and_then(Item::as_bool)
+            .unwrap_or(false)
+    {
+        return Ok(official_provider(ClientKind::Codex));
+    }
+    let name = provider
+        .get("name")
+        .and_then(Item::as_str)
+        .map_or_else(|| imported_name(provider_id, &base_url), str::to_owned);
+    let secret = provider
+        .get("experimental_bearer_token")
+        .and_then(Item::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| Zeroizing::new(value.to_owned()))
+        .or_else(|| {
+            provider
+                .get("env_key")
+                .and_then(Item::as_str)
+                .and_then(|key| std::env::var(key).ok())
+                .filter(|value| !value.trim().is_empty())
+                .map(Zeroizing::new)
+        });
+    Ok(DetectedProvider {
+        name,
+        base_url,
+        auth_scheme: AuthScheme::Bearer,
+        secret,
+        official: false,
+    })
+}
+
+fn detect_claude(text: &str) -> Result<DetectedProvider> {
+    let value = if text.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        jsonc_parser::parse_to_serde_value(text, &jsonc_parser::ParseOptions::default())
+            .map_err(|error| DaemonError::Config(error.to_string()))?
+            .ok_or_else(|| DaemonError::Config("empty Claude settings".into()))?
+    };
+    let env = value.get("env");
+    let base_url = env
+        .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(CLAUDE_OFFICIAL_URL)
+        .trim_end_matches('/')
+        .to_owned();
+    if same_url(&base_url, CLAUDE_OFFICIAL_URL) {
+        return Ok(official_provider(ClientKind::Claude));
+    }
+    let auth_token = env
+        .and_then(|env| env.get("ANTHROPIC_AUTH_TOKEN"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    let api_key = env
+        .and_then(|env| env.get("ANTHROPIC_API_KEY"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    Ok(DetectedProvider {
+        name: imported_name("Claude", &base_url),
+        base_url,
+        auth_scheme: if auth_token.is_some() {
+            AuthScheme::Bearer
+        } else {
+            AuthScheme::XApiKey
+        },
+        secret: auth_token
+            .or(api_key)
+            .map(|value| Zeroizing::new(value.to_owned())),
+        official: false,
+    })
+}
+
+pub fn official_provider(client: ClientKind) -> DetectedProvider {
+    let base_url = match client {
+        ClientKind::Codex => CODEX_OFFICIAL_URL,
+        ClientKind::Claude => CLAUDE_OFFICIAL_URL,
+    };
+    DetectedProvider {
+        name: "Official".into(),
+        base_url: base_url.into(),
+        auth_scheme: AuthScheme::OAuth,
+        secret: None,
+        official: true,
+    }
+}
+
+fn imported_name(fallback: &str, base_url: &str) -> String {
+    hsin_core::provider_name_from_url(base_url).unwrap_or_else(|| fallback.to_owned())
+}
+
+fn same_url(left: &str, right: &str) -> bool {
+    left.trim_end_matches('/').eq_ignore_ascii_case(right)
+}
+
 pub fn apply(path: &Path, expected_hash: Option<&str>, target: &ConfigTarget) -> Result<String> {
     atomic_patch(path, expected_hash, |before| patch_text(before, target))
 }
@@ -64,6 +231,22 @@ pub fn file_hash(path: &Path) -> Result<Option<String>> {
 
 pub fn patch_codex(text: &str, target: &ConfigTarget) -> Result<String> {
     let mut output = text.to_owned();
+    if let Some(model) = target.provider.model.as_deref() {
+        let document = parse_toml(&output)?;
+        if let Some(existing) = document.get("model") {
+            let span = existing
+                .span()
+                .ok_or_else(|| DaemonError::Config("model has no source span".into()))?;
+            output.replace_range(span, &value(model).to_string());
+        } else {
+            let insertion = top_level_property_insertion(
+                &document,
+                &output,
+                &format!("model = {}", value(model)),
+            );
+            output.insert_str(insertion.offset, &insertion.text);
+        }
+    }
     let document = parse_toml(&output)?;
     if let Some(existing) = document.get("model_provider") {
         let span = existing
@@ -126,6 +309,10 @@ fn codex_provider_table(target: &ConfigTarget) -> Table {
     provider["name"] = value("hsin");
     provider["base_url"] = value(base_url);
     provider["wire_api"] = value("responses");
+    if target.provider.official {
+        provider["requires_openai_auth"] = value(true);
+        return provider;
+    }
     let mut auth = Table::new();
     auth["command"] = value(target.credential_command.clone());
     let args = match target.mode {
@@ -168,6 +355,14 @@ struct TextInsertion {
 }
 
 fn top_level_insertion(document: &ImDocument<String>, text: &str) -> TextInsertion {
+    top_level_property_insertion(document, text, "model_provider = \"hsin\"")
+}
+
+fn top_level_property_insertion(
+    document: &ImDocument<String>,
+    text: &str,
+    property: &str,
+) -> TextInsertion {
     let mut ranges = Vec::new();
     for (_, item) in document.iter() {
         collect_table_starts(item, &mut ranges);
@@ -181,7 +376,7 @@ fn top_level_insertion(document: &ImDocument<String>, text: &str) -> TextInserti
     };
     TextInsertion {
         offset,
-        text: format!("{leading}model_provider = \"hsin\"{newline}"),
+        text: format!("{leading}{property}{newline}"),
     }
 }
 
@@ -270,6 +465,14 @@ pub fn patch_claude(text: &str, target: &ConfigTarget) -> Result<String> {
         text.to_owned()
     };
     validate_jsonc(&output)?;
+    if target.provider.official {
+        output = set_nested_string(&output, "env", "ANTHROPIC_BASE_URL", None)?;
+        output = set_nested_string(&output, "env", "ANTHROPIC_API_KEY", None)?;
+        output = set_nested_string(&output, "env", "ANTHROPIC_AUTH_TOKEN", None)?;
+        output = set_root_string(&output, "apiKeyHelper", None)?;
+        validate_jsonc(&output)?;
+        return Ok(output);
+    }
     let base_url = match target.mode {
         ConnectionMode::Direct => target.provider.base_url.trim_end_matches('/').to_owned(),
         ConnectionMode::Proxy => format!("http://127.0.0.1:{}/claude", target.proxy_port),
@@ -735,13 +938,103 @@ mod tests {
                 id: "p".into(),
                 client,
                 name: "Provider".into(),
+                description: String::new(),
                 base_url: "https://example.test/v1".into(),
                 auth_scheme: AuthScheme::Bearer,
+                official: false,
+                credential_configured: true,
+                credential_preview: None,
+                model: None,
                 revision: 1,
             },
             credential_command: "/opt/hsin".into(),
             proxy_port: 9999,
         }
+    }
+
+    #[test]
+    fn detects_official_and_custom_current_providers_without_exposing_secrets() {
+        let official = detect_codex("model_provider = \"openai\"\n").unwrap();
+        assert!(official.official);
+        assert_eq!(official.auth_scheme, AuthScheme::OAuth);
+        assert!(official.secret.is_none());
+
+        let custom = detect_codex(
+            "model_provider = \"acme\"\n[model_providers.acme]\nname = \"Acme\"\nbase_url = \"https://api.acme.test/v1\"\nexperimental_bearer_token = \"secret\"\n",
+        )
+        .unwrap();
+        assert!(!custom.official);
+        assert_eq!(custom.name, "Acme");
+        assert_eq!(custom.auth_scheme, AuthScheme::Bearer);
+        assert!(custom.secret.is_some());
+
+        let claude = detect_claude(
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://claude.acme.test","ANTHROPIC_API_KEY":"secret"}}"#,
+        )
+        .unwrap();
+        assert!(!claude.official);
+        assert_eq!(claude.auth_scheme, AuthScheme::XApiKey);
+        assert!(claude.secret.is_some());
+    }
+
+    #[test]
+    fn official_configuration_restores_native_auth_and_preserves_unowned_fields() {
+        let mut codex = target(ClientKind::Codex);
+        codex.provider = Provider {
+            id: "official-codex".into(),
+            client: ClientKind::Codex,
+            name: "Official".into(),
+            description: String::new(),
+            base_url: CODEX_OFFICIAL_URL.into(),
+            auth_scheme: AuthScheme::OAuth,
+            official: true,
+            credential_configured: false,
+            credential_preview: None,
+            model: None,
+            revision: 1,
+        };
+        let patched = patch_codex(
+            "# keep\nmodel_provider = \"hsin\"\napproval_policy = \"never\"\n[model_providers.hsin]\nname = \"hsin\"\nbase_url = \"http://127.0.0.1:9999/codex/v1\"\n",
+            &codex,
+        )
+        .unwrap();
+        assert!(patched.contains("model_provider = \"hsin\""));
+        assert!(patched.contains("requires_openai_auth = true"));
+        assert!(patched.contains("# keep"));
+        assert!(patched.contains("approval_policy = \"never\""));
+        assert!(patched.contains("[model_providers.hsin]"));
+
+        let mut claude = target(ClientKind::Claude);
+        claude.provider = Provider {
+            id: "official-claude".into(),
+            client: ClientKind::Claude,
+            name: "Official".into(),
+            description: String::new(),
+            base_url: CLAUDE_OFFICIAL_URL.into(),
+            auth_scheme: AuthScheme::OAuth,
+            official: true,
+            credential_configured: false,
+            credential_preview: None,
+            model: None,
+            revision: 1,
+        };
+        let patched = patch_claude(
+            r#"{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:9999/claude",
+    "ANTHROPIC_API_KEY": "remove"
+  },
+  "apiKeyHelper": "remove",
+  "hooks": {"keep": true}
+}
+"#,
+            &claude,
+        )
+        .unwrap();
+        assert!(!patched.contains("ANTHROPIC_BASE_URL"));
+        assert!(!patched.contains("ANTHROPIC_API_KEY"));
+        assert!(!patched.contains("apiKeyHelper"));
+        assert!(patched.contains("\"hooks\""));
     }
 
     fn codex_unowned_items(text: &str) -> (NamedItems, NamedItems) {
@@ -828,6 +1121,19 @@ mod tests {
         let once = patch_codex(input, &target(ClientKind::Codex)).unwrap();
         let twice = patch_codex(&once, &target(ClientKind::Codex)).unwrap();
         assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn codex_updates_model_only_when_provider_selects_one() {
+        let input = "model = \"keep\" # preserve comment\napproval_policy = \"on-request\"\n";
+        let mut selected = target(ClientKind::Codex);
+        selected.provider.model = Some("gpt-5".into());
+        let output = patch_codex(input, &selected).unwrap();
+        assert!(output.contains("model = \"gpt-5\" # preserve comment"));
+        assert!(output.contains("approval_policy = \"on-request\""));
+
+        let unchanged = patch_codex(input, &target(ClientKind::Codex)).unwrap();
+        assert!(unchanged.contains("model = \"keep\" # preserve comment"));
     }
 
     #[test]

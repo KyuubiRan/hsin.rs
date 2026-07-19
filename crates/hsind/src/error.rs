@@ -13,6 +13,12 @@ pub enum DaemonError {
     Conflict(String),
     #[error("invalid input: {0}")]
     Invalid(String),
+    #[error("Official OAuth providers cannot use the local proxy")]
+    OAuthProxyUnsupported,
+    #[error("no active Provider is configured for this client")]
+    NoActiveProvider,
+    #[error("the current client configuration does not expose an importable API key")]
+    CurrentCredentialUnavailable,
     #[error("configuration error: {0}")]
     Config(String),
     #[error("protocol error: {0}")]
@@ -40,6 +46,9 @@ impl DaemonError {
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) => "conflict",
             Self::Invalid(_) => "invalid_input",
+            Self::OAuthProxyUnsupported => "oauth_proxy_unsupported",
+            Self::NoActiveProvider => "no_active_provider",
+            Self::CurrentCredentialUnavailable => "current_credential_unavailable",
             Self::Config(_) => "config_error",
             Self::Protocol(_) => "protocol_error",
             Self::Database(_) => "database_error",

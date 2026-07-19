@@ -13,7 +13,9 @@ use crate::{
     model::{AuthScheme, ClientKind, ClientState, ConnectionMode, Provider, ProviderInput},
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 3;
+
+const PROVIDER_COLUMNS: &str = "p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,EXISTS(SELECT 1 FROM provider_secrets configured WHERE configured.provider_id=p.id)";
 
 pub struct Database {
     connection: Mutex<Connection>,
@@ -54,13 +56,19 @@ impl Database {
         let connection = self.connection.lock();
         let mut output = Vec::new();
         if let Some(client) = client {
-            let mut statement = connection.prepare("SELECT id, client, name, base_url, auth_scheme, revision FROM providers WHERE client=?1 ORDER BY lower(name)")?;
+            let sql = format!(
+                "SELECT {PROVIDER_COLUMNS} FROM providers p WHERE p.client=?1 ORDER BY p.official DESC, lower(p.name)"
+            );
+            let mut statement = connection.prepare(&sql)?;
             let rows = statement.query_map([client.to_string()], provider_from_row)?;
             for row in rows {
                 output.push(row?);
             }
         } else {
-            let mut statement = connection.prepare("SELECT id, client, name, base_url, auth_scheme, revision FROM providers ORDER BY client, lower(name)")?;
+            let sql = format!(
+                "SELECT {PROVIDER_COLUMNS} FROM providers p ORDER BY p.client, p.official DESC, lower(p.name)"
+            );
+            let mut statement = connection.prepare(&sql)?;
             let rows = statement.query_map([], provider_from_row)?;
             for row in rows {
                 output.push(row?);
@@ -70,12 +78,15 @@ impl Database {
     }
 
     pub fn get_provider(&self, id: &str) -> Result<Provider> {
-        self.connection.lock().query_row(
-            "SELECT id, client, name, base_url, auth_scheme, revision FROM providers WHERE id=?1",
-            [id], provider_from_row,
-        ).optional()?.ok_or_else(|| DaemonError::NotFound(format!("provider {id}")))
+        let sql = format!("SELECT {PROVIDER_COLUMNS} FROM providers p WHERE p.id=?1");
+        self.connection
+            .lock()
+            .query_row(&sql, [id], provider_from_row)
+            .optional()?
+            .ok_or_else(|| DaemonError::NotFound(format!("provider {id}")))
     }
 
+    #[cfg(test)]
     pub fn add_provider(&self, input: &ProviderInput) -> Result<Provider> {
         let provider = Self::new_provider(input)?;
         self.insert_provider(&provider, None)?;
@@ -87,9 +98,14 @@ impl Database {
         Ok(Provider {
             id: uuid::Uuid::new_v4().to_string(),
             client: input.client,
-            name: input.name.trim().to_owned(),
+            name: input.normalized_name()?,
+            description: input.description.trim().to_owned(),
             base_url: input.base_url.trim().trim_end_matches('/').to_owned(),
             auth_scheme: input.auth_scheme,
+            official: false,
+            credential_configured: false,
+            credential_preview: None,
+            model: input.model.as_ref().map(|model| model.trim().to_owned()),
             revision: 1,
         })
     }
@@ -103,8 +119,8 @@ impl Database {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = unix_time()?;
         transaction.execute(
-            "INSERT INTO providers(id,client,name,base_url,auth_scheme,revision,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
-            params![provider.id, provider.client.to_string(), provider.name, provider.base_url, provider.auth_scheme.to_string(), provider.revision, now],
+            "INSERT INTO providers(id,client,name,description,base_url,auth_scheme,model,revision,official,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10)",
+            params![provider.id, provider.client.to_string(), provider.name, provider.description, provider.base_url, provider.auth_scheme.to_string(), provider.model, provider.revision, provider.official, now],
         ).map_err(map_constraint)?;
         if let Some(secret) = secret {
             upsert_secret(&transaction, secret, now)?;
@@ -123,8 +139,8 @@ impl Database {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = unix_time()?;
         let changed = transaction.execute(
-            "UPDATE providers SET name=?1,base_url=?2,auth_scheme=?3,revision=revision+1,updated_at=?4 WHERE id=?5 AND client=?6 AND revision=?7",
-            params![provider.name, provider.base_url, provider.auth_scheme.to_string(), now, provider.id, provider.client.to_string(), expected_revision],
+            "UPDATE providers SET name=?1,description=?2,base_url=?3,auth_scheme=?4,model=?5,revision=revision+1,updated_at=?6 WHERE id=?7 AND client=?8 AND revision=?9",
+            params![provider.name, provider.description, provider.base_url, provider.auth_scheme.to_string(), provider.model, now, provider.id, provider.client.to_string(), expected_revision],
         ).map_err(map_constraint)?;
         if changed == 0 {
             return Err(DaemonError::Conflict(
@@ -238,7 +254,7 @@ impl Database {
         self.connection
             .lock()
             .query_row(
-                "SELECT p.id,p.client,p.name,p.base_url,p.auth_scheme,p.revision,s.provider_id,s.key_version,s.nonce,s.ciphertext FROM providers p JOIN provider_secrets s ON s.provider_id=p.id WHERE p.id=?1 AND p.client=?2 AND p.revision=?3",
+                "SELECT p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,1,s.provider_id,s.key_version,s.nonce,s.ciphertext FROM providers p JOIN provider_secrets s ON s.provider_id=p.id WHERE p.id=?1 AND p.client=?2 AND p.revision=?3",
                 params![provider_id, client.to_string(), revision],
                 provider_secret_from_row,
             )
@@ -250,7 +266,7 @@ impl Database {
         self.connection
             .lock()
             .query_row(
-                "SELECT p.id,p.client,p.name,p.base_url,p.auth_scheme,p.revision,s.provider_id,s.key_version,s.nonce,s.ciphertext FROM client_state c JOIN providers p ON p.id=c.active_provider_id JOIN provider_secrets s ON s.provider_id=p.id WHERE c.client=?1 AND p.client=?1",
+                "SELECT p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,1,s.provider_id,s.key_version,s.nonce,s.ciphertext FROM client_state c JOIN providers p ON p.id=c.active_provider_id JOIN provider_secrets s ON s.provider_id=p.id WHERE c.client=?1 AND p.client=?1",
                 [client.to_string()],
                 provider_secret_from_row,
             )
@@ -384,19 +400,43 @@ fn migrate(connection: &Connection) -> Result<()> {
     if version == SCHEMA_VERSION {
         return Ok(());
     }
-    connection.execute_batch(
-        "BEGIN IMMEDIATE;
-         CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY,client TEXT NOT NULL CHECK(client IN ('codex','claude')),name TEXT NOT NULL,base_url TEXT NOT NULL,auth_scheme TEXT NOT NULL CHECK(auth_scheme IN ('bearer','x_api_key')),revision INTEGER NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(client,name));
+    if version == 0 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+         CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY,client TEXT NOT NULL CHECK(client IN ('codex','claude')),name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',base_url TEXT NOT NULL,auth_scheme TEXT NOT NULL CHECK(auth_scheme IN ('bearer','x_api_key','oauth')),model TEXT,revision INTEGER NOT NULL,official INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(client,name));
          CREATE TABLE IF NOT EXISTS provider_secrets(provider_id TEXT PRIMARY KEY REFERENCES providers(id) ON DELETE CASCADE,key_version INTEGER NOT NULL,nonce BLOB NOT NULL,ciphertext BLOB NOT NULL,updated_at INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS client_state(client TEXT PRIMARY KEY CHECK(client IN ('codex','claude')),active_provider_id TEXT REFERENCES providers(id),mode TEXT NOT NULL CHECK(mode IN ('direct','proxy')),config_status TEXT NOT NULL,updated_at INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,kind TEXT NOT NULL,client TEXT NOT NULL,state TEXT NOT NULL,before_hash TEXT,target_json TEXT NOT NULL,error TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS encryption_keys(version INTEGER PRIMARY KEY,verifier_nonce BLOB NOT NULL,verifier BLOB NOT NULL,created_at INTEGER NOT NULL,is_current INTEGER NOT NULL);
          INSERT OR IGNORE INTO client_state(client,mode,config_status,updated_at) VALUES('codex','direct','unmanaged',0),('claude','direct','unmanaged',0);
-         INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES('language','en-US',0),('proxy_port','9999',0);
-         PRAGMA user_version=1;
+         INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES('language','system',0),('proxy_port','9999',0),('proxy_enabled','false',0);
+         PRAGMA user_version=3;
          COMMIT;"
-    )?;
+        )?;
+    } else {
+        if version == 1 {
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE providers ADD COLUMN description TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE providers ADD COLUMN model TEXT;
+                 PRAGMA user_version=2;
+                 COMMIT;",
+            )?;
+        }
+        connection.execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             BEGIN IMMEDIATE;
+             CREATE TABLE providers_v3(id TEXT PRIMARY KEY,client TEXT NOT NULL CHECK(client IN ('codex','claude')),name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',base_url TEXT NOT NULL,auth_scheme TEXT NOT NULL CHECK(auth_scheme IN ('bearer','x_api_key','oauth')),model TEXT,revision INTEGER NOT NULL,official INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(client,name));
+             INSERT INTO providers_v3(id,client,name,description,base_url,auth_scheme,model,revision,official,created_at,updated_at) SELECT id,client,name,description,base_url,auth_scheme,model,revision,0,created_at,updated_at FROM providers;
+             DROP TABLE providers;
+             ALTER TABLE providers_v3 RENAME TO providers;
+             INSERT OR IGNORE INTO settings(key,value,updated_at) SELECT 'proxy_enabled',CASE WHEN EXISTS(SELECT 1 FROM client_state WHERE mode='proxy') THEN 'true' ELSE 'false' END,0;
+             PRAGMA user_version=3;
+             COMMIT;
+             PRAGMA foreign_keys=ON;",
+        )?;
+    }
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version != SCHEMA_VERSION {
         return Err(DaemonError::Database(rusqlite::Error::InvalidQuery));
@@ -453,14 +493,19 @@ fn prune_backups(directory: &Path) -> Result<()> {
 
 fn provider_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Provider> {
     let client: String = row.get(1)?;
-    let auth: String = row.get(4)?;
+    let auth: String = row.get(5)?;
     Ok(Provider {
         id: row.get(0)?,
         client: ClientKind::from_str(&client).map_err(parse_to_sql_error)?,
         name: row.get(2)?,
-        base_url: row.get(3)?,
+        description: row.get(3)?,
+        base_url: row.get(4)?,
         auth_scheme: AuthScheme::from_str(&auth).map_err(parse_to_sql_error)?,
-        revision: row.get(5)?,
+        model: row.get(6)?,
+        revision: row.get(7)?,
+        official: row.get(8)?,
+        credential_configured: row.get(9)?,
+        credential_preview: None,
     })
 }
 
@@ -469,10 +514,10 @@ fn provider_secret_from_row(
 ) -> rusqlite::Result<(Provider, EncryptedSecret)> {
     let provider = provider_from_row(row)?;
     let secret = EncryptedSecret {
-        provider_id: row.get(6)?,
-        key_version: row.get(7)?,
-        nonce: row.get(8)?,
-        ciphertext: row.get(9)?,
+        provider_id: row.get(10)?,
+        key_version: row.get(11)?,
+        nonce: row.get(12)?,
+        ciphertext: row.get(13)?,
     };
     Ok((provider, secret))
 }
@@ -520,20 +565,28 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let db = Database::open(&root.join("db.sqlite"), &root.join("backups")).unwrap();
         assert_eq!(db.integrity_check().unwrap(), "ok");
+        assert_eq!(
+            db.setting("language").unwrap().as_deref(),
+            Some(hsin_core::LANGUAGE_SYSTEM)
+        );
         let provider = db
             .add_provider(&ProviderInput {
                 client: ClientKind::Codex,
                 name: "Test".into(),
+                description: "Primary account".into(),
                 base_url: "https://example.test/v1".into(),
                 auth_scheme: AuthScheme::Bearer,
+                model: Some("gpt-test".into()),
             })
             .unwrap();
         assert_eq!(provider.revision, 1);
         let second = Database::new_provider(&ProviderInput {
             client: ClientKind::Claude,
             name: "Atomic".into(),
+            description: String::new(),
             base_url: "https://example.test".into(),
             auth_scheme: AuthScheme::XApiKey,
+            model: None,
         })
         .unwrap();
         let encrypted = EncryptedSecret {
@@ -582,6 +635,73 @@ mod tests {
             Err(DaemonError::UnsupportedDatabaseVersion(99))
         ));
         assert_eq!(database_version(&path).unwrap(), 99);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn version_one_database_is_backed_up_and_migrated() {
+        let root = std::env::temp_dir().join(format!("hsind-v1-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("db.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE providers(id TEXT PRIMARY KEY,client TEXT NOT NULL,name TEXT NOT NULL,base_url TEXT NOT NULL,auth_scheme TEXT NOT NULL,revision INTEGER NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(client,name));
+                 CREATE TABLE provider_secrets(provider_id TEXT PRIMARY KEY REFERENCES providers(id) ON DELETE CASCADE,key_version INTEGER NOT NULL,nonce BLOB NOT NULL,ciphertext BLOB NOT NULL,updated_at INTEGER NOT NULL);
+                 CREATE TABLE client_state(client TEXT PRIMARY KEY,active_provider_id TEXT REFERENCES providers(id),mode TEXT NOT NULL,config_status TEXT NOT NULL,updated_at INTEGER NOT NULL);
+                 CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL);
+                 INSERT INTO providers VALUES('p','codex','Legacy','https://example.test/v1','bearer',1,0,0);
+                 INSERT INTO client_state VALUES('codex','p','direct','synchronized',0),('claude',NULL,'direct','unmanaged',0);
+                 PRAGMA user_version=1;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let backups = root.join("backups");
+        let db = Database::open(&path, &backups).unwrap();
+        let provider = db.get_provider("p").unwrap();
+        assert_eq!(provider.description, "");
+        assert_eq!(provider.model, None);
+        assert!(!provider.official);
+        assert!(!provider.credential_configured);
+        assert_eq!(database_version(&path).unwrap(), 3);
+        assert_eq!(fs::read_dir(backups).unwrap().count(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn version_two_migration_preserves_secrets_and_proxy_state() {
+        let root = std::env::temp_dir().join(format!("hsind-v2-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("db.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys=ON;
+                 CREATE TABLE providers(id TEXT PRIMARY KEY,client TEXT NOT NULL,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',base_url TEXT NOT NULL,auth_scheme TEXT NOT NULL,model TEXT,revision INTEGER NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(client,name));
+                 CREATE TABLE provider_secrets(provider_id TEXT PRIMARY KEY REFERENCES providers(id) ON DELETE CASCADE,key_version INTEGER NOT NULL,nonce BLOB NOT NULL,ciphertext BLOB NOT NULL,updated_at INTEGER NOT NULL);
+                 CREATE TABLE client_state(client TEXT PRIMARY KEY,active_provider_id TEXT REFERENCES providers(id),mode TEXT NOT NULL,config_status TEXT NOT NULL,updated_at INTEGER NOT NULL);
+                 CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL);
+                 CREATE TABLE operations(id TEXT PRIMARY KEY,kind TEXT NOT NULL,client TEXT NOT NULL,state TEXT NOT NULL,before_hash TEXT,target_json TEXT NOT NULL,error TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+                 CREATE TABLE encryption_keys(version INTEGER PRIMARY KEY,verifier_nonce BLOB NOT NULL,verifier BLOB NOT NULL,created_at INTEGER NOT NULL,is_current INTEGER NOT NULL);
+                 INSERT INTO providers VALUES('p','codex','Legacy','','https://example.test/v1','bearer',NULL,1,0,0);
+                 INSERT INTO provider_secrets VALUES('p',1,X'00',X'01',0);
+                 INSERT INTO client_state VALUES('codex','p','proxy','synchronized',0),('claude',NULL,'direct','unmanaged',0);
+                 PRAGMA user_version=2;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let db = Database::open(&path, &root.join("backups")).unwrap();
+        let provider = db.get_provider("p").unwrap();
+        assert!(!provider.official);
+        assert!(provider.credential_configured);
+        assert_eq!(db.secret("p").unwrap().ciphertext, vec![1]);
+        assert_eq!(
+            db.setting("proxy_enabled").unwrap().as_deref(),
+            Some("true")
+        );
+        assert_eq!(database_version(&path).unwrap(), 3);
         fs::remove_dir_all(root).unwrap();
     }
 }

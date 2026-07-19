@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use hsin_core::{
-    ClientKind, ImportCurrentParams, ModeSetParams, PROTOCOL_VERSION, ProviderListParams,
-    SettingsPatch,
+    ClientKind, ImportCurrentParams, ModeSetParams, ModelDiscoverParams, PROTOCOL_VERSION,
+    ProviderListParams, SettingsPatch, VERSION_CODE,
 };
 use hsin_ipc::{
     HelloParams, HelloResult, IpcListener, JsonRpcRequest, JsonRpcResponse, RpcError, capability,
@@ -90,14 +90,22 @@ async fn serve_connection(
                         params.protocol_version, PROTOCOL_VERSION
                     )));
                 }
+                if params.version_code != VERSION_CODE {
+                    return Err(DaemonError::Protocol(format!(
+                        "version code {} is incompatible with {}",
+                        params.version_code, VERSION_CODE
+                    )));
+                }
                 Ok(HelloResult {
                     protocol_version: PROTOCOL_VERSION,
+                    version_code: VERSION_CODE,
                     daemon_version: env!("CARGO_PKG_VERSION").into(),
                     capabilities: vec![
                         capability::PROVIDERS.into(),
                         capability::LOCAL_PROXY.into(),
                         capability::SECURITY.into(),
                         capability::CONFIG_SAGA.into(),
+                        capability::MODEL_DISCOVERY.into(),
                     ],
                 })
             }) {
@@ -155,6 +163,13 @@ async fn dispatch(
         method::PROVIDER_IMPORT_CURRENT => call!(
             async {
                 app.import_current(parse::<ImportCurrentParams>(params)?)
+                    .await
+            }
+            .await
+        ),
+        method::PROVIDER_DISCOVER_MODELS => call!(
+            async {
+                app.discover_models(parse::<ModelDiscoverParams>(params)?)
                     .await
             }
             .await

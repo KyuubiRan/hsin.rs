@@ -14,7 +14,10 @@ hsin-ipc = { path = "../hsin-ipc" }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sys-locale = "0.3"
 tokio = { version = "1.47", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+unicode-width = "0.2"
+url = "2"
 zeroize = "1.8"
 
 [[bin]]

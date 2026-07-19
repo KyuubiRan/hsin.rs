@@ -2,8 +2,9 @@ use std::io::{self, Read, Write};
 
 use anyhow::{Context, Result, bail};
 use hsin_core::{
-    ClientKind, ImportCurrentParams, ModeSetParams, Provider, ProviderAddParams, ProviderDraft,
-    ProviderEditParams, ProviderPatch, ProviderRemoveParams, ProviderSwitchParams, SecretInput,
+    ClientKind, ImportCurrentParams, ModeSetParams, ModelUpdate, Provider, ProviderAddParams,
+    ProviderDraft, ProviderEditParams, ProviderPatch, ProviderRemoveParams, ProviderSwitchParams,
+    SecretInput,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -21,7 +22,7 @@ pub async fn run(cli: Cli, i18n: &mut I18n) -> Result<()> {
     let Some(command) = cli.command else {
         let client = DaemonClient::connect_or_bootstrap().await?;
         synchronize_language(&client, i18n, language_overridden).await;
-        return tui::run(client, i18n).await;
+        return tui::run(client, i18n, !language_overridden).await;
     };
 
     if let Command::Daemon { command } = command {
@@ -108,8 +109,10 @@ async fn run_provider(command: ProviderCommand, client: &DaemonClient, json: boo
                 provider: ProviderDraft {
                     client: kind,
                     name: args.name,
+                    description: args.description,
                     base_url: args.base_url,
                     auth_scheme,
+                    model: args.model,
                 },
                 secret: secret.map_or(SecretInput::Clear, SecretInput::Replace),
             };
@@ -126,6 +129,8 @@ async fn run_provider(command: ProviderCommand, client: &DaemonClient, json: boo
                     name: args.name,
                     base_url: args.base_url,
                     auth_scheme: args.auth_scheme.map(Into::into),
+                    description: args.description,
+                    model: args.model.map_or(ModelUpdate::Preserve, ModelUpdate::Set),
                 },
                 secret: secret.map_or(SecretInput::Preserve, SecretInput::Replace),
             };

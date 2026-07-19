@@ -323,8 +323,13 @@ fn make_verifier(key: &[u8; KEY_BYTES], version: u32) -> Result<(Vec<u8>, Vec<u8
         id: "master-key".into(),
         client: ClientKind::Codex,
         name: String::new(),
+        description: String::new(),
         base_url: String::new(),
         auth_scheme: crate::model::AuthScheme::Bearer,
+        official: false,
+        credential_configured: false,
+        credential_preview: None,
+        model: None,
         revision: 0,
     };
     let encrypted = encrypt_secret(&provider, VERIFIER_TEXT, &material)?;
@@ -337,8 +342,13 @@ fn verify_key(key: &[u8; KEY_BYTES], version: u32, nonce: &[u8], verifier: &[u8]
         id: "master-key".into(),
         client: ClientKind::Codex,
         name: String::new(),
+        description: String::new(),
         base_url: String::new(),
         auth_scheme: crate::model::AuthScheme::Bearer,
+        official: false,
+        credential_configured: false,
+        credential_preview: None,
+        model: None,
         revision: 0,
     };
     let encrypted = EncryptedSecret {
@@ -438,8 +448,10 @@ mod tests {
             .add_provider(&ProviderInput {
                 client: ClientKind::Codex,
                 name: "x".into(),
+                description: String::new(),
                 base_url: "https://example.test".into(),
                 auth_scheme: AuthScheme::Bearer,
+                model: None,
             })
             .unwrap();
         let encrypted = crypto.encrypt_for(&provider, "secret").unwrap();

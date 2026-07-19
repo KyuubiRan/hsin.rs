@@ -8,7 +8,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// UI language (zh-CN or en-US).
+    /// UI language (system, en-US, or zh-CN).
     #[arg(long, global = true, env = "HSIN_LANGUAGE")]
     pub language: Option<String>,
 
@@ -94,10 +94,14 @@ pub struct ProviderSwitch {
 pub struct ProviderAdd {
     #[arg(value_enum)]
     pub client: ClientArg,
-    #[arg(long)]
+    #[arg(long, default_value = "")]
     pub name: String,
+    #[arg(long, default_value = "")]
+    pub description: String,
     #[arg(long)]
     pub base_url: String,
+    #[arg(long)]
+    pub model: Option<String>,
     #[arg(long, value_enum)]
     pub auth_scheme: Option<AuthArg>,
     /// Read the API key from standard input. This avoids exposing it in process arguments.
@@ -111,7 +115,11 @@ pub struct ProviderEdit {
     #[arg(long)]
     pub name: Option<String>,
     #[arg(long)]
+    pub description: Option<String>,
+    #[arg(long)]
     pub base_url: Option<String>,
+    #[arg(long)]
+    pub model: Option<String>,
     #[arg(long, value_enum)]
     pub auth_scheme: Option<AuthArg>,
     /// Replace the API key with a value read from standard input.

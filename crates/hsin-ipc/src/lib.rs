@@ -31,7 +31,7 @@ use interprocess::os::windows::{
 #[cfg(windows)]
 use widestring::U16CString;
 
-pub use hsin_core::PROTOCOL_VERSION;
+pub use hsin_core::{PROTOCOL_VERSION, VERSION_CODE};
 
 pub const JSON_RPC_VERSION: &str = "2.0";
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
@@ -50,6 +50,7 @@ pub mod method {
     pub const PROVIDER_REMOVE: &str = "provider.remove";
     pub const PROVIDER_SWITCH: &str = "provider.switch";
     pub const PROVIDER_IMPORT_CURRENT: &str = "provider.import_current";
+    pub const PROVIDER_DISCOVER_MODELS: &str = "provider.discover_models";
     pub const MODE_SET: &str = "mode.set";
     pub const STATUS: &str = "status";
     pub const DOCTOR: &str = "doctor";
@@ -69,11 +70,14 @@ pub mod capability {
     pub const LOCAL_PROXY: &str = "local_proxy.v1";
     pub const SECURITY: &str = "security.v1";
     pub const CONFIG_SAGA: &str = "config_saga.v1";
+    pub const MODEL_DISCOVERY: &str = "model_discovery.v1";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelloParams {
     pub protocol_version: u32,
+    #[serde(default)]
+    pub version_code: u32,
     pub client_name: String,
     pub client_version: String,
     #[serde(default)]
@@ -85,6 +89,7 @@ impl HelloParams {
     pub fn new(client_name: impl Into<String>, client_version: impl Into<String>) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
+            version_code: VERSION_CODE,
             client_name: client_name.into(),
             client_version: client_version.into(),
             capabilities: Vec::new(),
@@ -95,6 +100,8 @@ impl HelloParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelloResult {
     pub protocol_version: u32,
+    #[serde(default)]
+    pub version_code: u32,
     pub daemon_version: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
@@ -278,6 +285,8 @@ pub enum TransportError {
     HandshakeRequired,
     #[error("peer speaks protocol {actual}, expected {expected}")]
     ProtocolMismatch { expected: u32, actual: u32 },
+    #[error("peer version code is {actual}, expected {expected}")]
+    VersionCodeMismatch { expected: u32, actual: u32 },
     #[error("response id {actual} did not match request id {expected}")]
     ResponseIdMismatch { expected: u64, actual: u64 },
     #[error("invalid JSON-RPC version {0:?}")]
@@ -636,6 +645,12 @@ impl IpcClient {
                 actual: result.protocol_version,
             });
         }
+        if result.version_code != VERSION_CODE {
+            return Err(TransportError::VersionCodeMismatch {
+                expected: VERSION_CODE,
+                actual: result.version_code,
+            });
+        }
         self.handshake_complete = true;
         Ok(result)
     }
@@ -919,6 +934,7 @@ mod tests {
     fn hello_defaults_to_current_protocol() {
         let hello = HelloParams::new("hsin", "0.1.0");
         assert_eq!(hello.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(hello.version_code, VERSION_CODE);
         assert!(hello.capabilities.is_empty());
     }
 
@@ -957,6 +973,7 @@ mod tests {
                     hello.id,
                     HelloResult {
                         protocol_version: PROTOCOL_VERSION,
+                        version_code: VERSION_CODE,
                         daemon_version: "0.1.0".into(),
                         capabilities: vec![capability::PROVIDERS.into()],
                     },
@@ -992,6 +1009,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, serde_json::json!({"ok": true}));
+        server.await.unwrap();
+
+        drop(client);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn hello_rejects_daemon_without_current_version_code() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("hsin-vc-{}-{nonce}", std::process::id()));
+        #[cfg(not(windows))]
+        let endpoint = IpcEndpoint::filesystem(root.join(DEFAULT_SOCKET_FILE));
+        #[cfg(windows)]
+        let endpoint = IpcEndpoint::namespaced(format!("hsin-ipc-version-code-test-{nonce}"));
+        let listener = IpcListener::bind(endpoint.clone()).unwrap();
+
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let hello: JsonRpcRequest = read_frame(&mut stream).await.unwrap();
+            write_frame(
+                &mut stream,
+                &JsonRpcResponse::success(
+                    hello.id,
+                    serde_json::json!({
+                        "protocol_version": PROTOCOL_VERSION,
+                        "daemon_version": "0.1.0",
+                        "capabilities": []
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut client = IpcClient::connect(endpoint).await.unwrap();
+        assert!(matches!(
+            client.hello(&HelloParams::new("hsin-test", "0.1.0")).await,
+            Err(TransportError::VersionCodeMismatch {
+                expected: VERSION_CODE,
+                actual: 0
+            })
+        ));
         server.await.unwrap();
 
         drop(client);

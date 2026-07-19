@@ -3,13 +3,44 @@
 //! This crate intentionally contains no storage, operating-system, or transport
 //! code. In particular, [`Provider`] never carries provider credentials.
 
-use std::{collections::BTreeMap, error::Error, fmt, str::FromStr};
+use std::{collections::BTreeMap, error::Error, fmt, net::IpAddr, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 /// Wire protocol version implemented by this workspace.
 pub const PROTOCOL_VERSION: u32 = 1;
+/// Monotonic CLI/daemon compatibility code. Bump when either side requires
+/// RPC fields or behavior that an older binary cannot provide.
+pub const VERSION_CODE: u32 = 9;
+
+#[must_use]
+pub fn provider_name_from_url(value: &str) -> Option<String> {
+    let url = Url::parse(value.trim()).ok()?;
+    let host = url.host_str()?.trim_end_matches('.');
+    if host.is_empty() {
+        return None;
+    }
+    if host.parse::<IpAddr>().is_ok() || !host.contains('.') {
+        return Some(host.to_owned());
+    }
+    host.rsplit('.').nth(1).map(str::to_owned)
+}
+
+#[must_use]
+pub fn normalize_generated_provider_name(current: &str, base_url: &str) -> String {
+    let current = current.trim();
+    let host = Url::parse(base_url.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned));
+    if host
+        .as_deref()
+        .is_some_and(|host| current.eq_ignore_ascii_case(host))
+    {
+        return provider_name_from_url(base_url).unwrap_or_else(|| current.to_owned());
+    }
+    current.to_owned()
+}
 
 /// A stable identifier for an AI client whose provider hsin can manage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -89,6 +120,8 @@ impl FromStr for ConnectionMode {
 pub enum AuthScheme {
     Bearer,
     XApiKey,
+    #[serde(rename = "oauth")]
+    OAuth,
 }
 
 impl AuthScheme {
@@ -97,6 +130,7 @@ impl AuthScheme {
         match self {
             Self::Bearer => "bearer",
             Self::XApiKey => "x_api_key",
+            Self::OAuth => "oauth",
         }
     }
 }
@@ -114,6 +148,7 @@ impl FromStr for AuthScheme {
         match value.trim().to_ascii_lowercase().as_str() {
             "bearer" => Ok(Self::Bearer),
             "x_api_key" | "x-api-key" | "xapikey" => Ok(Self::XApiKey),
+            "oauth" => Ok(Self::OAuth),
             _ => Err(ParseEnumError::new("auth_scheme", value)),
         }
     }
@@ -135,8 +170,18 @@ pub struct Provider {
     pub id: String,
     pub client: ClientKind,
     pub name: String,
+    #[serde(default)]
+    pub description: String,
     pub base_url: String,
     pub auth_scheme: AuthScheme,
+    #[serde(default)]
+    pub official: bool,
+    #[serde(default)]
+    pub credential_configured: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub revision: u64,
 }
 
@@ -153,8 +198,10 @@ impl Provider {
         ProviderDraft {
             client: self.client,
             name: self.name.clone(),
+            description: self.description.clone(),
             base_url: self.base_url.clone(),
             auth_scheme: self.auth_scheme,
+            model: self.model.clone(),
         }
         .validate()
     }
@@ -164,8 +211,12 @@ impl Provider {
 pub struct ProviderDraft {
     pub client: ClientKind,
     pub name: String,
+    #[serde(default)]
+    pub description: String,
     pub base_url: String,
     pub auth_scheme: AuthScheme,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl ProviderDraft {
@@ -182,6 +233,17 @@ impl ProviderDraft {
         }
         if name.chars().count() > 128 {
             return Err(ValidationError::new("name", "too_long"));
+        }
+        if self.description.chars().count() > 1024 {
+            return Err(ValidationError::new("description", "too_long"));
+        }
+        if let Some(model) = &self.model {
+            if model.trim().is_empty() {
+                return Err(ValidationError::new("model", "empty"));
+            }
+            if model.chars().count() > 256 {
+                return Err(ValidationError::new("model", "too_long"));
+            }
         }
 
         let url = Url::parse(self.base_url.trim())
@@ -213,6 +275,26 @@ pub struct ProviderPatch {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_scheme: Option<AuthScheme>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "ModelUpdate::is_preserve")]
+    pub model: ModelUpdate,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ModelUpdate {
+    #[default]
+    Preserve,
+    Set(String),
+    Clear,
+}
+
+impl ModelUpdate {
+    #[must_use]
+    pub const fn is_preserve(&self) -> bool {
+        matches!(self, Self::Preserve)
+    }
 }
 
 /// How an RPC should update an existing secret.
@@ -267,9 +349,31 @@ pub struct ProviderSwitchParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelDiscoverParams {
+    pub client: ClientKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    pub base_url: String,
+    pub auth_scheme: AuthScheme,
+    pub secret: SecretInput,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelDiscovery {
+    pub models: Vec<String>,
+    pub resolved_base_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportCurrentParams {
     pub client: ClientKind,
     pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportCurrentResult {
+    pub provider: Provider,
+    pub imported: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,6 +396,8 @@ pub struct DaemonStatus {
     pub version: String,
     pub locked: bool,
     pub proxy_listening: bool,
+    #[serde(default)]
+    pub proxy_enabled: bool,
     pub proxy_address: String,
     pub clients: Vec<ClientState>,
 }
@@ -301,14 +407,21 @@ pub struct Settings {
     pub language: String,
     pub proxy_host: String,
     pub proxy_port: u16,
+    #[serde(default)]
+    pub proxy_enabled: bool,
 }
+
+pub const LANGUAGE_SYSTEM: &str = "system";
+pub const LANGUAGE_EN_US: &str = "en-US";
+pub const LANGUAGE_ZH_CN: &str = "zh-CN";
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            language: "en-US".into(),
+            language: LANGUAGE_SYSTEM.into(),
             proxy_host: "127.0.0.1".into(),
             proxy_port: 9999,
+            proxy_enabled: false,
         }
     }
 }
@@ -319,6 +432,8 @@ pub struct SettingsPatch {
     pub language: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -376,6 +491,9 @@ pub enum ErrorCode {
     FrameTooLarge,
     Timeout,
     DaemonUnavailable,
+    OAuthProxyUnsupported,
+    NoActiveProvider,
+    CurrentCredentialUnavailable,
     Internal,
 }
 
@@ -397,6 +515,9 @@ impl ErrorCode {
             Self::FrameTooLarge => "frame_too_large",
             Self::Timeout => "timeout",
             Self::DaemonUnavailable => "daemon_unavailable",
+            Self::OAuthProxyUnsupported => "oauth_proxy_unsupported",
+            Self::NoActiveProvider => "no_active_provider",
+            Self::CurrentCredentialUnavailable => "current_credential_unavailable",
             Self::Internal => "internal",
         }
     }
@@ -526,6 +647,7 @@ mod tests {
         assert_eq!(ClientKind::from_str("claude-code"), Ok(ClientKind::Claude));
         assert_eq!(ConnectionMode::from_str("PROXY"), Ok(ConnectionMode::Proxy));
         assert_eq!(AuthScheme::from_str("x-api-key"), Ok(AuthScheme::XApiKey));
+        assert_eq!(AuthScheme::from_str("oauth"), Ok(AuthScheme::OAuth));
         assert_eq!(
             serde_json::to_string(&ClientKind::Claude).unwrap(),
             "\"claude\""
@@ -534,6 +656,10 @@ mod tests {
             serde_json::to_string(&AuthScheme::XApiKey).unwrap(),
             "\"x_api_key\""
         );
+        assert_eq!(
+            serde_json::to_string(&AuthScheme::OAuth).unwrap(),
+            "\"oauth\""
+        );
     }
 
     #[test]
@@ -541,8 +667,10 @@ mod tests {
         let valid = ProviderDraft {
             client: ClientKind::Codex,
             name: "Example".into(),
+            description: String::new(),
             base_url: "https://api.example.com/v1".into(),
             auth_scheme: AuthScheme::Bearer,
+            model: None,
         };
         assert!(valid.validate().is_ok());
 
@@ -563,6 +691,30 @@ mod tests {
         assert_eq!(
             invalid.validate(),
             Err(ValidationError::new("base_url", "query_not_allowed"))
+        );
+    }
+
+    #[test]
+    fn provider_names_use_the_label_before_the_top_level_domain() {
+        assert_eq!(
+            provider_name_from_url("https://ai.router.team/v1").as_deref(),
+            Some("router")
+        );
+        assert_eq!(
+            provider_name_from_url("https://api.example.com/v1").as_deref(),
+            Some("example")
+        );
+        assert_eq!(
+            provider_name_from_url("http://127.0.0.1:8080/v1").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            normalize_generated_provider_name("ai.router.team", "https://ai.router.team/v1"),
+            "router"
+        );
+        assert_eq!(
+            normalize_generated_provider_name("My Router", "https://ai.router.team/v1"),
+            "My Router"
         );
     }
 
