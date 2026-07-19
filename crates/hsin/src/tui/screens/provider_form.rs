@@ -25,6 +25,11 @@ pub(super) fn draw_form(frame: &mut Frame<'_>, area: Rect, form: &ProviderForm, 
     } else {
         hidden.as_str()
     };
+    let secret_placeholder = if form.id.is_some() || form.copied_secret.is_some() {
+        i18n.text("api_key_preserve_hint")
+    } else {
+        "sk-****"
+    };
     let auth = match form.auth_scheme {
         AuthScheme::Bearer => "‹ Bearer ›",
         AuthScheme::XApiKey => "‹ X-API-Key ›",
@@ -47,16 +52,7 @@ pub(super) fn draw_form(frame: &mut Frame<'_>, area: Rect, form: &ProviderForm, 
         .min(area.width);
     let popup = bottom_centered_fixed(area, width, FORM_POPUP_HEIGHT);
     frame.render_widget(Clear, popup);
-    let title = if form.id.is_some() {
-        i18n.text("edit_provider")
-    } else {
-        i18n.text("add_provider")
-    };
-    let title = if form.discovering_models {
-        format!("{title} · {}", i18n.text("fetching_models"))
-    } else {
-        title.to_owned()
-    };
+    let title = form_title(form, i18n);
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -81,7 +77,7 @@ pub(super) fn draw_form(frame: &mut Frame<'_>, area: Rect, form: &ProviderForm, 
                 field,
                 i18n.text("api_key"),
                 secret,
-                Some("sk-****"),
+                Some(secret_placeholder),
                 form.field == index,
             ),
             2 => draw_input_field(
@@ -118,6 +114,19 @@ pub(super) fn draw_form(frame: &mut Frame<'_>, area: Rect, form: &ProviderForm, 
                 );
             }
         }
+    }
+}
+
+fn form_title(form: &ProviderForm, i18n: &I18n) -> String {
+    let title = if form.id.is_some() {
+        i18n.text("edit_provider")
+    } else {
+        i18n.text("add_provider")
+    };
+    if form.discovering_models {
+        format!("{title} · {}", i18n.text("fetching_models"))
+    } else {
+        title.to_owned()
     }
 }
 

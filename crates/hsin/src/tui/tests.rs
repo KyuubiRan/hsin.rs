@@ -14,8 +14,8 @@ use zeroize::Zeroizing;
 use super::{
     screens::{TITLE, VERSION_LABEL, form_field_areas},
     state::{
-        FormSubmission, InputMode, ModelPicker, ModelPickerMode, ProviderForm, SettingsPage,
-        SettingsScreen, take_form_submission,
+        FormSubmission, InputMode, ModelPicker, ModelPickerMode, ProviderClipboard, ProviderForm,
+        SettingsPage, SettingsScreen, take_form_submission,
     },
     theme::{INPUT_BG, RED, WHITE},
     widgets::bottom_centered_fixed,
@@ -188,6 +188,180 @@ fn home_p_without_a_provider_shows_a_localized_notice_without_rpc() {
     state.reduce(key(KeyCode::Char('p')));
     assert!(state.take_effect().is_none());
     assert_eq!(state.notice.as_deref(), Some("@proxy_requires_provider"));
+}
+
+#[test]
+fn home_c_queues_a_revision_bound_provider_copy() {
+    let provider = example_provider();
+    let mut state = State {
+        providers: vec![provider.clone()],
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Char('c')));
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::CopyProvider(copied))
+            if copied.id == provider.id && copied.revision == provider.revision
+    ));
+}
+
+#[test]
+fn home_v_pastes_a_same_client_copy_as_an_editable_add_form() {
+    let provider = example_provider();
+    let mut state = State {
+        providers: vec![provider.clone()],
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(Action::ProviderCopied(ProviderClipboard {
+        provider,
+        secret: Zeroizing::new("copied-secret".into()),
+    }));
+    state.reduce(key(KeyCode::Char('v')));
+    {
+        let InputMode::Form(form) = &state.input else {
+            panic!("paste must open an add form");
+        };
+        assert!(form.id.is_none());
+        assert_eq!(form.client, ClientKind::Codex);
+        assert_eq!(form.name, "Example copy");
+        assert_eq!(form.base_url, "https://api.example.test/v1");
+        assert_eq!(form.auth_scheme, AuthScheme::Bearer);
+        assert!(form.secret.is_empty());
+        assert_eq!(
+            form.copied_secret.as_deref().map(String::as_str),
+            Some("copied-secret")
+        );
+    }
+    let locale = I18n::new(Some("en-US"));
+    let mut terminal = Terminal::new(TestBackend::new(100, 32)).expect("test terminal");
+    terminal
+        .draw(|frame| draw(frame, &mut state, &locale))
+        .expect("draw pasted provider form");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>();
+    assert!(rendered.contains("<unchanged>"));
+
+    let InputMode::Form(form) = &mut state.input else {
+        panic!("paste form must remain open");
+    };
+    let submission = take_form_submission(form).unwrap();
+    assert_eq!(submission.secret.as_str(), "copied-secret");
+}
+
+#[test]
+fn home_v_converts_a_codex_provider_for_claude() {
+    let provider = example_provider();
+    let mut state = State {
+        client: ClientKind::Claude,
+        providers: vec![provider.clone()],
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(Action::ProviderCopied(ProviderClipboard {
+        provider,
+        secret: Zeroizing::new("copied-secret".into()),
+    }));
+    state.reduce(key(KeyCode::Char('v')));
+    assert!(matches!(
+        &state.input,
+        InputMode::Form(form)
+            if form.id.is_none()
+                && form.client == ClientKind::Claude
+                && form.name == "Example copy"
+                && form.base_url == "https://api.example.test"
+                && form.auth_scheme == AuthScheme::XApiKey
+                && form.copied_secret.is_some()
+    ));
+}
+
+#[test]
+fn home_v_converts_a_claude_provider_for_codex() {
+    let mut provider = example_provider();
+    provider.client = ClientKind::Claude;
+    provider.base_url = "https://api.example.test".into();
+    provider.auth_scheme = AuthScheme::XApiKey;
+    let mut state = State {
+        providers: vec![provider.clone()],
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(Action::ProviderCopied(ProviderClipboard {
+        provider,
+        secret: Zeroizing::new("copied-secret".into()),
+    }));
+    state.reduce(key(KeyCode::Char('v')));
+    assert!(matches!(
+        &state.input,
+        InputMode::Form(form)
+            if form.client == ClientKind::Codex
+                && form.base_url == "https://api.example.test/v1"
+                && form.auth_scheme == AuthScheme::Bearer
+    ));
+}
+
+#[test]
+fn pasted_api_key_can_be_replaced_before_submission() {
+    let provider = example_provider();
+    let mut state = State {
+        providers: vec![provider.clone()],
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(Action::ProviderCopied(ProviderClipboard {
+        provider,
+        secret: Zeroizing::new("copied-secret".into()),
+    }));
+    state.reduce(key(KeyCode::Char('v')));
+    state.reduce(key(KeyCode::Down));
+    for character in "replacement-secret".chars() {
+        state.reduce(key(KeyCode::Char(character)));
+    }
+    let InputMode::Form(form) = &mut state.input else {
+        panic!("paste must open an add form");
+    };
+    let submission = take_form_submission(form).unwrap();
+    assert_eq!(submission.secret.as_str(), "replacement-secret");
+}
+
+#[test]
+fn official_provider_copy_is_rejected_without_resolving_a_credential() {
+    let mut provider = example_provider();
+    provider.official = true;
+    provider.auth_scheme = AuthScheme::OAuth;
+    let mut state = State {
+        providers: vec![provider],
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Char('c')));
+    assert!(state.take_effect().is_none());
+    assert_eq!(state.notice.as_deref(), Some("@copy_official_unsupported"));
+}
+
+#[test]
+fn pasted_provider_names_avoid_target_client_conflicts() {
+    let source = example_provider();
+    let mut existing = example_provider();
+    existing.id = "provider-2".into();
+    existing.name = "Example copy".into();
+    let mut state = State {
+        providers: vec![source.clone(), existing],
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(Action::ProviderCopied(ProviderClipboard {
+        provider: source,
+        secret: Zeroizing::new("copied-secret".into()),
+    }));
+    state.reduce(key(KeyCode::Char('v')));
+    assert!(matches!(&state.input, InputMode::Form(form) if form.name == "Example copy 2"));
 }
 
 #[test]
@@ -406,6 +580,7 @@ fn add_form_defaults_empty_name_to_base_url_host() {
         base_url: "https://api.example.test/v1".into(),
         auth_scheme: AuthScheme::Bearer,
         secret: Zeroizing::new("secret".into()),
+        copied_secret: None,
         field: 0,
         error: None,
         secret_visible: false,
@@ -683,6 +858,31 @@ fn localized_form_has_input_background_and_context_help() {
     assert!(rendered.contains("enter"));
     assert!(rendered.contains("sk-****"));
     assert!(buffer.content().iter().any(|cell| cell.bg == INPUT_BG));
+}
+
+#[test]
+fn edit_form_marks_an_empty_api_key_as_unchanged() {
+    let mut state = State {
+        providers: vec![example_provider()],
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Char('e')));
+    let locale = I18n::new(Some("zh-CN"));
+    let mut terminal = Terminal::new(TestBackend::new(100, 32)).expect("test terminal");
+    terminal
+        .draw(|frame| draw(frame, &mut state, &locale))
+        .expect("draw edit form");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>();
+    assert_eq!(locale.text("api_key_preserve_hint"), "<不修改>");
+    assert!(rendered.contains("<不 修 改 >"));
+    assert!(!rendered.contains("sk-****"));
 }
 
 #[test]

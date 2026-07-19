@@ -5,12 +5,12 @@ use hsin_core::{
     ProviderEditParams, ProviderPatch, ProviderRemoveParams, ProviderSwitchParams, SecretInput,
     Settings, SettingsPatch,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::rpc::{DaemonClient, StatusSnapshot};
 
-use super::state::{Action, FormSubmission};
+use super::state::{Action, FormSubmission, ProviderClipboard};
 
 pub(super) enum Effect {
     Refresh,
@@ -30,6 +30,7 @@ pub(super) enum Effect {
     Add(FormSubmission),
     Edit(FormSubmission),
     DiscoverModels(FormSubmission),
+    CopyProvider(Provider),
     Remove {
         id: String,
         expected_revision: u64,
@@ -68,6 +69,17 @@ pub(super) async fn worker(
                             message: format!("{error:#}"),
                         })
                         .await;
+                }
+            }
+            continue;
+        }
+        if let Effect::CopyProvider(provider) = effect {
+            match resolve_provider_copy(&client, provider).await {
+                Ok(clipboard) => {
+                    let _ = actions.send(Action::ProviderCopied(clipboard)).await;
+                }
+                Err(error) => {
+                    let _ = actions.send(Action::Failed(error_notice(&error))).await;
                 }
             }
             continue;
@@ -207,7 +219,32 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
         }
         Effect::SetLanguage(language) => update_language(client, language).await,
         Effect::DiscoverModels(_) => unreachable!("model discovery is handled by the worker"),
+        Effect::CopyProvider(_) => unreachable!("provider copying is handled by the worker"),
     }
+}
+
+async fn resolve_provider_copy(
+    client: &DaemonClient,
+    provider: Provider,
+) -> Result<ProviderClipboard> {
+    let value: Value = client
+        .call(
+            "credential.resolve",
+            &json!({
+                "client": provider.client,
+                "provider_id": provider.id,
+                "revision": provider.revision,
+            }),
+        )
+        .await?;
+    let secret = value
+        .as_str()
+        .or_else(|| value.get("secret").and_then(Value::as_str))
+        .context("daemon returned an invalid credential response")?;
+    Ok(ProviderClipboard {
+        provider,
+        secret: zeroize::Zeroizing::new(secret.to_owned()),
+    })
 }
 
 async fn import_current(client: &DaemonClient, kind: ClientKind) -> Result<bool> {

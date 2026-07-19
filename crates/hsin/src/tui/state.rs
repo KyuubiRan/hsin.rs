@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hsin_core::{
     AuthScheme, ClientKind, ClientSettings, ConnectionMode, LANGUAGE_EN_US, LANGUAGE_SYSTEM,
-    LANGUAGE_ZH_CN, ModelDiscovery, ModelUpdate, Provider, Settings,
+    LANGUAGE_ZH_CN, ModelDiscovery, ModelUpdate, Provider, Settings, convert_provider_base_url,
     normalize_generated_provider_name, provider_name_from_url,
 };
 use zeroize::Zeroizing;
@@ -27,6 +27,7 @@ pub(super) enum Action {
         form: FormSubmission,
         message: String,
     },
+    ProviderCopied(ProviderClipboard),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -45,6 +46,7 @@ pub(super) struct State {
     pub(super) proxy_host: String,
     pub(super) proxy_port: u16,
     pub(super) client_settings: ClientSettings,
+    pub(super) clipboard: Option<ProviderClipboard>,
     pub(super) loading: bool,
     pub(super) notice: Option<String>,
     pub(super) input: InputMode,
@@ -63,6 +65,7 @@ impl Default for State {
             proxy_host: "127.0.0.1".into(),
             proxy_port: 9999,
             client_settings: ClientSettings::default(),
+            clipboard: None,
             loading: true,
             notice: None,
             input: InputMode::Normal,
@@ -125,10 +128,16 @@ pub(super) struct ProviderForm {
     pub(super) base_url: String,
     pub(super) auth_scheme: AuthScheme,
     pub(super) secret: Zeroizing<String>,
+    pub(super) copied_secret: Option<Zeroizing<String>>,
     pub(super) field: usize,
     pub(super) error: Option<&'static str>,
     pub(super) secret_visible: bool,
     pub(super) discovering_models: bool,
+}
+
+pub(super) struct ProviderClipboard {
+    pub(super) provider: Provider,
+    pub(super) secret: Zeroizing<String>,
 }
 
 pub(super) struct FormSubmission {
@@ -250,6 +259,11 @@ impl State {
                 });
                 self.loading = false;
                 self.notice = None;
+            }
+            Action::ProviderCopied(clipboard) => {
+                self.clipboard = Some(clipboard);
+                self.notice = Some("@provider_copied".into());
+                self.loading = false;
             }
             Action::Key(key) => return self.reduce_key(key),
         }
@@ -734,6 +748,7 @@ impl State {
                             ClientKind::Claude => AuthScheme::XApiKey,
                         },
                         secret: Zeroizing::new(String::new()),
+                        copied_secret: None,
                         field: 0,
                         error: None,
                         secret_visible: false,
@@ -757,12 +772,59 @@ impl State {
                             base_url: provider.base_url,
                             auth_scheme: provider.auth_scheme,
                             secret: Zeroizing::new(String::new()),
+                            copied_secret: None,
                             field: 0,
                             error: None,
                             secret_visible: false,
                             discovering_models: false,
                         });
                     }
+                }
+                KeyCode::Char('c') => {
+                    let Some(provider) = self.selected_provider().cloned() else {
+                        self.notice = Some("@copy_provider_required".into());
+                        return Transition::Continue;
+                    };
+                    if provider.official {
+                        self.notice = Some("@copy_official_unsupported".into());
+                    } else if !provider.credential_configured {
+                        self.notice = Some("@copy_credential_missing".into());
+                    } else {
+                        self.queue(Effect::CopyProvider(provider));
+                    }
+                }
+                KeyCode::Char('v') => {
+                    let Some(clipboard) = &self.clipboard else {
+                        self.notice = Some("@provider_clipboard_empty".into());
+                        return Transition::Continue;
+                    };
+                    let source = &clipboard.provider;
+                    self.input = InputMode::Form(ProviderForm {
+                        id: None,
+                        revision: None,
+                        client: self.client,
+                        name: copied_provider_name(&self.providers, self.client, &source.name),
+                        description: source.description.clone(),
+                        base_url: convert_provider_base_url(
+                            &source.base_url,
+                            source.client,
+                            self.client,
+                        ),
+                        auth_scheme: if source.client == self.client {
+                            source.auth_scheme
+                        } else {
+                            match self.client {
+                                ClientKind::Codex => AuthScheme::Bearer,
+                                ClientKind::Claude => AuthScheme::XApiKey,
+                            }
+                        },
+                        secret: Zeroizing::new(String::new()),
+                        copied_secret: Some(clipboard.secret.clone()),
+                        field: 0,
+                        error: None,
+                        secret_visible: false,
+                        discovering_models: false,
+                    });
                 }
                 KeyCode::Char('d') => {
                     if let Some(provider) = self.selected_provider() {
@@ -908,9 +970,14 @@ pub(super) fn take_form_submission(
     if form.description.chars().count() > 1024 {
         return Err("validation_description_too_long");
     }
-    if form.id.is_none() && form.secret.trim().is_empty() {
+    if form.id.is_none() && form.secret.trim().is_empty() && form.copied_secret.is_none() {
         return Err("validation_api_key_required");
     }
+    let secret = if form.secret.trim().is_empty() {
+        form.copied_secret.take().unwrap_or_default()
+    } else {
+        std::mem::take(&mut form.secret)
+    };
     Ok(FormSubmission {
         id: form.id.clone(),
         revision: form.revision,
@@ -919,9 +986,23 @@ pub(super) fn take_form_submission(
         description: form.description.clone(),
         base_url: base_url.trim_end_matches('/').to_owned(),
         auth_scheme: form.auth_scheme,
-        secret: std::mem::take(&mut form.secret),
+        secret,
         model: ModelUpdate::Preserve,
     })
+}
+
+fn copied_provider_name(providers: &[Provider], client: ClientKind, source_name: &str) -> String {
+    let base = format!("{} copy", source_name.trim());
+    let mut candidate = base.clone();
+    let mut suffix = 2;
+    while providers
+        .iter()
+        .any(|provider| provider.client == client && provider.name == candidate)
+    {
+        candidate = format!("{base} {suffix}");
+        suffix += 1;
+    }
+    candidate
 }
 
 fn take_submission(form: &mut FormSubmission) -> FormSubmission {

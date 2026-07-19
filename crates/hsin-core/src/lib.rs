@@ -42,6 +42,30 @@ pub fn normalize_generated_provider_name(current: &str, base_url: &str) -> Strin
     current.to_owned()
 }
 
+#[must_use]
+pub fn convert_provider_base_url(base_url: &str, source: ClientKind, target: ClientKind) -> String {
+    if source == target {
+        return base_url.to_owned();
+    }
+
+    match (source, target) {
+        (ClientKind::Codex, ClientKind::Claude) => base_url
+            .strip_suffix("/v1/")
+            .or_else(|| base_url.strip_suffix("/v1"))
+            .unwrap_or(base_url)
+            .to_owned(),
+        (ClientKind::Claude, ClientKind::Codex) => {
+            let trimmed = base_url.trim_end_matches('/');
+            if trimmed.ends_with("/v1") {
+                trimmed.to_owned()
+            } else {
+                format!("{trimmed}/v1")
+            }
+        }
+        _ => base_url.to_owned(),
+    }
+}
+
 /// A stable identifier for an AI client whose provider hsin can manage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -809,6 +833,42 @@ mod tests {
         assert_eq!(
             normalize_generated_provider_name("My Router", "https://ai.router.team/v1"),
             "My Router"
+        );
+    }
+
+    #[test]
+    fn provider_base_urls_convert_between_supported_clients() {
+        assert_eq!(
+            convert_provider_base_url(
+                "https://api.example.com/v1",
+                ClientKind::Codex,
+                ClientKind::Claude
+            ),
+            "https://api.example.com"
+        );
+        assert_eq!(
+            convert_provider_base_url(
+                "https://api.example.com",
+                ClientKind::Claude,
+                ClientKind::Codex
+            ),
+            "https://api.example.com/v1"
+        );
+        assert_eq!(
+            convert_provider_base_url(
+                "https://api.example.com/custom",
+                ClientKind::Codex,
+                ClientKind::Claude
+            ),
+            "https://api.example.com/custom"
+        );
+        assert_eq!(
+            convert_provider_base_url(
+                "https://api.example.com/v1",
+                ClientKind::Codex,
+                ClientKind::Codex
+            ),
+            "https://api.example.com/v1"
         );
     }
 
