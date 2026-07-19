@@ -1,4 +1,4 @@
-use hsin_core::{LANGUAGE_EN_US, LANGUAGE_ZH_CN};
+use hsin_core::{ClientKind, LANGUAGE_EN_US, LANGUAGE_ZH_CN};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -57,6 +57,18 @@ pub(super) fn draw_settings_screen(
         LANGUAGE_ZH_CN => i18n.text("language_zh_cn"),
         _ => i18n.text("language_system"),
     };
+    let visible_clients = format!(
+        "{} / {}",
+        state.client_settings.visible.len(),
+        ClientKind::ALL.len()
+    );
+    let client_order = state
+        .client_settings
+        .order
+        .iter()
+        .map(|client| client_label(*client, i18n))
+        .collect::<Vec<_>>()
+        .join(" → ");
 
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -67,6 +79,11 @@ pub(super) fn draw_settings_screen(
         SettingsPage::Root => {
             let items = vec![
                 settings_option_item(i18n.text("proxy_master"), proxy, option_width),
+                settings_option_item(
+                    i18n.text("client_configuration"),
+                    &visible_clients,
+                    option_width,
+                ),
                 settings_option_item(i18n.text("language"), language, option_width),
                 ListItem::new(i18n.text("import_current")),
             ];
@@ -80,6 +97,14 @@ pub(super) fn draw_settings_screen(
                     Some(proxy),
                 ),
                 1 => (
+                    items,
+                    screen.selected,
+                    i18n.text("settings_options"),
+                    i18n.text("client_configuration"),
+                    i18n.text("settings_client_configuration_description"),
+                    Some(visible_clients.as_str()),
+                ),
+                2 => (
                     items,
                     screen.selected,
                     i18n.text("settings_options"),
@@ -160,6 +185,89 @@ pub(super) fn draw_settings_screen(
                 Some(language),
             )
         }
+        SettingsPage::Clients { selected } => {
+            let (detail_title, description, current) = if *selected == 0 {
+                (
+                    i18n.text("client_visibility"),
+                    i18n.text("settings_client_visibility_description"),
+                    visible_clients.as_str(),
+                )
+            } else {
+                (
+                    i18n.text("client_order"),
+                    i18n.text("settings_client_order_description"),
+                    client_order.as_str(),
+                )
+            };
+            (
+                vec![
+                    settings_option_item(
+                        i18n.text("client_visibility"),
+                        &visible_clients,
+                        option_width,
+                    ),
+                    ListItem::new(i18n.text("client_order")),
+                ],
+                *selected,
+                i18n.text("client_configuration"),
+                detail_title,
+                description,
+                Some(current),
+            )
+        }
+        SettingsPage::ClientVisibility { selected } => {
+            let selected_client = state.client_settings.order[*selected];
+            let selected_visible = state.client_settings.visible.contains(&selected_client);
+            (
+                state
+                    .client_settings
+                    .order
+                    .iter()
+                    .map(|client| {
+                        settings_option_item(
+                            client_label(*client, i18n),
+                            if state.client_settings.visible.contains(client) {
+                                i18n.text("on")
+                            } else {
+                                i18n.text("off")
+                            },
+                            option_width,
+                        )
+                    })
+                    .collect(),
+                *selected,
+                i18n.text("client_visibility"),
+                client_label(selected_client, i18n),
+                i18n.text("settings_client_visibility_item_description"),
+                Some(if selected_visible {
+                    i18n.text("on")
+                } else {
+                    i18n.text("off")
+                }),
+            )
+        }
+        SettingsPage::ClientOrder {
+            selected,
+            order,
+            moving,
+        } => (
+            order
+                .iter()
+                .enumerate()
+                .map(|(index, client)| {
+                    ListItem::new(format!("{}. {}", index + 1, client_label(*client, i18n)))
+                })
+                .collect(),
+            *selected,
+            i18n.text("client_order"),
+            client_label(order[*selected], i18n),
+            i18n.text(if *moving {
+                "settings_client_order_moving_description"
+            } else {
+                "settings_client_order_item_description"
+            }),
+            None,
+        ),
         SettingsPage::Import { selected } => {
             let (detail_title, description) = match *selected {
                 0 => (
@@ -241,6 +349,13 @@ pub(super) fn draw_settings_screen(
         ),
         columns[1],
     );
+}
+
+fn client_label(client: ClientKind, i18n: &I18n) -> &str {
+    match client {
+        ClientKind::Codex => i18n.text("codex"),
+        ClientKind::Claude => i18n.text("claude"),
+    }
 }
 
 fn settings_option_item(label: &str, current: &str, width: usize) -> ListItem<'static> {

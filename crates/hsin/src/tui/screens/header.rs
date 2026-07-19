@@ -135,7 +135,7 @@ fn draw_compact_client_switcher(
     i18n: &I18n,
     title_width: u16,
 ) {
-    let full_width = client_switcher_width(i18n);
+    let full_width = client_switcher_width(state, i18n);
     let title_right = area.x.saturating_add(1).saturating_add(title_width);
     let available = area.right().saturating_sub(title_right.saturating_add(1));
     let line = if available >= full_width {
@@ -161,11 +161,18 @@ fn draw_compact_client_switcher(
 }
 
 fn client_switcher_line<'a>(state: &State, i18n: &'a I18n) -> Line<'a> {
-    Line::from(vec![
-        client_span(i18n.text("codex"), state.client == ClientKind::Codex),
-        Span::raw(" "),
-        client_span(i18n.text("claude"), state.client == ClientKind::Claude),
-    ])
+    let mut spans = Vec::new();
+    for client in state.visible_clients() {
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        let label = match client {
+            ClientKind::Codex => i18n.text("codex"),
+            ClientKind::Claude => i18n.text("claude"),
+        };
+        spans.push(client_span(label, state.client == client));
+    }
+    Line::from(spans)
 }
 
 fn selected_client_line<'a>(state: &State, i18n: &'a I18n) -> Line<'a> {
@@ -188,9 +195,18 @@ fn client_span(label: &str, selected: bool) -> Span<'_> {
     Span::styled(format!(" {label} "), style)
 }
 
-fn client_switcher_width(i18n: &I18n) -> u16 {
-    let width = display_width(i18n.text("codex"))
-        .saturating_add(display_width(i18n.text("claude")))
-        .saturating_add(5);
+fn client_switcher_width(state: &State, i18n: &I18n) -> u16 {
+    let clients = state.visible_clients();
+    let labels = clients
+        .iter()
+        .map(|client| match client {
+            ClientKind::Codex => i18n.text("codex"),
+            ClientKind::Claude => i18n.text("claude"),
+        })
+        .map(display_width)
+        .sum::<usize>();
+    let width = labels
+        .saturating_add(clients.len().saturating_mul(2))
+        .saturating_add(clients.len().saturating_sub(1));
     u16::try_from(width).unwrap_or(u16::MAX)
 }

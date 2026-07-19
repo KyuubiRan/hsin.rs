@@ -1,8 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hsin_core::{
-    AuthScheme, ClientKind, ConnectionMode, LANGUAGE_EN_US, LANGUAGE_SYSTEM, LANGUAGE_ZH_CN,
-    ModelDiscovery, ModelUpdate, Provider, Settings, normalize_generated_provider_name,
-    provider_name_from_url,
+    AuthScheme, ClientKind, ClientSettings, ConnectionMode, LANGUAGE_EN_US, LANGUAGE_SYSTEM,
+    LANGUAGE_ZH_CN, ModelDiscovery, ModelUpdate, Provider, Settings,
+    normalize_generated_provider_name, provider_name_from_url,
 };
 use zeroize::Zeroizing;
 
@@ -44,6 +44,7 @@ pub(super) struct State {
     pub(super) proxy_enabled: bool,
     pub(super) proxy_host: String,
     pub(super) proxy_port: u16,
+    pub(super) client_settings: ClientSettings,
     pub(super) loading: bool,
     pub(super) notice: Option<String>,
     pub(super) input: InputMode,
@@ -61,6 +62,7 @@ impl Default for State {
             proxy_enabled: false,
             proxy_host: "127.0.0.1".into(),
             proxy_port: 9999,
+            client_settings: ClientSettings::default(),
             loading: true,
             notice: None,
             input: InputMode::Normal,
@@ -97,6 +99,17 @@ pub(super) enum SettingsPage {
     },
     Language {
         selected: usize,
+    },
+    Clients {
+        selected: usize,
+    },
+    ClientVisibility {
+        selected: usize,
+    },
+    ClientOrder {
+        selected: usize,
+        order: Vec<ClientKind>,
+        moving: bool,
     },
     Import {
         selected: usize,
@@ -161,6 +174,12 @@ impl State {
                 self.proxy_enabled = settings.proxy_enabled;
                 self.proxy_host = settings.proxy_host;
                 self.proxy_port = settings.proxy_port;
+                self.client_settings = settings.clients;
+                if !self.client_settings.visible.contains(&self.client)
+                    && let Some(client) = self.client_settings.visible_in_order().first().copied()
+                {
+                    self.client = client;
+                }
                 if let InputMode::Settings(SettingsScreen {
                     page:
                         SettingsPage::Proxy {
@@ -172,6 +191,18 @@ impl State {
                 }) = &mut self.input
                 {
                     *port = self.proxy_port.to_string();
+                }
+                if let InputMode::Settings(SettingsScreen {
+                    page:
+                        SettingsPage::ClientOrder {
+                            order,
+                            moving: false,
+                            ..
+                        },
+                    ..
+                }) = &mut self.input
+                {
+                    order.clone_from(&self.client_settings.order);
                 }
                 self.loading = false;
                 self.clamp_selection();
@@ -233,6 +264,7 @@ impl State {
         let current_mode = self.mode();
         let proxy_enabled = self.proxy_enabled;
         let proxy_port = self.proxy_port;
+        let client_settings = self.client_settings.clone();
         let language_selected = match self.language.as_str() {
             LANGUAGE_EN_US => 1,
             LANGUAGE_ZH_CN => 2,
@@ -409,7 +441,7 @@ impl State {
                         screen.selected = screen.selected.saturating_sub(1);
                     }
                     KeyCode::Down | KeyCode::Char('k') => {
-                        screen.selected = (screen.selected + 1).min(2);
+                        screen.selected = (screen.selected + 1).min(3);
                     }
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => match screen.selected {
                         0 => {
@@ -420,6 +452,9 @@ impl State {
                             };
                         }
                         1 => {
+                            screen.page = SettingsPage::Clients { selected: 0 };
+                        }
+                        2 => {
                             screen.page = SettingsPage::Language {
                                 selected: language_selected,
                             };
@@ -519,6 +554,108 @@ impl State {
                     }
                     _ => {}
                 },
+                SettingsPage::Clients { selected } => match key.code {
+                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
+                        screen.page = SettingsPage::Root;
+                    }
+                    KeyCode::Up | KeyCode::Char('i') => {
+                        *selected = selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('k') => {
+                        *selected = (*selected + 1).min(1);
+                    }
+                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                        screen.page = if *selected == 0 {
+                            SettingsPage::ClientVisibility { selected: 0 }
+                        } else {
+                            SettingsPage::ClientOrder {
+                                selected: 0,
+                                order: client_settings.order.clone(),
+                                moving: false,
+                            }
+                        };
+                    }
+                    _ => {}
+                },
+                SettingsPage::ClientVisibility { selected } => match key.code {
+                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
+                        screen.page = SettingsPage::Clients { selected: 0 };
+                    }
+                    KeyCode::Up | KeyCode::Char('i') => {
+                        *selected = selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('k') => {
+                        *selected = (*selected + 1).min(ClientKind::ALL.len() - 1);
+                    }
+                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l' | ' ') => {
+                        let client = client_settings.order[*selected];
+                        let mut updated = client_settings.clone();
+                        if updated.visible.contains(&client) {
+                            if updated.visible.len() == 1 {
+                                self.notice = Some("@client_visibility_minimum".into());
+                            } else {
+                                updated.visible.retain(|candidate| *candidate != client);
+                                self.pending_effect = Some(Effect::SetClients(updated));
+                                self.loading = true;
+                            }
+                        } else {
+                            updated.visible.push(client);
+                            updated.visible = updated.visible_in_order();
+                            self.pending_effect = Some(Effect::SetClients(updated));
+                            self.loading = true;
+                        }
+                    }
+                    _ => {}
+                },
+                SettingsPage::ClientOrder {
+                    selected,
+                    order,
+                    moving,
+                } => {
+                    if *moving {
+                        match key.code {
+                            KeyCode::Esc => {
+                                order.clone_from(&client_settings.order);
+                                *moving = false;
+                            }
+                            KeyCode::Up | KeyCode::Char('i') if *selected > 0 => {
+                                order.swap(*selected, *selected - 1);
+                                *selected -= 1;
+                            }
+                            KeyCode::Down | KeyCode::Char('k') if *selected + 1 < order.len() => {
+                                order.swap(*selected, *selected + 1);
+                                *selected += 1;
+                            }
+                            KeyCode::Enter | KeyCode::Char(' ') => {
+                                *moving = false;
+                                if *order != client_settings.order {
+                                    let mut updated = client_settings.clone();
+                                    updated.order.clone_from(order);
+                                    updated.visible = updated.visible_in_order();
+                                    self.pending_effect = Some(Effect::SetClients(updated));
+                                    self.loading = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
+                                screen.page = SettingsPage::Clients { selected: 1 };
+                            }
+                            KeyCode::Up | KeyCode::Char('i') => {
+                                *selected = selected.saturating_sub(1);
+                            }
+                            KeyCode::Down | KeyCode::Char('k') => {
+                                *selected = (*selected + 1).min(order.len().saturating_sub(1));
+                            }
+                            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l' | ' ') => {
+                                *moving = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 SettingsPage::Import { selected } => match key.code {
                     KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
                         screen.page = SettingsPage::Root;
@@ -544,15 +681,15 @@ impl State {
             InputMode::Normal => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Transition::Quit,
                 KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    self.client = previous_client(self.client);
+                    self.client = self.previous_visible_client();
                     self.selected = 0;
                 }
                 KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
-                    self.client = next_client(self.client);
+                    self.client = self.next_visible_client();
                     self.selected = 0;
                 }
                 KeyCode::BackTab | KeyCode::Left | KeyCode::Char('j') => {
-                    self.client = previous_client(self.client);
+                    self.client = self.previous_visible_client();
                     self.selected = 0;
                 }
                 KeyCode::Down | KeyCode::Char('k') => {
@@ -684,6 +821,40 @@ impl State {
         self.visible_providers().get(self.selected).copied()
     }
 
+    pub(super) fn visible_clients(&self) -> Vec<ClientKind> {
+        self.client_settings.visible_in_order()
+    }
+
+    fn next_visible_client(&self) -> ClientKind {
+        let clients = self.visible_clients();
+        if clients.is_empty() {
+            return self.client;
+        }
+        let index = clients
+            .iter()
+            .position(|client| *client == self.client)
+            .unwrap_or(0);
+        clients
+            .get((index + 1) % clients.len())
+            .copied()
+            .unwrap_or(self.client)
+    }
+
+    fn previous_visible_client(&self) -> ClientKind {
+        let clients = self.visible_clients();
+        if clients.is_empty() {
+            return self.client;
+        }
+        let index = clients
+            .iter()
+            .position(|client| *client == self.client)
+            .unwrap_or(0);
+        clients
+            .get((index + clients.len() - 1) % clients.len())
+            .copied()
+            .unwrap_or(self.client)
+    }
+
     fn clamp_selection(&mut self) {
         self.selected = self
             .selected
@@ -702,20 +873,6 @@ impl State {
             ClientKind::Codex => self.status.codex_active_provider.as_deref(),
             ClientKind::Claude => self.status.claude_active_provider.as_deref(),
         }
-    }
-}
-
-const fn next_client(client: ClientKind) -> ClientKind {
-    match client {
-        ClientKind::Codex => ClientKind::Claude,
-        ClientKind::Claude => ClientKind::Codex,
-    }
-}
-
-const fn previous_client(client: ClientKind) -> ClientKind {
-    match client {
-        ClientKind::Codex => ClientKind::Claude,
-        ClientKind::Claude => ClientKind::Codex,
     }
 }
 

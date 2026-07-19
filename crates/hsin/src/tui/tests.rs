@@ -1,8 +1,8 @@
 use super::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hsin_core::{
-    AuthScheme, ClientKind, LANGUAGE_EN_US, LANGUAGE_SYSTEM, LANGUAGE_ZH_CN, ModelUpdate, Provider,
-    Settings,
+    AuthScheme, ClientKind, ClientSettings, LANGUAGE_EN_US, LANGUAGE_SYSTEM, LANGUAGE_ZH_CN,
+    ModelUpdate, Provider, Settings,
 };
 use ratatui::{
     backend::TestBackend,
@@ -73,6 +73,93 @@ fn reducer_switches_client_and_moves_selection() {
 }
 
 #[test]
+fn client_switching_follows_visibility_and_configured_order() {
+    let mut state = State {
+        client: ClientKind::Claude,
+        client_settings: ClientSettings {
+            order: vec![ClientKind::Claude, ClientKind::Codex],
+            visible: vec![ClientKind::Claude, ClientKind::Codex],
+        },
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Tab));
+    assert_eq!(state.client, ClientKind::Codex);
+    state.reduce(key(KeyCode::BackTab));
+    assert_eq!(state.client, ClientKind::Claude);
+
+    state.client_settings.visible = vec![ClientKind::Claude];
+    state.reduce(key(KeyCode::Tab));
+    assert_eq!(state.client, ClientKind::Claude);
+}
+
+#[test]
+fn loaded_settings_switch_away_from_a_hidden_current_client() {
+    let mut state = State::default();
+    state.reduce(Action::Loaded {
+        providers: Vec::new(),
+        status: crate::rpc::StatusSnapshot::default(),
+        settings: Settings {
+            clients: ClientSettings {
+                order: vec![ClientKind::Codex, ClientKind::Claude],
+                visible: vec![ClientKind::Claude],
+            },
+            ..Settings::default()
+        },
+    });
+    assert_eq!(state.client, ClientKind::Claude);
+}
+
+#[test]
+fn client_visibility_keeps_at_least_one_client_enabled() {
+    let mut state = State {
+        input: InputMode::Settings(SettingsScreen {
+            selected: 1,
+            page: SettingsPage::ClientVisibility { selected: 0 },
+        }),
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Enter));
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::SetClients(ClientSettings { visible, .. }))
+            if visible == [ClientKind::Claude]
+    ));
+
+    state.client_settings.visible = vec![ClientKind::Claude];
+    state.input = InputMode::Settings(SettingsScreen {
+        selected: 1,
+        page: SettingsPage::ClientVisibility { selected: 1 },
+    });
+    state.reduce(key(KeyCode::Enter));
+    assert!(state.take_effect().is_none());
+    assert_eq!(state.notice.as_deref(), Some("@client_visibility_minimum"));
+}
+
+#[test]
+fn client_order_moves_the_selected_client_before_saving() {
+    let mut state = State {
+        input: InputMode::Settings(SettingsScreen {
+            selected: 1,
+            page: SettingsPage::ClientOrder {
+                selected: 1,
+                order: ClientKind::ALL.to_vec(),
+                moving: false,
+            },
+        }),
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Enter));
+    state.reduce(key(KeyCode::Up));
+    state.reduce(key(KeyCode::Enter));
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::SetClients(ClientSettings { order, visible }))
+            if order == [ClientKind::Claude, ClientKind::Codex]
+                && visible == [ClientKind::Claude, ClientKind::Codex]
+    ));
+}
+
+#[test]
 fn home_p_toggles_the_current_client_proxy_mode() {
     let mut state = State::default();
     state.status.codex_active_provider = Some("provider-1".into());
@@ -130,7 +217,9 @@ fn settings_menu_queues_proxy_and_language_changes() {
     ));
     state.reduce(key(KeyCode::Esc));
     state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Down));
     state.reduce(key(KeyCode::Enter));
+    state.reduce(key(KeyCode::Down));
     state.reduce(key(KeyCode::Down));
     state.reduce(key(KeyCode::Down));
     state.reduce(key(KeyCode::Enter));
@@ -180,6 +269,7 @@ fn settings_import_menu_selects_codex_claude_or_all() {
     state.reduce(key(KeyCode::Char('o')));
     state.reduce(key(KeyCode::Down));
     state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Down));
     state.reduce(key(KeyCode::Enter));
     assert!(state.take_effect().is_none());
     assert!(matches!(
@@ -204,7 +294,7 @@ fn settings_import_menu_selects_codex_claude_or_all() {
 
     let mut claude = State {
         input: InputMode::Settings(SettingsScreen {
-            selected: 2,
+            selected: 3,
             page: SettingsPage::Import { selected: 0 },
         }),
         ..State::default()
@@ -218,7 +308,7 @@ fn settings_import_menu_selects_codex_claude_or_all() {
 
     let mut all = State {
         input: InputMode::Settings(SettingsScreen {
-            selected: 2,
+            selected: 3,
             page: SettingsPage::Import { selected: 0 },
         }),
         ..State::default()
@@ -276,9 +366,10 @@ fn hidden_ijkl_navigation_works_on_home_and_settings() {
 
     state.reduce(key(KeyCode::Char('o')));
     state.reduce(key(KeyCode::Char('k')));
+    state.reduce(key(KeyCode::Char('k')));
     assert!(matches!(
         &state.input,
-        InputMode::Settings(SettingsScreen { selected: 1, .. })
+        InputMode::Settings(SettingsScreen { selected: 2, .. })
     ));
     state.reduce(key(KeyCode::Char('l')));
     assert!(matches!(
@@ -817,6 +908,46 @@ fn header_client_switcher_uses_a_selected_background() {
 }
 
 #[test]
+fn header_respects_client_visibility_and_order() {
+    let mut state = State {
+        client: ClientKind::Claude,
+        client_settings: ClientSettings {
+            order: vec![ClientKind::Claude, ClientKind::Codex],
+            visible: vec![ClientKind::Claude, ClientKind::Codex],
+        },
+        loading: false,
+        ..State::default()
+    };
+    let locale = I18n::new(Some(LANGUAGE_EN_US));
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+    terminal
+        .draw(|frame| draw(frame, &mut state, &locale))
+        .expect("draw reordered clients");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>();
+    assert!(rendered.find("Claude Code").unwrap() < rendered.find("Codex").unwrap());
+
+    state.client_settings.visible = vec![ClientKind::Claude];
+    terminal
+        .draw(|frame| draw(frame, &mut state, &locale))
+        .expect("draw one visible client");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>();
+    assert!(rendered.contains("Claude Code"));
+    assert!(!rendered.contains("Codex"));
+}
+
+#[test]
 fn home_keeps_the_status_panel_without_mode_or_language_summary() {
     let mut state = State {
         loading: false,
@@ -1056,6 +1187,56 @@ fn proxy_settings_renders_switch_address_and_port() {
     ] {
         assert!(rendered.contains(expected), "missing {expected}");
     }
+}
+
+#[test]
+fn client_settings_render_visibility_and_move_mode() {
+    let mut state = State {
+        loading: false,
+        input: InputMode::Settings(SettingsScreen {
+            selected: 1,
+            page: SettingsPage::ClientVisibility { selected: 1 },
+        }),
+        ..State::default()
+    };
+    let locale = I18n::new(Some(LANGUAGE_EN_US));
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+    terminal
+        .draw(|frame| draw(frame, &mut state, &locale))
+        .expect("draw client visibility");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>();
+    assert!(rendered.contains("Displayed clients"));
+    assert!(rendered.contains("[on]"));
+    assert!(rendered.contains("enter toggle"));
+
+    state.input = InputMode::Settings(SettingsScreen {
+        selected: 1,
+        page: SettingsPage::ClientOrder {
+            selected: 0,
+            order: ClientKind::ALL.to_vec(),
+            moving: true,
+        },
+    });
+    terminal
+        .draw(|frame| draw(frame, &mut state, &locale))
+        .expect("draw client order movement");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>();
+    assert!(rendered.contains("Client order"));
+    assert!(rendered.contains("1. Codex"));
+    assert!(rendered.contains("move"));
+    assert!(rendered.contains("enter save"));
 }
 
 #[test]

@@ -12,7 +12,7 @@ use url::Url;
 pub const PROTOCOL_VERSION: u32 = 1;
 /// Monotonic CLI/daemon compatibility code. Bump when either side requires
 /// RPC fields or behavior that an older binary cannot provide.
-pub const VERSION_CODE: u32 = 9;
+pub const VERSION_CODE: u32 = 10;
 
 #[must_use]
 pub fn provider_name_from_url(value: &str) -> Option<String> {
@@ -52,6 +52,8 @@ pub enum ClientKind {
 }
 
 impl ClientKind {
+    pub const ALL: [Self; 2] = [Self::Codex, Self::Claude];
+
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -77,6 +79,61 @@ impl FromStr for ClientKind {
             _ => Err(ParseEnumError::new("client", value)),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientSettings {
+    #[serde(default = "default_client_order")]
+    pub order: Vec<ClientKind>,
+    #[serde(default = "default_client_order")]
+    pub visible: Vec<ClientKind>,
+}
+
+impl ClientSettings {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.order.len() == ClientKind::ALL.len()
+            && ClientKind::ALL.iter().all(|client| {
+                self.order
+                    .iter()
+                    .filter(|candidate| *candidate == client)
+                    .count()
+                    == 1
+            })
+            && !self.visible.is_empty()
+            && self.visible.len() <= ClientKind::ALL.len()
+            && self.visible.iter().all(|client| {
+                self.order.contains(client)
+                    && self
+                        .visible
+                        .iter()
+                        .filter(|candidate| *candidate == client)
+                        .count()
+                        == 1
+            })
+    }
+
+    #[must_use]
+    pub fn visible_in_order(&self) -> Vec<ClientKind> {
+        self.order
+            .iter()
+            .copied()
+            .filter(|client| self.visible.contains(client))
+            .collect()
+    }
+}
+
+impl Default for ClientSettings {
+    fn default() -> Self {
+        Self {
+            order: default_client_order(),
+            visible: default_client_order(),
+        }
+    }
+}
+
+fn default_client_order() -> Vec<ClientKind> {
+    ClientKind::ALL.to_vec()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -409,6 +466,8 @@ pub struct Settings {
     pub proxy_port: u16,
     #[serde(default)]
     pub proxy_enabled: bool,
+    #[serde(default)]
+    pub clients: ClientSettings,
 }
 
 pub const LANGUAGE_SYSTEM: &str = "system";
@@ -422,6 +481,7 @@ impl Default for Settings {
             proxy_host: "127.0.0.1".into(),
             proxy_port: 9999,
             proxy_enabled: false,
+            clients: ClientSettings::default(),
         }
     }
 }
@@ -434,6 +494,8 @@ pub struct SettingsPatch {
     pub proxy_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clients: Option<ClientSettings>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -659,6 +721,38 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&AuthScheme::OAuth).unwrap(),
             "\"oauth\""
+        );
+    }
+
+    #[test]
+    fn client_settings_require_complete_order_and_one_visible_client() {
+        let default = ClientSettings::default();
+        assert!(default.is_valid());
+        assert_eq!(default.visible_in_order(), ClientKind::ALL);
+
+        let reordered = ClientSettings {
+            order: vec![ClientKind::Claude, ClientKind::Codex],
+            visible: vec![ClientKind::Codex, ClientKind::Claude],
+        };
+        assert!(reordered.is_valid());
+        assert_eq!(
+            reordered.visible_in_order(),
+            [ClientKind::Claude, ClientKind::Codex]
+        );
+
+        assert!(
+            !ClientSettings {
+                order: ClientKind::ALL.to_vec(),
+                visible: Vec::new(),
+            }
+            .is_valid()
+        );
+        assert!(
+            !ClientSettings {
+                order: vec![ClientKind::Codex, ClientKind::Codex],
+                visible: vec![ClientKind::Codex],
+            }
+            .is_valid()
         );
     }
 

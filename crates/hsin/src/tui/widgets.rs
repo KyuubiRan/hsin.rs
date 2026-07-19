@@ -69,9 +69,14 @@ pub(super) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
                 editing_port: true, ..
             } => i18n.text("settings_port_help"),
             SettingsPage::Proxy { .. } => i18n.text("settings_proxy_help"),
-            SettingsPage::Language { .. } | SettingsPage::Import { .. } => {
-                i18n.text("settings_submenu_help")
+            SettingsPage::ClientOrder { moving: true, .. } => {
+                i18n.text("settings_client_order_moving_help")
             }
+            SettingsPage::ClientOrder { .. } => i18n.text("settings_client_order_help"),
+            SettingsPage::ClientVisibility { .. } => i18n.text("settings_client_visibility_help"),
+            SettingsPage::Language { .. }
+            | SettingsPage::Clients { .. }
+            | SettingsPage::Import { .. } => i18n.text("settings_submenu_help"),
         },
     };
     let transient = match &state.input {

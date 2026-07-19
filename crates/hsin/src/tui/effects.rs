@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use hsin_core::{
-    ClientKind, ConnectionMode, ImportCurrentParams, ImportCurrentResult, ModeSetParams,
-    ModelDiscoverParams, ModelUpdate, Provider, ProviderAddParams, ProviderDraft,
+    ClientKind, ClientSettings, ConnectionMode, ImportCurrentParams, ImportCurrentResult,
+    ModeSetParams, ModelDiscoverParams, ModelUpdate, Provider, ProviderAddParams, ProviderDraft,
     ProviderEditParams, ProviderPatch, ProviderRemoveParams, ProviderSwitchParams, SecretInput,
     Settings, SettingsPatch,
 };
@@ -24,6 +24,7 @@ pub(super) enum Effect {
     },
     SetProxyEnabled(bool),
     SetProxyPort(u16),
+    SetClients(ClientSettings),
     ImportCurrent(ClientKind),
     ImportAll,
     Add(FormSubmission),
@@ -132,6 +133,7 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
         }
         Effect::SetProxyEnabled(enabled) => update_proxy_enabled(client, enabled).await,
         Effect::SetProxyPort(port) => update_proxy_port(client, port).await,
+        Effect::SetClients(settings) => update_clients(client, settings).await,
         Effect::ImportCurrent(kind) => {
             let imported = import_current(client, kind).await?;
             Ok(Some(if imported {
@@ -246,6 +248,7 @@ async fn update_proxy_enabled(
                 language: None,
                 proxy_port: None,
                 proxy_enabled: Some(enabled),
+                clients: None,
             },
         )
         .await?;
@@ -264,6 +267,7 @@ async fn update_proxy_port(client: &DaemonClient, port: u16) -> Result<Option<&'
                 language: None,
                 proxy_port: Some(port),
                 proxy_enabled: None,
+                clients: None,
             },
         )
         .await?;
@@ -278,10 +282,29 @@ async fn update_language(client: &DaemonClient, language: String) -> Result<Opti
                 language: Some(language),
                 proxy_port: None,
                 proxy_enabled: None,
+                clients: None,
             },
         )
         .await?;
     Ok(Some("language_changed"))
+}
+
+async fn update_clients(
+    client: &DaemonClient,
+    clients: ClientSettings,
+) -> Result<Option<&'static str>> {
+    let _: Value = client
+        .call(
+            "settings.set",
+            &SettingsPatch {
+                language: None,
+                proxy_port: None,
+                proxy_enabled: None,
+                clients: Some(clients),
+            },
+        )
+        .await?;
+    Ok(Some("client_settings_changed"))
 }
 
 async fn load(client: &DaemonClient) -> Result<(Vec<Provider>, StatusSnapshot, Settings)> {

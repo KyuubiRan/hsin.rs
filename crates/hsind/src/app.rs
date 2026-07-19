@@ -10,9 +10,9 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hsin_core::{
-    AppError, AuthScheme, ClientKind, ConnectionMode, DaemonStatus, DoctorFinding, DoctorReport,
-    DoctorSeverity, ErrorCode, ImportCurrentParams, ImportCurrentResult, KeyStoreState,
-    ModelDiscoverParams, ModelDiscovery, ModelUpdate, Provider, ProviderAddParams,
+    AppError, AuthScheme, ClientKind, ClientSettings, ConnectionMode, DaemonStatus, DoctorFinding,
+    DoctorReport, DoctorSeverity, ErrorCode, ImportCurrentParams, ImportCurrentResult,
+    KeyStoreState, ModelDiscoverParams, ModelDiscovery, ModelUpdate, Provider, ProviderAddParams,
     ProviderEditParams, ProviderListParams, ProviderRemoveParams, ProviderSwitchParams,
     SecretInput, SecurityStatus, Settings, SettingsPatch,
 };
@@ -814,11 +814,34 @@ impl App {
             proxy_host: "127.0.0.1".into(),
             proxy_port: self.proxy_port()?,
             proxy_enabled: self.proxy_enabled(),
+            clients: self.client_settings()?,
         })
+    }
+
+    fn client_settings(&self) -> Result<ClientSettings> {
+        let Some(value) = self.db.setting("clients")? else {
+            return Ok(ClientSettings::default());
+        };
+        let settings: ClientSettings = serde_json::from_str(&value)
+            .map_err(|error| DaemonError::Config(format!("invalid client settings: {error}")))?;
+        if !settings.is_valid() {
+            return Err(DaemonError::Config("invalid client settings".into()));
+        }
+        Ok(settings)
     }
 
     pub async fn update_settings(&self, patch: SettingsPatch) -> Result<Settings> {
         let _guard = self.mutation.lock().await;
+        if patch
+            .clients
+            .as_ref()
+            .is_some_and(|clients| !clients.is_valid())
+        {
+            return Err(DaemonError::Invalid(
+                "client settings must contain each client once and keep at least one visible"
+                    .into(),
+            ));
+        }
         if let Some(language) = patch.language {
             if !matches!(
                 language.as_str(),
@@ -846,6 +869,10 @@ impl App {
                 ));
             }
             self.db.set_setting("proxy_port", &port.to_string())?;
+        }
+        if let Some(clients) = patch.clients {
+            self.db
+                .set_setting("clients", &serde_json::to_string(&clients)?)?;
         }
         if patch.proxy_enabled == Some(true) {
             self.set_proxy_enabled_locked(true).await?;
@@ -1170,6 +1197,49 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[tokio::test]
+    async fn client_settings_are_validated_and_persisted() {
+        let root = std::env::temp_dir().join(format!("hsind-clients-{}", uuid::Uuid::new_v4()));
+        let paths = Paths {
+            database: root.join("hsin.sqlite3"),
+            lock: root.join("hsind.lock"),
+            logs: root.join("logs"),
+            backups: root.join("backups"),
+            home: root.clone(),
+        };
+        let app = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
+        let clients = ClientSettings {
+            order: vec![ClientKind::Claude, ClientKind::Codex],
+            visible: vec![ClientKind::Claude],
+        };
+        let settings = app
+            .update_settings(SettingsPatch {
+                language: None,
+                proxy_port: None,
+                proxy_enabled: None,
+                clients: Some(clients.clone()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(settings.clients, clients);
+        assert_eq!(app.settings().unwrap().clients, clients);
+
+        let invalid = app
+            .update_settings(SettingsPatch {
+                language: None,
+                proxy_port: None,
+                proxy_enabled: None,
+                clients: Some(ClientSettings {
+                    order: ClientKind::ALL.to_vec(),
+                    visible: Vec::new(),
+                }),
+            })
+            .await;
+        assert!(matches!(invalid, Err(DaemonError::Invalid(_))));
+        assert_eq!(app.settings().unwrap().clients, clients);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn v1_detection_checks_the_last_path_segment() {
         assert!(base_url_has_v1("https://example.test/v1"));
@@ -1470,6 +1540,7 @@ mod tests {
             language: None,
             proxy_port: None,
             proxy_enabled: Some(false),
+            clients: None,
         })
         .await
         .unwrap();
