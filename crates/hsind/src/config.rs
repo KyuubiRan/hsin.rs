@@ -881,12 +881,13 @@ fn set_object_raw(
 ) -> Result<String> {
     if let Some(existing) = find_direct_property(text, range, property)? {
         if let Some(raw) = raw {
-            return Ok(format!(
+            let output = format!(
                 "{}{}{}",
                 &text[..existing.value_start],
                 raw,
                 &text[existing.value_end..]
-            ));
+            );
+            return repair_owned_property_layout(&output, range.start, property);
         }
         return remove_property(text, range, existing);
     }
@@ -894,18 +895,27 @@ fn set_object_raw(
         return Ok(text.to_owned());
     };
     let indent = child_indent(text, range);
-    let has_properties = skip_trivia(text, range.start + 1)? < range.end;
     let newline = newline(text);
-    let insertion = if has_properties {
-        let separator = if object_has_trailing_comma(text, range)? {
-            ""
-        } else {
-            ","
-        };
-        format!(
-            "{separator}{newline}{indent}{}: {raw}",
-            quote_json(property)
-        )
+    let interior = &text[range.start + 1..range.end];
+    if interior.trim().is_empty() {
+        let insertion = format!(
+            "{newline}{indent}{}: {raw}{newline}{}",
+            quote_json(property),
+            parent_indent(&indent)
+        );
+        return Ok(format!(
+            "{}{}{}",
+            &text[..=range.start],
+            insertion,
+            &text[range.end..]
+        ));
+    }
+
+    let tail = object_tail(text, range)?;
+    let closing_indent = closing_indent_start(text, range);
+    let insertion_offset = closing_indent.unwrap_or(range.end);
+    let insertion = if closing_indent.is_some() {
+        format!("{indent}{}: {raw}{newline}", quote_json(property))
     } else {
         format!(
             "{newline}{indent}{}: {raw}{newline}{}",
@@ -913,16 +923,70 @@ fn set_object_raw(
             parent_indent(&indent)
         )
     };
-    Ok(format!(
-        "{}{}{}",
-        &text[..range.end],
-        insertion,
-        &text[range.end..]
-    ))
+    let mut output = String::with_capacity(text.len() + insertion.len() + 1);
+    if let Some((value_end, has_trailing_comma)) = tail {
+        if value_end > insertion_offset {
+            return Err(DaemonError::Config("invalid JSONC object layout".into()));
+        }
+        output.push_str(&text[..value_end]);
+        if !has_trailing_comma {
+            output.push(',');
+        }
+        output.push_str(&text[value_end..insertion_offset]);
+    } else {
+        output.push_str(&text[..insertion_offset]);
+    }
+    output.push_str(&insertion);
+    output.push_str(&text[insertion_offset..]);
+    Ok(output)
 }
 
 fn remove_property(text: &str, range: ObjectRange, property: PropertyRange) -> Result<String> {
     let bytes = text.as_bytes();
+    let line_start = text[..property.start]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let property_is_indented = line_start > range.start
+        && text[line_start..property.start]
+            .bytes()
+            .all(|byte| matches!(byte, b' ' | b'\t'));
+    if property_is_indented {
+        let mut after = property.value_end;
+        while matches!(bytes.get(after), Some(b' ' | b'\t')) {
+            after += 1;
+        }
+        let has_following_comma = bytes.get(after) == Some(&b',');
+        if has_following_comma {
+            after += 1;
+            while matches!(bytes.get(after), Some(b' ' | b'\t')) {
+                after += 1;
+            }
+        }
+        let line_end = match bytes.get(after) {
+            Some(b'\r') if bytes.get(after + 1) == Some(&b'\n') => Some(after + 2),
+            Some(b'\n') => Some(after + 1),
+            _ => None,
+        };
+        if let Some(line_end) = line_end {
+            if has_following_comma {
+                return Ok(format!("{}{}", &text[..line_start], &text[line_end..]));
+            }
+            let mut before = line_start;
+            while before > range.start + 1 && bytes[before - 1].is_ascii_whitespace() {
+                before -= 1;
+            }
+            if before > range.start + 1 && bytes[before - 1] == b',' {
+                return Ok(format!(
+                    "{}{}{}",
+                    &text[..before - 1],
+                    &text[before..line_start],
+                    &text[line_end..]
+                ));
+            }
+            return Ok(format!("{}{}", &text[..line_start], &text[line_end..]));
+        }
+    }
+
     let mut before = property.start;
     while before > range.start + 1 && bytes[before - 1].is_ascii_whitespace() {
         before -= 1;
@@ -993,7 +1057,7 @@ fn find_direct_property(
     Ok(None)
 }
 
-fn object_has_trailing_comma(text: &str, range: ObjectRange) -> Result<bool> {
+fn object_tail(text: &str, range: ObjectRange) -> Result<Option<(usize, bool)>> {
     let mut index = range.start + 1;
     let mut last_value_end = None;
     while index < range.end {
@@ -1021,9 +1085,86 @@ fn object_has_trailing_comma(text: &str, range: ObjectRange) -> Result<bool> {
         index = value_end;
     }
     let Some(value_end) = last_value_end else {
-        return Ok(false);
+        return Ok(None);
     };
-    Ok(text.as_bytes().get(skip_trivia(text, value_end)?) == Some(&b','))
+    Ok(Some((
+        value_end,
+        text.as_bytes().get(skip_trivia(text, value_end)?) == Some(&b','),
+    )))
+}
+
+fn closing_indent_start(text: &str, range: ObjectRange) -> Option<usize> {
+    let line_start = text[..range.end].rfind('\n').map_or(0, |index| index + 1);
+    (line_start > range.start
+        && text[line_start..range.end]
+            .bytes()
+            .all(|byte| matches!(byte, b' ' | b'\t')))
+    .then_some(line_start)
+}
+
+fn repair_owned_property_layout(text: &str, object_start: usize, property: &str) -> Result<String> {
+    let mut output = text.to_owned();
+
+    let mut range = ObjectRange {
+        start: object_start,
+        end: find_matching(&output, object_start, b'{', b'}')?,
+    };
+    let mut existing = find_direct_property(&output, range, property)?.ok_or_else(|| {
+        DaemonError::Config(format!(
+            "JSONC property {property} disappeared during update"
+        ))
+    })?;
+    let leading = &output[range.start + 1..existing.start];
+    if leading.trim().is_empty() && leading.bytes().filter(|byte| *byte == b'\n').count() > 1 {
+        let replacement = format!("{}{}", newline(&output), child_indent(&output, range));
+        output.replace_range(range.start + 1..existing.start, &replacement);
+        range.end = find_matching(&output, object_start, b'{', b'}')?;
+        existing = find_direct_property(&output, range, property)?.ok_or_else(|| {
+            DaemonError::Config(format!(
+                "JSONC property {property} disappeared during repair"
+            ))
+        })?;
+    }
+
+    let bytes = output.as_bytes();
+    let mut comma = existing.value_end;
+    while comma < range.end && bytes[comma].is_ascii_whitespace() {
+        comma += 1;
+    }
+    if comma > existing.value_end
+        && output[existing.value_end..comma].contains('\n')
+        && bytes.get(comma) == Some(&b',')
+    {
+        let mut next = comma + 1;
+        while next < range.end && bytes[next].is_ascii_whitespace() {
+            next += 1;
+        }
+        if bytes.get(next) == Some(&b'"') {
+            let line_start = output[..next].rfind('\n').map_or(next, |index| index + 1);
+            let indent = if output[line_start..next]
+                .bytes()
+                .all(|byte| matches!(byte, b' ' | b'\t'))
+            {
+                output[line_start..next].to_owned()
+            } else {
+                child_indent(&output, range)
+            };
+            let replacement = format!(",{}{indent}", newline(&output));
+            output.replace_range(existing.value_end..next, &replacement);
+            range.end = find_matching(&output, object_start, b'{', b'}')?;
+            existing = find_direct_property(&output, range, property)?.ok_or_else(|| {
+                DaemonError::Config(format!(
+                    "JSONC property {property} disappeared after separator repair"
+                ))
+            })?;
+        }
+    }
+
+    if existing.value_end == range.end && output[range.start..range.end].contains('\n') {
+        let closing_indent = parent_indent(&child_indent(&output, range));
+        output.insert_str(range.end, &format!("{}{closing_indent}", newline(&output)));
+    }
+    Ok(output)
 }
 
 fn read_value_end(text: &str, start: usize) -> Result<usize> {
@@ -1469,6 +1610,71 @@ mod tests {
         let output = patch_claude_with_credential("{}\n", &claude, None).unwrap();
         assert!(output.contains(&format!("\"ANTHROPIC_API_KEY\": \"{HSIN_MANAGED_KEY}\"")));
         assert!(!output.contains("apiKeyHelper"));
+    }
+
+    #[test]
+    fn codex_auth_uses_clean_json_layout_and_repairs_legacy_artifacts() {
+        let expected = format!(
+            "{{\n  \"auth_mode\": \"apikey\",\n  \"OPENAI_API_KEY\": \"{HSIN_MANAGED_KEY}\"\n}}\n"
+        );
+        assert_eq!(
+            patch_codex_auth_text("{}\n", HSIN_MANAGED_KEY).unwrap(),
+            expected
+        );
+
+        let malformed = "{\n\n\n  \"auth_mode\": \"apikey\"\n,\n  \"OPENAI_API_KEY\": \"stale\"}\n";
+        assert_eq!(
+            patch_codex_auth_text(malformed, HSIN_MANAGED_KEY).unwrap(),
+            expected
+        );
+
+        let empty_snapshot = CodexAuthSnapshot {
+            auth_path: "/tmp/auth.json".into(),
+            file_existed: true,
+            auth_mode: None,
+            openai_api_key: None,
+        };
+        assert_eq!(
+            restore_codex_auth_text(&expected, &empty_snapshot).unwrap(),
+            "{\n}\n"
+        );
+    }
+
+    #[test]
+    fn claude_owned_fields_use_clean_json_layout_when_added_and_removed() {
+        let mut claude = target(ClientKind::Claude);
+        claude.mode = ConnectionMode::Proxy;
+        claude.disable_custom_auth = true;
+        let managed = patch_claude_with_credential("{}\n", &claude, None).unwrap();
+        assert_eq!(
+            managed,
+            format!(
+                "{{\n  \"env\": {{\n    \"ANTHROPIC_BASE_URL\": \"http://127.0.0.1:9999/claude\",\n    \"ANTHROPIC_API_KEY\": \"{HSIN_MANAGED_KEY}\"\n  }}\n}}\n"
+            )
+        );
+        let malformed = "{\n  \"env\": {\n\n    \"ANTHROPIC_BASE_URL\": \"old\"\n,\n    \"ANTHROPIC_API_KEY\": \"old\"}\n}\n";
+        assert_eq!(
+            patch_claude_with_credential(malformed, &claude, None).unwrap(),
+            managed
+        );
+
+        claude.provider = Provider {
+            id: "official-claude".into(),
+            client: ClientKind::Claude,
+            name: "Official".into(),
+            description: String::new(),
+            base_url: CLAUDE_OFFICIAL_URL.into(),
+            auth_scheme: AuthScheme::OAuth,
+            official: true,
+            credential_configured: false,
+            credential_preview: None,
+            model: None,
+            revision: 1,
+        };
+        assert_eq!(
+            patch_claude_with_credential(&managed, &claude, None).unwrap(),
+            "{\n  \"env\": {\n  }\n}\n"
+        );
     }
 
     #[test]
