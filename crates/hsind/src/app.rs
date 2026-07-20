@@ -171,15 +171,19 @@ impl App {
     }
 
     pub(crate) fn reconcile_client_auth_configuration(&self) -> Result<()> {
-        if !self.disable_custom_auth(ClientKind::Codex)? {
-            return Ok(());
-        }
         let state = self.db.client_state(ClientKind::Codex)?;
         let Some(provider_id) = state.active_provider_id else {
             return Ok(());
         };
         let provider = self.db.get_provider(&provider_id)?;
-        self.apply_configuration_with_auth(&provider, state.mode, Some(true))
+        if provider.official && self.codex_auth_backup()?.is_none() {
+            return Ok(());
+        }
+        self.apply_configuration_with_auth(
+            &provider,
+            state.mode,
+            Some(self.disable_custom_auth(ClientKind::Codex)?),
+        )
     }
 
     fn ensure_official_provider(&self, client: ClientKind) -> Result<Provider> {
@@ -842,9 +846,18 @@ impl App {
     }
 
     fn manages_codex_auth(target: &ConfigTarget) -> bool {
-        target.client == ClientKind::Codex
-            && target.disable_custom_auth
-            && !target.provider.official
+        target.client == ClientKind::Codex && !target.provider.official
+    }
+
+    fn managed_codex_auth_key<'a>(
+        target: &ConfigTarget,
+        credential: Option<&'a str>,
+    ) -> Result<&'a str> {
+        if target.disable_custom_auth && target.mode == ConnectionMode::Direct {
+            credential.ok_or(DaemonError::Locked)
+        } else {
+            Ok(config::HSIN_MANAGED_KEY)
+        }
     }
 
     fn codex_auth_backup(&self) -> Result<Option<config::CodexAuthSnapshot>> {
@@ -890,10 +903,7 @@ impl App {
         let config_path = self.config_path(ClientKind::Codex)?;
         let auth_path = config::codex_auth_path(&config_path)?;
         if Self::manages_codex_auth(target) {
-            let key = match target.mode {
-                ConnectionMode::Proxy => config::HSIN_MANAGED_KEY,
-                ConnectionMode::Direct => credential.ok_or(DaemonError::Locked)?,
-            };
+            let key = Self::managed_codex_auth_key(target, credential)?;
             config::apply_codex_auth(&auth_path, target.codex_auth_before_hash.as_deref(), key)?;
         } else if let Some(snapshot) = self.codex_auth_backup()? {
             if snapshot.auth_path != auth_path.to_string_lossy() {
@@ -926,10 +936,7 @@ impl App {
             String::new()
         };
         if Self::manages_codex_auth(target) {
-            let key = match target.mode {
-                ConnectionMode::Proxy => config::HSIN_MANAGED_KEY,
-                ConnectionMode::Direct => credential.ok_or(DaemonError::Locked)?,
-            };
+            let key = Self::managed_codex_auth_key(target, credential)?;
             return config::codex_auth_is_managed(&current, key);
         }
         let Some(snapshot) = self.codex_auth_backup()? else {
@@ -1429,6 +1436,30 @@ mod tests {
         }
     }
 
+    fn leave_pending_configuration_operation(
+        app: &App,
+        path: &std::path::Path,
+        target: &ConfigTarget,
+    ) {
+        let before_hash = config::file_hash(path).unwrap();
+        app.db
+            .begin_operation(
+                "apply_config",
+                target.client,
+                before_hash.as_deref(),
+                &serde_json::to_string(target).unwrap(),
+            )
+            .unwrap();
+        let credential = app.config_credential(target).unwrap();
+        config::apply_with_credential(
+            path,
+            before_hash.as_deref(),
+            target,
+            credential.as_ref().map(ExposeSecret::expose_secret),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn model_ids_are_sorted_descending() {
         let models = parse_model_ids(&json!({
@@ -1577,6 +1608,19 @@ mod tests {
                 .unwrap()
                 .contains("[model_providers.hsin.auth]")
         );
+        let auth = fs::read_to_string(&codex_auth).unwrap();
+        assert!(auth.contains("\"auth_mode\": \"apikey\""));
+        assert!(auth.contains(&format!(
+            "\"OPENAI_API_KEY\": \"{}\"",
+            config::HSIN_MANAGED_KEY
+        )));
+        assert!(auth.contains("\"tokens\": {\"access_token\": \"keep-token\"}"));
+        assert!(
+            app.db
+                .protected_value(CODEX_AUTH_BACKUP_KEY)
+                .unwrap()
+                .is_some()
+        );
 
         let client_auth = ClientAuthSettings {
             codex_disable_custom_auth: true,
@@ -1635,7 +1679,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!settings.client_auth.codex_disable_custom_auth);
-        assert_eq!(fs::read_to_string(&codex_auth).unwrap(), original_auth);
+        let auth = fs::read_to_string(&codex_auth).unwrap();
+        assert!(auth.contains(&format!(
+            "\"OPENAI_API_KEY\": \"{}\"",
+            config::HSIN_MANAGED_KEY
+        )));
+        assert!(auth.contains("\"tokens\": {\"access_token\": \"keep-token\"}"));
         assert!(
             fs::read_to_string(&codex_config)
                 .unwrap()
@@ -1645,7 +1694,7 @@ mod tests {
             app.db
                 .protected_value(CODEX_AUTH_BACKUP_KEY)
                 .unwrap()
-                .is_none()
+                .is_some()
         );
 
         app.update_settings(SettingsPatch {
@@ -1726,23 +1775,7 @@ mod tests {
             .config_target(&provider, ConnectionMode::Direct, Some(true))
             .unwrap();
         app.ensure_codex_auth_backup(&codex_auth).unwrap();
-        let before_hash = config::file_hash(&codex_config).unwrap();
-        app.db
-            .begin_operation(
-                "apply_config",
-                ClientKind::Codex,
-                before_hash.as_deref(),
-                &serde_json::to_string(&enable).unwrap(),
-            )
-            .unwrap();
-        let credential = app.config_credential(&enable).unwrap().unwrap();
-        config::apply_with_credential(
-            &codex_config,
-            before_hash.as_deref(),
-            &enable,
-            Some(credential.expose_secret()),
-        )
-        .unwrap();
+        leave_pending_configuration_operation(&app, &codex_config, &enable);
         app.recover_operations().unwrap();
         assert!(
             fs::read_to_string(&codex_auth)
@@ -1757,28 +1790,36 @@ mod tests {
         );
         assert!(app.db.pending_operations().unwrap().is_empty());
 
-        let disable = app
+        let helper_auth = app
             .config_target(&provider, ConnectionMode::Direct, Some(false))
             .unwrap();
-        let before_hash = config::file_hash(&codex_config).unwrap();
-        app.db
-            .begin_operation(
-                "apply_config",
-                ClientKind::Codex,
-                before_hash.as_deref(),
-                &serde_json::to_string(&disable).unwrap(),
-            )
-            .unwrap();
-        config::apply_with_credential(&codex_config, before_hash.as_deref(), &disable, None)
-            .unwrap();
+        leave_pending_configuration_operation(&app, &codex_config, &helper_auth);
         app.recover_operations().unwrap();
-        assert_eq!(fs::read_to_string(&codex_auth).unwrap(), original_auth);
+        assert!(fs::read_to_string(&codex_auth).unwrap().contains(&format!(
+            "\"OPENAI_API_KEY\": \"{}\"",
+            config::HSIN_MANAGED_KEY
+        )));
         assert!(
             !app.settings()
                 .unwrap()
                 .client_auth
                 .codex_disable_custom_auth
         );
+        assert!(
+            app.db
+                .protected_value(CODEX_AUTH_BACKUP_KEY)
+                .unwrap()
+                .is_some()
+        );
+        assert!(app.db.pending_operations().unwrap().is_empty());
+
+        let official = app.ensure_official_provider(ClientKind::Codex).unwrap();
+        let restore = app
+            .config_target(&official, ConnectionMode::Direct, Some(false))
+            .unwrap();
+        leave_pending_configuration_operation(&app, &codex_config, &restore);
+        app.recover_operations().unwrap();
+        assert_eq!(fs::read_to_string(&codex_auth).unwrap(), original_auth);
         assert!(
             app.db
                 .protected_value(CODEX_AUTH_BACKUP_KEY)
@@ -1857,6 +1898,72 @@ mod tests {
             "\"OPENAI_API_KEY\": \"{}\"",
             config::HSIN_MANAGED_KEY
         )));
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_reconciles_cli_auth_with_codex_login_placeholder() {
+        let root = std::env::temp_dir().join(format!("hsind-auth-helper-{}", uuid::Uuid::new_v4()));
+        let paths = Paths {
+            database: root.join("hsin.sqlite3"),
+            lock: root.join("hsind.lock"),
+            logs: root.join("logs"),
+            backups: root.join("backups"),
+            home: root.clone(),
+        };
+        let codex_config = root.join("codex/config.toml");
+        let codex_auth = root.join("codex/auth.json");
+        fs::create_dir_all(codex_config.parent().unwrap()).unwrap();
+        let original_auth =
+            "{\n  \"auth_mode\": \"chatgpt\",\n  \"tokens\": {\"access_token\": \"keep\"}\n}\n";
+        fs::write(&codex_auth, original_auth).unwrap();
+        let app = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
+        *app.config_paths.write() = HashMap::from([
+            (ClientKind::Codex, codex_config.clone()),
+            (ClientKind::Claude, root.join("claude/settings.json")),
+        ]);
+        let provider = app
+            .add_provider(ProviderAddParams {
+                provider: hsin_core::ProviderDraft {
+                    client: ClientKind::Codex,
+                    name: "Helper login".into(),
+                    description: String::new(),
+                    base_url: "https://helper.example.test/v1".into(),
+                    auth_scheme: AuthScheme::Bearer,
+                    model: None,
+                },
+                secret: SecretInput::Replace("helper-secret".into()),
+            })
+            .await
+            .unwrap();
+        app.db
+            .set_active(ClientKind::Codex, &provider.id, "synchronized")
+            .unwrap();
+        app.db
+            .set_mode(ClientKind::Codex, ConnectionMode::Proxy)
+            .unwrap();
+
+        app.reconcile_client_auth_configuration().unwrap();
+
+        let configured = fs::read_to_string(&codex_config).unwrap();
+        assert!(configured.contains("[model_providers.hsin.auth]"));
+        assert!(configured.contains("args = [\"credential\", \"codex\"]"));
+        assert!(!configured.contains("requires_openai_auth"));
+        assert!(!configured.contains("helper-secret"));
+        let auth = fs::read_to_string(&codex_auth).unwrap();
+        assert!(auth.contains(&format!(
+            "\"OPENAI_API_KEY\": \"{}\"",
+            config::HSIN_MANAGED_KEY
+        )));
+        assert!(auth.contains("\"tokens\": {\"access_token\": \"keep\"}"));
+        assert!(
+            app.db
+                .protected_value(CODEX_AUTH_BACKUP_KEY)
+                .unwrap()
+                .is_some()
+        );
 
         drop(app);
         fs::remove_dir_all(root).unwrap();

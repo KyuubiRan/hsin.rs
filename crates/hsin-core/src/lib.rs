@@ -12,7 +12,7 @@ use url::Url;
 pub const PROTOCOL_VERSION: u32 = 1;
 /// Monotonic CLI/daemon compatibility code. Bump when either side requires
 /// RPC fields or behavior that an older binary cannot provide.
-pub const VERSION_CODE: u32 = 13;
+pub const VERSION_CODE: u32 = 14;
 
 #[must_use]
 pub fn provider_name_from_url(value: &str) -> Option<String> {
