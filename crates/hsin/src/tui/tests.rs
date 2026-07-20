@@ -479,59 +479,35 @@ fn proxy_settings_edits_port_only_while_disabled() {
 }
 
 #[test]
-fn settings_import_menu_selects_codex_claude_or_all() {
-    let mut state = State::default();
-    state.reduce(key(KeyCode::Char('o')));
-    state.reduce(key(KeyCode::Down));
-    state.reduce(key(KeyCode::Down));
-    state.reduce(key(KeyCode::Down));
-    state.reduce(key(KeyCode::Enter));
-    assert!(state.take_effect().is_none());
-    assert!(matches!(
-        &state.input,
-        InputMode::Settings(SettingsScreen {
-            page: SettingsPage::Import { selected: 0 },
-            ..
-        })
-    ));
-    state.reduce(key(KeyCode::Enter));
-    assert!(matches!(
-        state.take_effect(),
-        Some(Effect::ImportCurrent(ClientKind::Codex))
-    ));
-    assert!(matches!(
-        state.input,
-        InputMode::Settings(SettingsScreen {
-            page: SettingsPage::Root,
-            ..
-        })
-    ));
-
-    let mut claude = State {
-        input: InputMode::Settings(SettingsScreen {
-            selected: 3,
-            page: SettingsPage::Import { selected: 0 },
-        }),
-        ..State::default()
-    };
-    claude.reduce(key(KeyCode::Down));
-    claude.reduce(key(KeyCode::Enter));
-    assert!(matches!(
-        claude.take_effect(),
-        Some(Effect::ImportCurrent(ClientKind::Claude))
-    ));
-
-    let mut all = State {
-        input: InputMode::Settings(SettingsScreen {
-            selected: 3,
-            page: SettingsPage::Import { selected: 0 },
-        }),
-        ..State::default()
-    };
-    all.reduce(key(KeyCode::Down));
-    all.reduce(key(KeyCode::Down));
-    all.reduce(key(KeyCode::Enter));
-    assert!(matches!(all.take_effect(), Some(Effect::ImportAll)));
+fn client_configuration_imports_the_corresponding_current_provider() {
+    for client in ClientKind::ALL {
+        let mut state = State {
+            input: InputMode::Settings(SettingsScreen {
+                selected: match client {
+                    ClientKind::Codex => 0,
+                    ClientKind::Claude => 1,
+                },
+                page: SettingsPage::ClientConfig {
+                    client,
+                    selected: 0,
+                },
+            }),
+            ..State::default()
+        };
+        state.reduce(key(KeyCode::Down));
+        state.reduce(key(KeyCode::Enter));
+        assert!(matches!(
+            state.take_effect(),
+            Some(Effect::ImportCurrent(imported_client)) if imported_client == client
+        ));
+        assert!(matches!(
+            state.input,
+            InputMode::Settings(SettingsScreen {
+                page: SettingsPage::ClientConfig { selected: 1, .. },
+                ..
+            })
+        ));
+    }
 }
 
 #[test]
@@ -1336,7 +1312,7 @@ fn renders_provider_and_compact_windows() {
     assert!(rendered.contains("Settings"));
     assert!(!rendered.contains("Options"));
     assert!(rendered.contains("Description"));
-    assert!(rendered.contains("Import current configuration"));
+    assert!(!rendered.contains("Import current Provider"));
     assert!(rendered.contains("Control whether hsind"));
     assert!(!rendered.contains("2 / 2"));
     assert!(!rendered.contains("Example"));
@@ -1555,12 +1531,15 @@ fn settings_header_hides_clients_at_full_and_compact_sizes() {
 }
 
 #[test]
-fn settings_import_menu_renders_each_source_and_import_all() {
+fn client_configuration_renders_import_current_provider() {
     let mut state = State {
         loading: false,
         input: InputMode::Settings(SettingsScreen {
-            selected: 2,
-            page: SettingsPage::Import { selected: 2 },
+            selected: 1,
+            page: SettingsPage::ClientConfig {
+                client: ClientKind::Claude,
+                selected: 1,
+            },
         }),
         ..State::default()
     };
@@ -1568,7 +1547,7 @@ fn settings_import_menu_renders_each_source_and_import_all() {
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
     terminal
         .draw(|frame| draw(frame, &mut state, &locale))
-        .expect("draw import settings");
+        .expect("draw Claude Code settings");
     let rendered = terminal
         .backend()
         .buffer()
@@ -1576,21 +1555,9 @@ fn settings_import_menu_renders_each_source_and_import_all() {
         .iter()
         .map(ratatui::buffer::Cell::symbol)
         .collect::<String>();
-    let left_column = terminal
-        .backend()
-        .buffer()
-        .content()
-        .chunks(80)
-        .flat_map(|row| {
-            row.iter()
-                .take(34)
-                .map(ratatui::buffer::Cell::symbol)
-                .chain(std::iter::once("\n"))
-        })
-        .collect::<String>();
-    let positions = ["Codex", "Claude Code", "Import all"]
-        .map(|label| left_column.find(label).expect("import source must render"));
-    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
-    assert!(rendered.contains("Process both Codex and Claude Code"));
-    assert!(!rendered.contains("Import source"));
+    assert!(rendered.contains("Claude Code configuration"));
+    assert!(rendered.contains("Import current Provider"));
+    assert!(rendered.contains("A new Provider is created only when"));
+    assert!(!rendered.contains("Import all"));
+    assert!(!rendered.contains("reduces security"));
 }

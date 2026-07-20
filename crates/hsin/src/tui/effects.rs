@@ -30,7 +30,6 @@ pub(super) enum Effect {
         disable_custom_auth: bool,
     },
     ImportCurrent(ClientKind),
-    ImportAll,
     Add(FormSubmission),
     Edit(FormSubmission),
     DiscoverModels(FormSubmission),
@@ -163,7 +162,6 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
                 "provider_unchanged"
             }))
         }
-        Effect::ImportAll => import_all(client).await,
         Effect::Add(form) => {
             let model = match form.model {
                 ModelUpdate::Set(model) => Some(model),
@@ -267,20 +265,6 @@ async fn import_current(client: &DaemonClient, kind: ClientKind) -> Result<bool>
         )
         .await?;
     Ok(result.imported)
-}
-
-async fn import_all(client: &DaemonClient) -> Result<Option<&'static str>> {
-    let codex = import_current(client, ClientKind::Codex).await;
-    let claude = import_current(client, ClientKind::Claude).await;
-    match (codex, claude) {
-        (Ok(codex), Ok(claude)) => Ok(Some(if codex || claude {
-            "providers_imported_all"
-        } else {
-            "providers_unchanged_all"
-        })),
-        (Ok(_), Err(_)) | (Err(_), Ok(_)) => Ok(Some("providers_imported_partial")),
-        (Err(error), Err(_)) => Err(error),
-    }
 }
 
 async fn update_proxy_enabled(

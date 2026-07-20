@@ -69,7 +69,7 @@ pub(super) fn draw_settings_screen(
         .map(|client| client_label(*client, i18n))
         .collect::<Vec<_>>()
         .join(" → ");
-    let auth_warning = matches!(&screen.page, SettingsPage::ClientConfig { .. });
+    let auth_warning = matches!(&screen.page, SettingsPage::ClientConfig { selected: 0, .. });
 
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -82,7 +82,6 @@ pub(super) fn draw_settings_screen(
                 settings_option_item(i18n.text("proxy_master"), proxy, option_width),
                 ListItem::new(i18n.text("client_configuration")),
                 settings_option_item(i18n.text("language"), language, option_width),
-                ListItem::new(i18n.text("import_current")),
             ];
             match screen.selected {
                 0 => (
@@ -109,14 +108,7 @@ pub(super) fn draw_settings_screen(
                     i18n.text("settings_language_description"),
                     Some(language),
                 ),
-                _ => (
-                    items,
-                    screen.selected,
-                    i18n.text("settings_options"),
-                    i18n.text("import_current"),
-                    i18n.text("settings_import_current_description"),
-                    None,
-                ),
+                _ => unreachable!("root settings selection is bounded"),
             }
         }
         SettingsPage::Proxy { selected, port, .. } => {
@@ -225,25 +217,41 @@ pub(super) fn draw_settings_screen(
         }
         SettingsPage::ClientConfig { client, selected } => {
             let disabled = state.client_auth.disable_custom_auth(*client);
-            (
-                vec![settings_option_item(
+            let (detail_title, description, current) = if *selected == 0 {
+                (
                     i18n.text("disable_custom_auth"),
-                    if disabled {
+                    i18n.text("settings_disable_custom_auth_description"),
+                    Some(if disabled {
                         i18n.text("on")
                     } else {
                         i18n.text("off")
-                    },
-                    option_width,
-                )],
+                    }),
+                )
+            } else {
+                (
+                    i18n.text("import_current"),
+                    i18n.text("settings_import_current_description"),
+                    None,
+                )
+            };
+            (
+                vec![
+                    settings_option_item(
+                        i18n.text("disable_custom_auth"),
+                        if disabled {
+                            i18n.text("on")
+                        } else {
+                            i18n.text("off")
+                        },
+                        option_width,
+                    ),
+                    ListItem::new(i18n.text("import_current")),
+                ],
                 *selected,
                 client_config_label(*client, i18n),
-                i18n.text("disable_custom_auth"),
-                i18n.text("settings_disable_custom_auth_description"),
-                Some(if disabled {
-                    i18n.text("on")
-                } else {
-                    i18n.text("off")
-                }),
+                detail_title,
+                description,
+                current,
             )
         }
         SettingsPage::ClientVisibility { selected } => {
@@ -299,34 +307,6 @@ pub(super) fn draw_settings_screen(
             }),
             None,
         ),
-        SettingsPage::Import { selected } => {
-            let (detail_title, description) = match *selected {
-                0 => (
-                    i18n.text("codex"),
-                    i18n.text("settings_import_codex_description"),
-                ),
-                1 => (
-                    i18n.text("claude"),
-                    i18n.text("settings_import_claude_description"),
-                ),
-                _ => (
-                    i18n.text("import_all"),
-                    i18n.text("settings_import_all_description"),
-                ),
-            };
-            (
-                vec![
-                    ListItem::new(i18n.text("codex")),
-                    ListItem::new(i18n.text("claude")),
-                    ListItem::new(i18n.text("import_all")),
-                ],
-                *selected,
-                i18n.text("import_current"),
-                detail_title,
-                description,
-                None,
-            )
-        }
     };
     let mut list_state = ListState::default().with_selected(Some(selected));
     let list = List::new(items)

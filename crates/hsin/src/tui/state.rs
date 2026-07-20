@@ -120,9 +120,6 @@ pub(super) enum SettingsPage {
         order: Vec<ClientKind>,
         moving: bool,
     },
-    Import {
-        selected: usize,
-    },
 }
 
 pub(super) struct ProviderForm {
@@ -463,7 +460,7 @@ impl State {
                         screen.selected = screen.selected.saturating_sub(1);
                     }
                     KeyCode::Down | KeyCode::Char('k') => {
-                        screen.selected = (screen.selected + 1).min(3);
+                        screen.selected = (screen.selected + 1).min(2);
                     }
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => match screen.selected {
                         0 => {
@@ -476,13 +473,10 @@ impl State {
                         1 => {
                             screen.page = SettingsPage::Clients { selected: 0 };
                         }
-                        2 => {
+                        _ => {
                             screen.page = SettingsPage::Language {
                                 selected: language_selected,
                             };
-                        }
-                        _ => {
-                            screen.page = SettingsPage::Import { selected: 0 };
                         }
                     },
                     _ => {}
@@ -619,12 +613,16 @@ impl State {
                         *selected = selected.saturating_sub(1);
                     }
                     KeyCode::Down | KeyCode::Char('k') => {
-                        *selected = 0;
+                        *selected = (*selected + 1).min(1);
                     }
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l' | ' ') => {
-                        self.pending_effect = Some(Effect::SetClientAuth {
-                            client: *client,
-                            disable_custom_auth: !client_auth.disable_custom_auth(*client),
+                        self.pending_effect = Some(if *selected == 0 {
+                            Effect::SetClientAuth {
+                                client: *client,
+                                disable_custom_auth: !client_auth.disable_custom_auth(*client),
+                            }
+                        } else {
+                            Effect::ImportCurrent(*client)
                         });
                         self.loading = true;
                     }
@@ -709,27 +707,6 @@ impl State {
                         }
                     }
                 }
-                SettingsPage::Import { selected } => match key.code {
-                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
-                        screen.page = SettingsPage::Root;
-                    }
-                    KeyCode::Up | KeyCode::Char('i') => {
-                        *selected = selected.saturating_sub(1);
-                    }
-                    KeyCode::Down | KeyCode::Char('k') => {
-                        *selected = (*selected + 1).min(2);
-                    }
-                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                        self.pending_effect = Some(match *selected {
-                            0 => Effect::ImportCurrent(ClientKind::Codex),
-                            1 => Effect::ImportCurrent(ClientKind::Claude),
-                            _ => Effect::ImportAll,
-                        });
-                        self.loading = true;
-                        screen.page = SettingsPage::Root;
-                    }
-                    _ => {}
-                },
             },
             InputMode::Normal => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Transition::Quit,

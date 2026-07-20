@@ -75,9 +75,9 @@ pub(super) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
             SettingsPage::ClientOrder { .. } => i18n.text("settings_client_order_help"),
             SettingsPage::ClientVisibility { .. } => i18n.text("settings_client_visibility_help"),
             SettingsPage::ClientConfig { .. } => i18n.text("settings_client_auth_help"),
-            SettingsPage::Language { .. }
-            | SettingsPage::Clients { .. }
-            | SettingsPage::Import { .. } => i18n.text("settings_submenu_help"),
+            SettingsPage::Language { .. } | SettingsPage::Clients { .. } => {
+                i18n.text("settings_submenu_help")
+            }
         },
     };
     let transient = match &state.input {
