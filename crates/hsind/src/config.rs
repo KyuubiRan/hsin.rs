@@ -14,7 +14,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use toml_edit::{DocumentMut, ImDocument, Item, Table, value};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     error::{DaemonError, Result},
@@ -23,6 +23,7 @@ use crate::{
 
 pub const CODEX_OFFICIAL_URL: &str = "https://api.openai.com/v1";
 pub const CLAUDE_OFFICIAL_URL: &str = "https://api.anthropic.com";
+pub const HSIN_MANAGED_KEY: &str = "HSIN_MANAGED_KEY";
 
 pub struct DetectedProvider {
     pub name: String,
@@ -39,6 +40,19 @@ pub struct ConfigTarget {
     pub provider: Provider,
     pub credential_command: String,
     pub proxy_port: u16,
+    #[serde(default)]
+    pub disable_custom_auth: bool,
+    #[serde(default)]
+    pub codex_auth_before_hash: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Zeroize)]
+#[zeroize(drop)]
+pub struct CodexAuthSnapshot {
+    pub auth_path: String,
+    pub file_existed: bool,
+    pub auth_mode: Option<String>,
+    pub openai_api_key: Option<String>,
 }
 
 pub fn default_config_path(client: ClientKind) -> Result<PathBuf> {
@@ -56,6 +70,13 @@ pub fn default_config_path(client: ClientKind) -> Result<PathBuf> {
     })
 }
 
+pub fn codex_auth_path(config_path: &Path) -> Result<PathBuf> {
+    config_path
+        .parent()
+        .map(|parent| parent.join("auth.json"))
+        .ok_or_else(|| DaemonError::Config("Codex config path has no parent directory".into()))
+}
+
 pub fn detect_current(path: &Path, client: ClientKind) -> Result<DetectedProvider> {
     let text = if path.exists() {
         fs::read_to_string(path).map_err(|error| {
@@ -65,12 +86,22 @@ pub fn detect_current(path: &Path, client: ClientKind) -> Result<DetectedProvide
         String::new()
     };
     match client {
-        ClientKind::Codex => detect_codex(&text),
+        ClientKind::Codex => {
+            let auth_path = codex_auth_path(path)?;
+            let auth_text = if auth_path.exists() {
+                fs::read_to_string(&auth_path).map_err(|error| {
+                    DaemonError::Config(format!("cannot read {}: {error}", auth_path.display()))
+                })?
+            } else {
+                String::new()
+            };
+            detect_codex(&text, &auth_text)
+        }
         ClientKind::Claude => detect_claude(&text),
     }
 }
 
-fn detect_codex(text: &str) -> Result<DetectedProvider> {
+fn detect_codex(text: &str, auth_text: &str) -> Result<DetectedProvider> {
     let document = text
         .parse::<DocumentMut>()
         .map_err(|error| DaemonError::Config(error.to_string()))?;
@@ -126,19 +157,31 @@ fn detect_codex(text: &str) -> Result<DetectedProvider> {
         .get("name")
         .and_then(Item::as_str)
         .map_or_else(|| imported_name(provider_id, &base_url), str::to_owned);
+    let requires_openai_auth = provider
+        .get("requires_openai_auth")
+        .and_then(Item::as_bool)
+        .unwrap_or(false);
+    let auth_secret = if requires_openai_auth {
+        codex_auth_api_key(auth_text)?
+            .filter(|value| is_importable_secret(value))
+            .map(Zeroizing::new)
+    } else {
+        None
+    };
     let secret = provider
         .get("experimental_bearer_token")
         .and_then(Item::as_str)
-        .filter(|value| !value.trim().is_empty())
+        .filter(|value| is_importable_secret(value))
         .map(|value| Zeroizing::new(value.to_owned()))
         .or_else(|| {
             provider
                 .get("env_key")
                 .and_then(Item::as_str)
                 .and_then(|key| std::env::var(key).ok())
-                .filter(|value| !value.trim().is_empty())
+                .filter(|value| is_importable_secret(value))
                 .map(Zeroizing::new)
-        });
+        })
+        .or(auth_secret);
     Ok(DetectedProvider {
         name,
         base_url,
@@ -169,11 +212,11 @@ fn detect_claude(text: &str) -> Result<DetectedProvider> {
     let auth_token = env
         .and_then(|env| env.get("ANTHROPIC_AUTH_TOKEN"))
         .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty());
+        .filter(|value| is_importable_secret(value));
     let api_key = env
         .and_then(|env| env.get("ANTHROPIC_API_KEY"))
         .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty());
+        .filter(|value| is_importable_secret(value));
     Ok(DetectedProvider {
         name: imported_name("Claude", &base_url),
         base_url,
@@ -211,14 +254,35 @@ fn same_url(left: &str, right: &str) -> bool {
     left.trim_end_matches('/').eq_ignore_ascii_case(right)
 }
 
-pub fn apply(path: &Path, expected_hash: Option<&str>, target: &ConfigTarget) -> Result<String> {
-    atomic_patch(path, expected_hash, |before| patch_text(before, target))
+fn is_importable_secret(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && value != HSIN_MANAGED_KEY
 }
 
-pub fn patch_text(before: &str, target: &ConfigTarget) -> Result<String> {
+#[cfg(test)]
+pub fn apply(path: &Path, expected_hash: Option<&str>, target: &ConfigTarget) -> Result<String> {
+    apply_with_credential(path, expected_hash, target, None)
+}
+
+pub fn apply_with_credential(
+    path: &Path,
+    expected_hash: Option<&str>,
+    target: &ConfigTarget,
+    credential: Option<&str>,
+) -> Result<String> {
+    atomic_patch(path, expected_hash, |before| {
+        patch_text_with_credential(before, target, credential)
+    })
+}
+
+pub fn patch_text_with_credential(
+    before: &str,
+    target: &ConfigTarget,
+    credential: Option<&str>,
+) -> Result<String> {
     match target.client {
-        ClientKind::Codex => patch_codex(before, target),
-        ClientKind::Claude => patch_claude(before, target),
+        ClientKind::Codex => patch_codex_with_credential(before, target, credential),
+        ClientKind::Claude => patch_claude_with_credential(before, target, credential),
     }
 }
 
@@ -229,7 +293,86 @@ pub fn file_hash(path: &Path) -> Result<Option<String>> {
     Ok(Some(hash(&fs::read(path)?)))
 }
 
+pub fn capture_codex_auth(path: &Path) -> Result<CodexAuthSnapshot> {
+    let file_existed = path.exists();
+    let text = if file_existed {
+        fs::read_to_string(path)?
+    } else {
+        String::new()
+    };
+    let value = parse_json_object(&text, "Codex auth")?;
+    Ok(CodexAuthSnapshot {
+        auth_path: path.to_string_lossy().into_owned(),
+        file_existed,
+        auth_mode: optional_string(&value, "auth_mode", "Codex auth")?,
+        openai_api_key: optional_string(&value, "OPENAI_API_KEY", "Codex auth")?,
+    })
+}
+
+pub fn apply_codex_auth(path: &Path, expected_hash: Option<&str>, api_key: &str) -> Result<String> {
+    atomic_patch(path, expected_hash, |before| {
+        patch_codex_auth_text(before, api_key)
+    })
+}
+
+pub fn patch_codex_auth_text(before: &str, api_key: &str) -> Result<String> {
+    let mut output = if before.trim().is_empty() {
+        "{}\n".to_owned()
+    } else {
+        before.to_owned()
+    };
+    validate_jsonc(&output)?;
+    output = set_root_string(&output, "auth_mode", Some("apikey"))?;
+    output = set_root_string(&output, "OPENAI_API_KEY", Some(api_key))?;
+    validate_jsonc(&output)?;
+    Ok(output)
+}
+
+pub fn restore_codex_auth(
+    path: &Path,
+    expected_hash: Option<&str>,
+    snapshot: &CodexAuthSnapshot,
+) -> Result<String> {
+    atomic_patch(path, expected_hash, |before| {
+        restore_codex_auth_text(before, snapshot)
+    })
+}
+
+pub fn restore_codex_auth_text(before: &str, snapshot: &CodexAuthSnapshot) -> Result<String> {
+    let mut output = if before.trim().is_empty() {
+        "{}\n".to_owned()
+    } else {
+        before.to_owned()
+    };
+    validate_jsonc(&output)?;
+    output = set_root_string(&output, "auth_mode", snapshot.auth_mode.as_deref())?;
+    output = set_root_string(
+        &output,
+        "OPENAI_API_KEY",
+        snapshot.openai_api_key.as_deref(),
+    )?;
+    validate_jsonc(&output)?;
+    Ok(output)
+}
+
+pub fn codex_auth_is_managed(text: &str, api_key: &str) -> Result<bool> {
+    let value = parse_json_object(text, "Codex auth")?;
+    Ok(
+        optional_string(&value, "auth_mode", "Codex auth")?.as_deref() == Some("apikey")
+            && optional_string(&value, "OPENAI_API_KEY", "Codex auth")?.as_deref() == Some(api_key),
+    )
+}
+
+#[cfg(test)]
 pub fn patch_codex(text: &str, target: &ConfigTarget) -> Result<String> {
+    patch_codex_with_credential(text, target, None)
+}
+
+pub fn patch_codex_with_credential(
+    text: &str,
+    target: &ConfigTarget,
+    credential: Option<&str>,
+) -> Result<String> {
     let mut output = text.to_owned();
     if let Some(model) = target.provider.model.as_deref() {
         let document = parse_toml(&output)?;
@@ -259,14 +402,14 @@ pub fn patch_codex(text: &str, target: &ConfigTarget) -> Result<String> {
     }
 
     let document = parse_toml(&output)?;
-    let provider_block = codex_provider_block(target, newline(&output));
+    let provider_block = codex_provider_block(target, credential, newline(&output))?;
     match document.get("model_providers") {
         Some(Item::Table(providers)) => match providers.get("hsin") {
             Some(Item::Value(existing)) => {
                 let span = existing.span().ok_or_else(|| {
                     DaemonError::Config("hsin provider has no source span".into())
                 })?;
-                output.replace_range(span, &codex_provider_inline(target)?);
+                output.replace_range(span, &codex_provider_inline(target, credential)?);
             }
             Some(existing) => {
                 let mut ranges = Vec::new();
@@ -299,7 +442,7 @@ fn parse_toml(text: &str) -> Result<ImDocument<String>> {
     ImDocument::parse(text.to_owned()).map_err(|error| DaemonError::Config(error.to_string()))
 }
 
-fn codex_provider_table(target: &ConfigTarget) -> Table {
+fn codex_provider_table(target: &ConfigTarget, credential: Option<&str>) -> Result<Table> {
     let base_url = match target.mode {
         ConnectionMode::Direct => target.provider.base_url.trim_end_matches('/').to_owned(),
         ConnectionMode::Proxy => format!("http://127.0.0.1:{}/codex/v1", target.proxy_port),
@@ -311,7 +454,12 @@ fn codex_provider_table(target: &ConfigTarget) -> Table {
     provider["wire_api"] = value("responses");
     if target.provider.official {
         provider["requires_openai_auth"] = value(true);
-        return provider;
+        return Ok(provider);
+    }
+    if target.disable_custom_auth {
+        let _ = configured_key(target, credential)?;
+        provider["requires_openai_auth"] = value(true);
+        return Ok(provider);
     }
     let mut auth = Table::new();
     auth["command"] = value(target.credential_command.clone());
@@ -330,20 +478,27 @@ fn codex_provider_table(target: &ConfigTarget) -> Table {
     auth["timeout_ms"] = value(5000);
     auth["refresh_interval_ms"] = value(0);
     provider.insert("auth", Item::Table(auth));
-    provider
+    Ok(provider)
 }
 
-fn codex_provider_block(target: &ConfigTarget, newline: &str) -> String {
+fn codex_provider_block(
+    target: &ConfigTarget,
+    credential: Option<&str>,
+    newline: &str,
+) -> Result<String> {
     let mut document = DocumentMut::new();
     let mut providers = Table::new();
     providers.set_implicit(true);
-    providers.insert("hsin", Item::Table(codex_provider_table(target)));
+    providers.insert(
+        "hsin",
+        Item::Table(codex_provider_table(target, credential)?),
+    );
     document["model_providers"] = Item::Table(providers);
-    document.to_string().replace('\n', newline)
+    Ok(document.to_string().replace('\n', newline))
 }
 
-fn codex_provider_inline(target: &ConfigTarget) -> Result<String> {
-    Item::Table(codex_provider_table(target))
+fn codex_provider_inline(target: &ConfigTarget, credential: Option<&str>) -> Result<String> {
+    Item::Table(codex_provider_table(target, credential)?)
         .into_value()
         .map(|value| value.to_string())
         .map_err(|_| DaemonError::Config("cannot encode inline hsin provider".into()))
@@ -458,7 +613,16 @@ fn append_toml_table(output: &mut String, table: &str) {
     output.push_str(table);
 }
 
+#[cfg(test)]
 pub fn patch_claude(text: &str, target: &ConfigTarget) -> Result<String> {
+    patch_claude_with_credential(text, target, None)
+}
+
+pub fn patch_claude_with_credential(
+    text: &str,
+    target: &ConfigTarget,
+    credential: Option<&str>,
+) -> Result<String> {
     let mut output = if text.trim().is_empty() {
         "{}\n".to_owned()
     } else {
@@ -478,6 +642,22 @@ pub fn patch_claude(text: &str, target: &ConfigTarget) -> Result<String> {
         ConnectionMode::Proxy => format!("http://127.0.0.1:{}/claude", target.proxy_port),
     };
     output = set_nested_string(&output, "env", "ANTHROPIC_BASE_URL", Some(&base_url))?;
+    if target.disable_custom_auth {
+        let key = configured_key(target, credential)?;
+        let (api_key, auth_token) = match target.mode {
+            ConnectionMode::Proxy => (Some(key), None),
+            ConnectionMode::Direct => match target.provider.auth_scheme {
+                AuthScheme::Bearer => (None, Some(key)),
+                AuthScheme::XApiKey => (Some(key), None),
+                AuthScheme::OAuth => (None, None),
+            },
+        };
+        output = set_nested_string(&output, "env", "ANTHROPIC_API_KEY", api_key)?;
+        output = set_nested_string(&output, "env", "ANTHROPIC_AUTH_TOKEN", auth_token)?;
+        output = set_root_string(&output, "apiKeyHelper", None)?;
+        validate_jsonc(&output)?;
+        return Ok(output);
+    }
     output = set_nested_string(&output, "env", "ANTHROPIC_API_KEY", None)?;
     output = set_nested_string(&output, "env", "ANTHROPIC_AUTH_TOKEN", None)?;
     output = set_root_string(
@@ -487,6 +667,49 @@ pub fn patch_claude(text: &str, target: &ConfigTarget) -> Result<String> {
     )?;
     validate_jsonc(&output)?;
     Ok(output)
+}
+
+fn configured_key<'a>(target: &ConfigTarget, credential: Option<&'a str>) -> Result<&'a str> {
+    match target.mode {
+        ConnectionMode::Proxy => Ok(HSIN_MANAGED_KEY),
+        ConnectionMode::Direct => credential.ok_or(DaemonError::Locked),
+    }
+}
+
+fn codex_auth_api_key(text: &str) -> Result<Option<String>> {
+    let value = parse_json_object(text, "Codex auth")?;
+    optional_string(&value, "OPENAI_API_KEY", "Codex auth")
+}
+
+fn parse_json_object(
+    text: &str,
+    label: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let value = if text.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        jsonc_parser::parse_to_serde_value(text, &jsonc_parser::ParseOptions::default())
+            .map_err(|error| DaemonError::Config(error.to_string()))?
+            .ok_or_else(|| DaemonError::Config(format!("empty {label}")))?
+    };
+    value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| DaemonError::Config(format!("{label} must be a JSON object")))
+}
+
+fn optional_string(
+    value: &serde_json::Map<String, serde_json::Value>,
+    property: &str,
+    label: &str,
+) -> Result<Option<String>> {
+    match value.get(property) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(DaemonError::Config(format!(
+            "{label} field {property} must be a string"
+        ))),
+    }
 }
 
 fn credential_helper_command(target: &ConfigTarget) -> String {
@@ -950,24 +1173,37 @@ mod tests {
             },
             credential_command: "/opt/hsin".into(),
             proxy_port: 9999,
+            disable_custom_auth: false,
+            codex_auth_before_hash: None,
         }
     }
 
     #[test]
     fn detects_official_and_custom_current_providers_without_exposing_secrets() {
-        let official = detect_codex("model_provider = \"openai\"\n").unwrap();
+        let official = detect_codex("model_provider = \"openai\"\n", "").unwrap();
         assert!(official.official);
         assert_eq!(official.auth_scheme, AuthScheme::OAuth);
         assert!(official.secret.is_none());
 
         let custom = detect_codex(
             "model_provider = \"acme\"\n[model_providers.acme]\nname = \"Acme\"\nbase_url = \"https://api.acme.test/v1\"\nexperimental_bearer_token = \"secret\"\n",
+            "",
         )
         .unwrap();
         assert!(!custom.official);
         assert_eq!(custom.name, "Acme");
         assert_eq!(custom.auth_scheme, AuthScheme::Bearer);
         assert!(custom.secret.is_some());
+
+        let login_backed = detect_codex(
+            "model_provider = \"acme\"\n[model_providers.acme]\nname = \"Acme\"\nbase_url = \"https://api.acme.test/v1\"\nrequires_openai_auth = true\n",
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"auth-secret"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            login_backed.secret.as_deref().map(String::as_str),
+            Some("auth-secret")
+        );
 
         let claude = detect_claude(
             r#"{"env":{"ANTHROPIC_BASE_URL":"https://claude.acme.test","ANTHROPIC_API_KEY":"secret"}}"#,
@@ -976,6 +1212,18 @@ mod tests {
         assert!(!claude.official);
         assert_eq!(claude.auth_scheme, AuthScheme::XApiKey);
         assert!(claude.secret.is_some());
+
+        let managed_codex = detect_codex(
+            "model_provider = \"hsin\"\n[model_providers.hsin]\nbase_url = \"http://127.0.0.1:9999/codex/v1\"\nrequires_openai_auth = true\n",
+            &format!(r#"{{"auth_mode":"apikey","OPENAI_API_KEY":"{HSIN_MANAGED_KEY}"}}"#),
+        )
+        .unwrap();
+        assert!(managed_codex.secret.is_none());
+        let managed_claude = detect_claude(&format!(
+            r#"{{"env":{{"ANTHROPIC_BASE_URL":"http://127.0.0.1:9999/claude","ANTHROPIC_API_KEY":"{HSIN_MANAGED_KEY}"}}}}"#
+        ))
+        .unwrap();
+        assert!(managed_claude.secret.is_none());
     }
 
     #[test]
@@ -1178,6 +1426,70 @@ mod tests {
         let proxy = patch_claude("{}\n", &claude).unwrap();
         assert!(!proxy.contains("--provider-id"));
         assert!(!proxy.contains("--revision"));
+    }
+
+    #[test]
+    fn disabled_custom_auth_writes_direct_credentials_without_persisting_them_in_target() {
+        let secret = "sk-direct-secret";
+        let mut codex = target(ClientKind::Codex);
+        codex.disable_custom_auth = true;
+        let output = patch_codex_with_credential("", &codex, Some(secret)).unwrap();
+        assert!(output.contains("requires_openai_auth = true"));
+        assert!(!output.contains(secret));
+        assert!(!output.contains("[model_providers.hsin.auth]"));
+        assert!(!serde_json::to_string(&codex).unwrap().contains(secret));
+        let auth = patch_codex_auth_text("{}\n", secret).unwrap();
+        assert!(auth.contains(&format!("\"OPENAI_API_KEY\": \"{secret}\"")));
+        assert!(auth.contains("\"auth_mode\": \"apikey\""));
+
+        let mut claude = target(ClientKind::Claude);
+        claude.provider.auth_scheme = AuthScheme::XApiKey;
+        claude.disable_custom_auth = true;
+        let output = patch_claude_with_credential("{}\n", &claude, Some(secret)).unwrap();
+        assert!(output.contains(&format!("\"ANTHROPIC_API_KEY\": \"{secret}\"")));
+        assert!(!output.contains("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!output.contains("apiKeyHelper"));
+    }
+
+    #[test]
+    fn disabled_custom_auth_uses_managed_key_in_proxy_mode() {
+        let mut codex = target(ClientKind::Codex);
+        codex.mode = ConnectionMode::Proxy;
+        codex.disable_custom_auth = true;
+        let output = patch_codex_with_credential("", &codex, None).unwrap();
+        assert!(output.contains("requires_openai_auth = true"));
+        assert!(!output.contains(HSIN_MANAGED_KEY));
+        assert!(!output.contains("[model_providers.hsin.auth]"));
+        let auth = patch_codex_auth_text("{}\n", HSIN_MANAGED_KEY).unwrap();
+        assert!(auth.contains(&format!("\"OPENAI_API_KEY\": \"{HSIN_MANAGED_KEY}\"")));
+
+        let mut claude = target(ClientKind::Claude);
+        claude.mode = ConnectionMode::Proxy;
+        claude.disable_custom_auth = true;
+        let output = patch_claude_with_credential("{}\n", &claude, None).unwrap();
+        assert!(output.contains(&format!("\"ANTHROPIC_API_KEY\": \"{HSIN_MANAGED_KEY}\"")));
+        assert!(!output.contains("apiKeyHelper"));
+    }
+
+    #[test]
+    fn codex_auth_patch_and_restore_preserve_unowned_fields() {
+        let original = "{\r\n  // keep\r\n  \"auth_mode\": \"chatgpt\",\r\n  \"OPENAI_API_KEY\": \"old-secret\",\r\n  \"tokens\": { \"access_token\": \"keep-token\" },\r\n  \"account_id\": \"keep-account\"\r\n}\r\n";
+        let snapshot = CodexAuthSnapshot {
+            auth_path: "/tmp/auth.json".into(),
+            file_existed: true,
+            auth_mode: Some("chatgpt".into()),
+            openai_api_key: Some("old-secret".into()),
+        };
+        let managed = patch_codex_auth_text(original, "new-secret").unwrap();
+        assert!(managed.contains("\"auth_mode\": \"apikey\""));
+        assert!(managed.contains("\"OPENAI_API_KEY\": \"new-secret\""));
+        assert!(managed.contains("// keep\r\n"));
+        assert!(managed.contains("\"tokens\": { \"access_token\": \"keep-token\" }"));
+        assert!(managed.contains("\"account_id\": \"keep-account\""));
+        assert_crlf_only(&managed);
+
+        let restored = restore_codex_auth_text(&managed, &snapshot).unwrap();
+        assert_eq!(restored, original);
     }
 
     #[test]

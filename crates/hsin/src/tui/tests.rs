@@ -160,6 +160,47 @@ fn client_order_moves_the_selected_client_before_saving() {
 }
 
 #[test]
+fn client_configuration_toggles_custom_auth_per_client() {
+    let mut state = State {
+        input: InputMode::Settings(SettingsScreen {
+            selected: 1,
+            page: SettingsPage::Clients { selected: 0 },
+        }),
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Enter));
+    assert!(matches!(
+        &state.input,
+        InputMode::Settings(SettingsScreen {
+            page: SettingsPage::ClientConfig {
+                client: ClientKind::Codex,
+                selected: 0,
+            },
+            ..
+        })
+    ));
+    state.reduce(key(KeyCode::Enter));
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::SetClientAuth {
+            client: ClientKind::Codex,
+            disable_custom_auth: true,
+        })
+    ));
+
+    state.client_auth.codex_disable_custom_auth = true;
+    state.loading = false;
+    state.reduce(key(KeyCode::Enter));
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::SetClientAuth {
+            client: ClientKind::Codex,
+            disable_custom_auth: false,
+        })
+    ));
+}
+
+#[test]
 fn home_p_toggles_the_current_client_proxy_mode() {
     let mut state = State::default();
     state.status.codex_active_provider = Some("provider-1".into());
@@ -1297,6 +1338,7 @@ fn renders_provider_and_compact_windows() {
     assert!(rendered.contains("Description"));
     assert!(rendered.contains("Import current configuration"));
     assert!(rendered.contains("Control whether hsind"));
+    assert!(!rendered.contains("2 / 2"));
     assert!(!rendered.contains("Example"));
     assert!(!rendered.contains("Codex"));
     assert!(!rendered.contains("Claude Code"));
@@ -1349,6 +1391,50 @@ fn renders_provider_and_compact_windows() {
     compact
         .draw(|frame| draw(frame, &mut state, &locale))
         .expect("draw compact terminal");
+}
+
+#[test]
+fn custom_auth_warning_colors_only_the_security_phrase_red() {
+    let mut state = State {
+        loading: false,
+        input: InputMode::Settings(SettingsScreen {
+            selected: 1,
+            page: SettingsPage::ClientConfig {
+                client: ClientKind::Codex,
+                selected: 0,
+            },
+        }),
+        ..State::default()
+    };
+    let locale = I18n::new(Some(LANGUAGE_ZH_CN));
+    let mut terminal = Terminal::new(TestBackend::new(100, 28)).expect("test terminal");
+    terminal
+        .draw(|frame| draw(frame, &mut state, &locale))
+        .expect("draw client auth settings");
+    let buffer = terminal.backend().buffer();
+    let rendered = buffer
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>();
+    assert!(rendered.replace(' ', "").contains("禁用自定义Auth"));
+    assert!(!rendered.contains("HSIN_MANAGED_KEY"));
+    for symbol in ["安", "全", "性", "降", "低"] {
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == symbol && cell.fg == RED)
+        );
+    }
+    for symbol in ["这", "会", "使", "如", "果"] {
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == symbol && cell.fg != RED)
+        );
+    }
 }
 
 #[test]

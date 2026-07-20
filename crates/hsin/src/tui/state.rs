@@ -1,8 +1,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hsin_core::{
-    AuthScheme, ClientKind, ClientSettings, ConnectionMode, LANGUAGE_EN_US, LANGUAGE_SYSTEM,
-    LANGUAGE_ZH_CN, ModelDiscovery, ModelUpdate, Provider, Settings, convert_provider_base_url,
-    normalize_generated_provider_name, provider_name_from_url,
+    AuthScheme, ClientAuthSettings, ClientKind, ClientSettings, ConnectionMode, LANGUAGE_EN_US,
+    LANGUAGE_SYSTEM, LANGUAGE_ZH_CN, ModelDiscovery, ModelUpdate, Provider, Settings,
+    convert_provider_base_url, normalize_generated_provider_name, provider_name_from_url,
 };
 use zeroize::Zeroizing;
 
@@ -46,6 +46,7 @@ pub(super) struct State {
     pub(super) proxy_host: String,
     pub(super) proxy_port: u16,
     pub(super) client_settings: ClientSettings,
+    pub(super) client_auth: ClientAuthSettings,
     pub(super) clipboard: Option<ProviderClipboard>,
     pub(super) loading: bool,
     pub(super) notice: Option<String>,
@@ -65,6 +66,7 @@ impl Default for State {
             proxy_host: "127.0.0.1".into(),
             proxy_port: 9999,
             client_settings: ClientSettings::default(),
+            client_auth: ClientAuthSettings::default(),
             clipboard: None,
             loading: true,
             notice: None,
@@ -104,6 +106,10 @@ pub(super) enum SettingsPage {
         selected: usize,
     },
     Clients {
+        selected: usize,
+    },
+    ClientConfig {
+        client: ClientKind,
         selected: usize,
     },
     ClientVisibility {
@@ -184,6 +190,7 @@ impl State {
                 self.proxy_host = settings.proxy_host;
                 self.proxy_port = settings.proxy_port;
                 self.client_settings = settings.clients;
+                self.client_auth = settings.client_auth;
                 if !self.client_settings.visible.contains(&self.client)
                     && let Some(client) = self.client_settings.visible_in_order().first().copied()
                 {
@@ -279,6 +286,7 @@ impl State {
         let proxy_enabled = self.proxy_enabled;
         let proxy_port = self.proxy_port;
         let client_settings = self.client_settings.clone();
+        let client_auth = self.client_auth;
         let language_selected = match self.language.as_str() {
             LANGUAGE_EN_US => 1,
             LANGUAGE_ZH_CN => 2,
@@ -576,24 +584,55 @@ impl State {
                         *selected = selected.saturating_sub(1);
                     }
                     KeyCode::Down | KeyCode::Char('k') => {
-                        *selected = (*selected + 1).min(1);
+                        *selected = (*selected + 1).min(3);
                     }
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                        screen.page = if *selected == 0 {
-                            SettingsPage::ClientVisibility { selected: 0 }
-                        } else {
-                            SettingsPage::ClientOrder {
+                        screen.page = match *selected {
+                            0 => SettingsPage::ClientConfig {
+                                client: ClientKind::Codex,
+                                selected: 0,
+                            },
+                            1 => SettingsPage::ClientConfig {
+                                client: ClientKind::Claude,
+                                selected: 0,
+                            },
+                            2 => SettingsPage::ClientVisibility { selected: 0 },
+                            _ => SettingsPage::ClientOrder {
                                 selected: 0,
                                 order: client_settings.order.clone(),
                                 moving: false,
-                            }
+                            },
                         };
+                    }
+                    _ => {}
+                },
+                SettingsPage::ClientConfig { client, selected } => match key.code {
+                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
+                        screen.page = SettingsPage::Clients {
+                            selected: match client {
+                                ClientKind::Codex => 0,
+                                ClientKind::Claude => 1,
+                            },
+                        };
+                    }
+                    KeyCode::Up | KeyCode::Char('i') => {
+                        *selected = selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('k') => {
+                        *selected = 0;
+                    }
+                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l' | ' ') => {
+                        self.pending_effect = Some(Effect::SetClientAuth {
+                            client: *client,
+                            disable_custom_auth: !client_auth.disable_custom_auth(*client),
+                        });
+                        self.loading = true;
                     }
                     _ => {}
                 },
                 SettingsPage::ClientVisibility { selected } => match key.code {
                     KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
-                        screen.page = SettingsPage::Clients { selected: 0 };
+                        screen.page = SettingsPage::Clients { selected: 2 };
                     }
                     KeyCode::Up | KeyCode::Char('i') => {
                         *selected = selected.saturating_sub(1);
@@ -655,7 +694,7 @@ impl State {
                     } else {
                         match key.code {
                             KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
-                                screen.page = SettingsPage::Clients { selected: 1 };
+                                screen.page = SettingsPage::Clients { selected: 3 };
                             }
                             KeyCode::Up | KeyCode::Char('i') => {
                                 *selected = selected.saturating_sub(1);

@@ -10,11 +10,11 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hsin_core::{
-    AppError, AuthScheme, ClientKind, ClientSettings, ConnectionMode, DaemonStatus, DoctorFinding,
-    DoctorReport, DoctorSeverity, ErrorCode, ImportCurrentParams, ImportCurrentResult,
-    KeyStoreState, ModelDiscoverParams, ModelDiscovery, ModelUpdate, Provider, ProviderAddParams,
-    ProviderEditParams, ProviderListParams, ProviderRemoveParams, ProviderSwitchParams,
-    SecretInput, SecurityStatus, Settings, SettingsPatch,
+    AppError, AuthScheme, ClientAuthSettings, ClientKind, ClientSettings, ConnectionMode,
+    DaemonStatus, DoctorFinding, DoctorReport, DoctorSeverity, ErrorCode, ImportCurrentParams,
+    ImportCurrentResult, KeyStoreState, ModelDiscoverParams, ModelDiscovery, ModelUpdate, Provider,
+    ProviderAddParams, ProviderEditParams, ProviderListParams, ProviderRemoveParams,
+    ProviderSwitchParams, SecretInput, SecurityStatus, Settings, SettingsPatch,
 };
 use parking_lot::RwLock;
 use secrecy::{ExposeSecret, SecretString};
@@ -31,6 +31,8 @@ use crate::{
     model::ProviderInput,
     paths::Paths,
 };
+
+const CODEX_AUTH_BACKUP_KEY: &str = "codex_auth_backup_v1";
 
 pub struct App {
     pub db: Arc<Database>,
@@ -168,6 +170,18 @@ impl App {
         self.db.set_setting("providers_initialized_v1", "true")
     }
 
+    pub(crate) fn reconcile_client_auth_configuration(&self) -> Result<()> {
+        if !self.disable_custom_auth(ClientKind::Codex)? {
+            return Ok(());
+        }
+        let state = self.db.client_state(ClientKind::Codex)?;
+        let Some(provider_id) = state.active_provider_id else {
+            return Ok(());
+        };
+        let provider = self.db.get_provider(&provider_id)?;
+        self.apply_configuration_with_auth(&provider, state.mode, Some(true))
+    }
+
     fn ensure_official_provider(&self, client: ClientKind) -> Result<Provider> {
         let id = format!("official-{}", client.as_str());
         match self.db.get_provider(&id) {
@@ -288,14 +302,13 @@ impl App {
         } else {
             String::new()
         };
-        let target = ConfigTarget {
-            client,
-            mode: state.mode,
-            provider: provider.clone(),
-            credential_command: self.credential_command.to_string_lossy().into_owned(),
-            proxy_port: self.proxy_port()?,
-        };
-        Ok((config::patch_text(&current, &target)? == current).then_some(provider))
+        let target = self.config_target(&provider, state.mode, None)?;
+        let credential = self.config_credential(&target)?;
+        let credential = credential.as_ref().map(ExposeSecret::expose_secret);
+        let config_matches =
+            config::patch_text_with_credential(&current, &target, credential)? == current;
+        let auth_matches = self.codex_auth_target_is_applied(&target, credential)?;
+        Ok((config_matches && auth_matches).then_some(provider))
     }
 
     pub fn list_providers(&self, params: &ProviderListParams) -> Result<Vec<Provider>> {
@@ -417,13 +430,7 @@ impl App {
             provider.credential_configured = true;
         }
         let pending_config = if update_active_config {
-            let target = ConfigTarget {
-                client: provider.client,
-                mode: state.mode,
-                provider: provider.clone(),
-                credential_command: self.credential_command.to_string_lossy().into_owned(),
-                proxy_port: self.proxy_port()?,
-            };
+            let target = self.config_target(&provider, state.mode, None)?;
             let path = self.config_path(provider.client)?;
             let before_hash = config::file_hash(&path)?;
             let operation = self.db.begin_operation(
@@ -432,7 +439,20 @@ impl App {
                 before_hash.as_deref(),
                 &serde_json::to_string(&target)?,
             )?;
-            Some((target, path, before_hash, operation))
+            let backup_created = if Self::manages_codex_auth(&target) {
+                let auth_path = config::codex_auth_path(&path)?;
+                match self.ensure_codex_auth_backup(&auth_path) {
+                    Ok(created) => created,
+                    Err(error) => {
+                        self.db
+                            .finish_operation(&operation, "failed", Some(&error.to_string()))?;
+                        return Err(error);
+                    }
+                }
+            } else {
+                false
+            };
+            Some((target, path, before_hash, operation, backup_created))
         } else {
             None
         };
@@ -440,14 +460,26 @@ impl App {
             self.db
                 .update_provider(&provider, params.expected_revision, encrypted.as_ref())
         {
-            if let Some((_, _, _, operation)) = &pending_config {
+            if let Some((_, _, _, operation, backup_created)) = &pending_config {
+                if *backup_created {
+                    self.remove_codex_auth_backup()?;
+                }
                 self.db
                     .finish_operation(operation, "failed", Some(&error.to_string()))?;
             }
             return Err(error);
         }
-        if let Some((target, path, before_hash, operation)) = pending_config {
-            if let Err(error) = config::apply(&path, before_hash.as_deref(), &target) {
+        if let Some((target, path, before_hash, operation, backup_created)) = pending_config {
+            let credential = self.config_credential(&target)?;
+            if let Err(error) = config::apply_with_credential(
+                &path,
+                before_hash.as_deref(),
+                &target,
+                credential.as_ref().map(ExposeSecret::expose_secret),
+            ) {
+                if backup_created {
+                    self.remove_codex_auth_backup()?;
+                }
                 let conflict = matches!(error, DaemonError::Conflict(_));
                 self.db.finish_operation(
                     &operation,
@@ -459,6 +491,16 @@ impl App {
                     if conflict { "conflict" } else { "unavailable" },
                 )?;
                 return Err(error);
+            }
+            if let Err(error) = self.apply_codex_auth_target(
+                &target,
+                credential.as_ref().map(ExposeSecret::expose_secret),
+            ) {
+                self.db.set_config_status(provider.client, "unavailable")?;
+                return Err(error);
+            }
+            if target.client == ClientKind::Codex && !Self::manages_codex_auth(&target) {
+                self.remove_codex_auth_backup()?;
             }
             self.db
                 .set_active(provider.client, &provider.id, "synchronized")?;
@@ -663,6 +705,15 @@ impl App {
     }
 
     fn apply_configuration(&self, provider: &Provider, mode: ConnectionMode) -> Result<()> {
+        self.apply_configuration_with_auth(provider, mode, None)
+    }
+
+    fn apply_configuration_with_auth(
+        &self,
+        provider: &Provider,
+        mode: ConnectionMode,
+        disable_custom_auth: Option<bool>,
+    ) -> Result<()> {
         if mode == ConnectionMode::Proxy && provider.auth_scheme == AuthScheme::OAuth {
             return Err(DaemonError::OAuthProxyUnsupported);
         }
@@ -678,13 +729,8 @@ impl App {
                     .into(),
             ));
         }
-        let target = ConfigTarget {
-            client: provider.client,
-            mode,
-            provider: provider.clone(),
-            credential_command: self.credential_command.to_string_lossy().into_owned(),
-            proxy_port: self.proxy_port()?,
-        };
+        let target = self.config_target(provider, mode, disable_custom_auth)?;
+        let credential = self.config_credential(&target)?;
         let path = self.config_path(provider.client)?;
         let before_hash = config::file_hash(&path)?;
         let target_json = serde_json::to_string(&target)?;
@@ -694,35 +740,239 @@ impl App {
             before_hash.as_deref(),
             &target_json,
         )?;
-        match config::apply(&path, before_hash.as_deref(), &target) {
-            Ok(_) => {
-                self.db
-                    .set_active(provider.client, &provider.id, "synchronized")?;
-                self.db.set_mode(provider.client, mode)?;
-                self.db.finish_operation(&operation, "complete", None)?;
-                Ok(())
+        let backup_created = if Self::manages_codex_auth(&target) {
+            let auth_path = config::codex_auth_path(&path)?;
+            match self.ensure_codex_auth_backup(&auth_path) {
+                Ok(created) => created,
+                Err(error) => {
+                    self.db
+                        .finish_operation(&operation, "failed", Some(&error.to_string()))?;
+                    return Err(error);
+                }
             }
-            Err(error) => {
-                self.db.finish_operation(
-                    &operation,
-                    if matches!(error, DaemonError::Conflict(_)) {
-                        "conflict"
-                    } else {
-                        "failed"
-                    },
-                    Some(&error.to_string()),
-                )?;
-                self.db.set_config_status(
-                    provider.client,
-                    if matches!(error, DaemonError::Conflict(_)) {
-                        "conflict"
-                    } else {
-                        "unavailable"
-                    },
-                )?;
-                Err(error)
+        } else {
+            false
+        };
+        if let Err(error) = config::apply_with_credential(
+            &path,
+            before_hash.as_deref(),
+            &target,
+            credential.as_ref().map(ExposeSecret::expose_secret),
+        ) {
+            if backup_created {
+                self.remove_codex_auth_backup()?;
             }
+            self.db.finish_operation(
+                &operation,
+                if matches!(error, DaemonError::Conflict(_)) {
+                    "conflict"
+                } else {
+                    "failed"
+                },
+                Some(&error.to_string()),
+            )?;
+            self.db.set_config_status(
+                provider.client,
+                if matches!(error, DaemonError::Conflict(_)) {
+                    "conflict"
+                } else {
+                    "unavailable"
+                },
+            )?;
+            return Err(error);
         }
+        if let Err(error) = self.apply_codex_auth_target(
+            &target,
+            credential.as_ref().map(ExposeSecret::expose_secret),
+        ) {
+            self.db.set_config_status(provider.client, "unavailable")?;
+            return Err(error);
+        }
+        if target.client == ClientKind::Codex && !Self::manages_codex_auth(&target) {
+            self.remove_codex_auth_backup()?;
+        }
+        self.db
+            .set_active(provider.client, &provider.id, "synchronized")?;
+        self.db.set_mode(provider.client, mode)?;
+        if let Some(disabled) = disable_custom_auth {
+            let mut client_auth = self.client_auth_settings()?;
+            client_auth.set_disable_custom_auth(provider.client, disabled);
+            self.db
+                .set_setting("client_auth", &serde_json::to_string(&client_auth)?)?;
+        }
+        self.db.finish_operation(&operation, "complete", None)?;
+        Ok(())
+    }
+
+    fn config_target(
+        &self,
+        provider: &Provider,
+        mode: ConnectionMode,
+        disable_custom_auth: Option<bool>,
+    ) -> Result<ConfigTarget> {
+        let codex_auth_before_hash = if provider.client == ClientKind::Codex {
+            let config_path = self.config_path(ClientKind::Codex)?;
+            config::file_hash(&config::codex_auth_path(&config_path)?)?
+        } else {
+            None
+        };
+        Ok(ConfigTarget {
+            client: provider.client,
+            mode,
+            provider: provider.clone(),
+            credential_command: self.credential_command.to_string_lossy().into_owned(),
+            proxy_port: self.proxy_port()?,
+            disable_custom_auth: disable_custom_auth
+                .unwrap_or(self.disable_custom_auth(provider.client)?),
+            codex_auth_before_hash,
+        })
+    }
+
+    fn config_credential(&self, target: &ConfigTarget) -> Result<Option<SecretString>> {
+        if !target.disable_custom_auth
+            || target.mode == ConnectionMode::Proxy
+            || target.provider.official
+        {
+            return Ok(None);
+        }
+        let encrypted = self.db.secret(&target.provider.id)?;
+        self.crypto
+            .decrypt_for(&target.provider, &encrypted)
+            .map(Some)
+    }
+
+    fn manages_codex_auth(target: &ConfigTarget) -> bool {
+        target.client == ClientKind::Codex
+            && target.disable_custom_auth
+            && !target.provider.official
+    }
+
+    fn codex_auth_backup(&self) -> Result<Option<config::CodexAuthSnapshot>> {
+        let Some(encrypted) = self.db.protected_value(CODEX_AUTH_BACKUP_KEY)? else {
+            return Ok(None);
+        };
+        let plaintext = self.crypto.decrypt_protected(&encrypted)?;
+        serde_json::from_slice(&plaintext)
+            .map(Some)
+            .map_err(|_| DaemonError::Crypto)
+    }
+
+    fn ensure_codex_auth_backup(&self, path: &std::path::Path) -> Result<bool> {
+        if let Some(snapshot) = self.codex_auth_backup()? {
+            if snapshot.auth_path != path.to_string_lossy() {
+                return Err(DaemonError::Conflict(
+                    "Codex auth backup belongs to a different CODEX_HOME".into(),
+                ));
+            }
+            return Ok(false);
+        }
+        let snapshot = config::capture_codex_auth(path)?;
+        let serialized = Zeroizing::new(serde_json::to_vec(&snapshot)?);
+        let encrypted = self
+            .crypto
+            .encrypt_protected(CODEX_AUTH_BACKUP_KEY, &serialized)?;
+        self.db.put_protected_value(&encrypted)?;
+        Ok(true)
+    }
+
+    fn remove_codex_auth_backup(&self) -> Result<()> {
+        self.db.delete_protected_value(CODEX_AUTH_BACKUP_KEY)
+    }
+
+    fn apply_codex_auth_target(
+        &self,
+        target: &ConfigTarget,
+        credential: Option<&str>,
+    ) -> Result<()> {
+        if target.client != ClientKind::Codex {
+            return Ok(());
+        }
+        let config_path = self.config_path(ClientKind::Codex)?;
+        let auth_path = config::codex_auth_path(&config_path)?;
+        if Self::manages_codex_auth(target) {
+            let key = match target.mode {
+                ConnectionMode::Proxy => config::HSIN_MANAGED_KEY,
+                ConnectionMode::Direct => credential.ok_or(DaemonError::Locked)?,
+            };
+            config::apply_codex_auth(&auth_path, target.codex_auth_before_hash.as_deref(), key)?;
+        } else if let Some(snapshot) = self.codex_auth_backup()? {
+            if snapshot.auth_path != auth_path.to_string_lossy() {
+                return Err(DaemonError::Conflict(
+                    "Codex auth backup belongs to a different CODEX_HOME".into(),
+                ));
+            }
+            config::restore_codex_auth(
+                &auth_path,
+                target.codex_auth_before_hash.as_deref(),
+                &snapshot,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn codex_auth_target_is_applied(
+        &self,
+        target: &ConfigTarget,
+        credential: Option<&str>,
+    ) -> Result<bool> {
+        if target.client != ClientKind::Codex {
+            return Ok(true);
+        }
+        let config_path = self.config_path(ClientKind::Codex)?;
+        let auth_path = config::codex_auth_path(&config_path)?;
+        let current = if auth_path.exists() {
+            fs::read_to_string(&auth_path)?
+        } else {
+            String::new()
+        };
+        if Self::manages_codex_auth(target) {
+            let key = match target.mode {
+                ConnectionMode::Proxy => config::HSIN_MANAGED_KEY,
+                ConnectionMode::Direct => credential.ok_or(DaemonError::Locked)?,
+            };
+            return config::codex_auth_is_managed(&current, key);
+        }
+        let Some(snapshot) = self.codex_auth_backup()? else {
+            return Ok(true);
+        };
+        if snapshot.auth_path != auth_path.to_string_lossy() {
+            return Err(DaemonError::Conflict(
+                "Codex auth backup belongs to a different CODEX_HOME".into(),
+            ));
+        }
+        Ok(config::restore_codex_auth_text(&current, &snapshot)? == current)
+    }
+
+    fn recover_codex_auth_target(
+        &self,
+        target: &ConfigTarget,
+        credential: Option<&str>,
+    ) -> Result<()> {
+        if target.client != ClientKind::Codex {
+            return Ok(());
+        }
+        let config_path = self.config_path(ClientKind::Codex)?;
+        let auth_path = config::codex_auth_path(&config_path)?;
+        if Self::manages_codex_auth(target) {
+            self.ensure_codex_auth_backup(&auth_path)?;
+        }
+        if self.codex_auth_target_is_applied(target, credential)? {
+            if !Self::manages_codex_auth(target) {
+                self.remove_codex_auth_backup()?;
+            }
+            return Ok(());
+        }
+        let current_hash = config::file_hash(&auth_path)?;
+        if current_hash != target.codex_auth_before_hash {
+            return Err(DaemonError::Conflict(
+                "Codex authentication changed during configuration recovery".into(),
+            ));
+        }
+        self.apply_codex_auth_target(target, credential)?;
+        if !Self::manages_codex_auth(target) {
+            self.remove_codex_auth_backup()?;
+        }
+        Ok(())
     }
 
     pub fn recover_operations(&self) -> Result<()> {
@@ -777,16 +1027,23 @@ impl App {
             String::new()
         };
         let current_hash = config::file_hash(&path)?;
+        let credential = self.config_credential(&target)?;
+        let credential = credential.as_ref().map(ExposeSecret::expose_secret);
         if current_hash.as_deref() == before_hash {
-            config::apply(&path, before_hash, &target)?;
-        } else if config::patch_text(&current, &target)? != current {
+            config::apply_with_credential(&path, before_hash, &target, credential)?;
+        } else if config::patch_text_with_credential(&current, &target, credential)? != current {
             return Err(DaemonError::Conflict(
                 "configuration diverged during recovery".into(),
             ));
         }
+        self.recover_codex_auth_target(&target, credential)?;
         self.db
             .set_active(client, &target.provider.id, "synchronized")?;
         self.db.set_mode(client, target.mode)?;
+        let mut client_auth = self.client_auth_settings()?;
+        client_auth.set_disable_custom_auth(client, target.disable_custom_auth);
+        self.db
+            .set_setting("client_auth", &serde_json::to_string(&client_auth)?)?;
         Ok(RecoveryOutcome::Complete)
     }
 
@@ -815,6 +1072,7 @@ impl App {
             proxy_port: self.proxy_port()?,
             proxy_enabled: self.proxy_enabled(),
             clients: self.client_settings()?,
+            client_auth: self.client_auth_settings()?,
         })
     }
 
@@ -828,6 +1086,18 @@ impl App {
             return Err(DaemonError::Config("invalid client settings".into()));
         }
         Ok(settings)
+    }
+
+    fn client_auth_settings(&self) -> Result<ClientAuthSettings> {
+        let Some(value) = self.db.setting("client_auth")? else {
+            return Ok(ClientAuthSettings::default());
+        };
+        serde_json::from_str(&value)
+            .map_err(|error| DaemonError::Config(format!("invalid client auth settings: {error}")))
+    }
+
+    pub fn disable_custom_auth(&self, client: ClientKind) -> Result<bool> {
+        Ok(self.client_auth_settings()?.disable_custom_auth(client))
     }
 
     pub async fn update_settings(&self, patch: SettingsPatch) -> Result<Settings> {
@@ -873,6 +1143,23 @@ impl App {
         if let Some(clients) = patch.clients {
             self.db
                 .set_setting("clients", &serde_json::to_string(&clients)?)?;
+        }
+        if let Some(update) = patch.client_auth {
+            let mut client_auth = self.client_auth_settings()?;
+            if update.disable_custom_auth != client_auth.disable_custom_auth(update.client) {
+                let state = self.db.client_state(update.client)?;
+                if let Some(provider_id) = state.active_provider_id {
+                    let provider = self.db.get_provider(&provider_id)?;
+                    self.apply_configuration_with_auth(
+                        &provider,
+                        state.mode,
+                        Some(update.disable_custom_auth),
+                    )?;
+                }
+                client_auth.set_disable_custom_auth(update.client, update.disable_custom_auth);
+                self.db
+                    .set_setting("client_auth", &serde_json::to_string(&client_auth)?)?;
+            }
         }
         if patch.proxy_enabled == Some(true) {
             self.set_proxy_enabled_locked(true).await?;
@@ -1219,6 +1506,7 @@ mod tests {
                 proxy_port: None,
                 proxy_enabled: None,
                 clients: Some(clients.clone()),
+                client_auth: None,
             })
             .await
             .unwrap();
@@ -1234,10 +1522,342 @@ mod tests {
                     order: ClientKind::ALL.to_vec(),
                     visible: Vec::new(),
                 }),
+                client_auth: None,
             })
             .await;
         assert!(matches!(invalid, Err(DaemonError::Invalid(_))));
         assert_eq!(app.settings().unwrap().clients, clients);
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn client_auth_setting_rewrites_the_active_direct_configuration() {
+        let root = std::env::temp_dir().join(format!("hsind-client-auth-{}", uuid::Uuid::new_v4()));
+        let paths = Paths {
+            database: root.join("hsin.sqlite3"),
+            lock: root.join("hsind.lock"),
+            logs: root.join("logs"),
+            backups: root.join("backups"),
+            home: root.clone(),
+        };
+        let codex_config = root.join("codex/config.toml");
+        let codex_auth = root.join("codex/auth.json");
+        fs::create_dir_all(codex_config.parent().unwrap()).unwrap();
+        let original_auth = "{\n  \"auth_mode\": \"chatgpt\",\n  \"tokens\": {\"access_token\": \"keep-token\"},\n  \"account_id\": \"keep-account\"\n}\n";
+        fs::write(&codex_auth, original_auth).unwrap();
+        let app = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
+        *app.config_paths.write() = HashMap::from([
+            (ClientKind::Codex, codex_config.clone()),
+            (ClientKind::Claude, root.join("claude/settings.json")),
+        ]);
+        let provider = app
+            .add_provider(ProviderAddParams {
+                provider: hsin_core::ProviderDraft {
+                    client: ClientKind::Codex,
+                    name: "Codex custom".into(),
+                    description: String::new(),
+                    base_url: "https://codex.example.test/v1".into(),
+                    auth_scheme: AuthScheme::Bearer,
+                    model: None,
+                },
+                secret: SecretInput::Replace("sk-client-auth-secret".into()),
+            })
+            .await
+            .unwrap();
+        app.switch_provider(ProviderSwitchParams {
+            client: ClientKind::Codex,
+            provider_id: provider.id,
+        })
+        .await
+        .unwrap();
+        assert!(
+            fs::read_to_string(&codex_config)
+                .unwrap()
+                .contains("[model_providers.hsin.auth]")
+        );
+
+        let client_auth = ClientAuthSettings {
+            codex_disable_custom_auth: true,
+            claude_disable_custom_auth: false,
+        };
+        let settings = app
+            .update_settings(SettingsPatch {
+                language: None,
+                proxy_port: None,
+                proxy_enabled: None,
+                clients: None,
+                client_auth: Some(hsin_core::ClientAuthUpdate {
+                    client: ClientKind::Codex,
+                    disable_custom_auth: true,
+                }),
+            })
+            .await
+            .unwrap();
+        assert_eq!(settings.client_auth, client_auth);
+        let configured = fs::read_to_string(&codex_config).unwrap();
+        assert!(configured.contains("requires_openai_auth = true"));
+        assert!(!configured.contains("sk-client-auth-secret"));
+        assert!(!configured.contains("[model_providers.hsin.auth]"));
+        let auth = fs::read_to_string(&codex_auth).unwrap();
+        assert!(auth.contains("\"auth_mode\": \"apikey\""));
+        assert!(auth.contains("\"OPENAI_API_KEY\": \"sk-client-auth-secret\""));
+        assert!(auth.contains("\"tokens\": {\"access_token\": \"keep-token\"}"));
+        assert!(
+            app.db
+                .protected_value(CODEX_AUTH_BACKUP_KEY)
+                .unwrap()
+                .is_some()
+        );
+        let audit = rusqlite::Connection::open(&paths.database).unwrap();
+        let leaked: i64 = audit
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM operations WHERE instr(target_json,'sk-client-auth-secret')>0) OR EXISTS(SELECT 1 FROM settings WHERE instr(value,'sk-client-auth-secret')>0)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked, 0);
+        drop(audit);
+
+        let settings = app
+            .update_settings(SettingsPatch {
+                language: None,
+                proxy_port: None,
+                proxy_enabled: None,
+                clients: None,
+                client_auth: Some(hsin_core::ClientAuthUpdate {
+                    client: ClientKind::Codex,
+                    disable_custom_auth: false,
+                }),
+            })
+            .await
+            .unwrap();
+        assert!(!settings.client_auth.codex_disable_custom_auth);
+        assert_eq!(fs::read_to_string(&codex_auth).unwrap(), original_auth);
+        assert!(
+            fs::read_to_string(&codex_config)
+                .unwrap()
+                .contains("[model_providers.hsin.auth]")
+        );
+        assert!(
+            app.db
+                .protected_value(CODEX_AUTH_BACKUP_KEY)
+                .unwrap()
+                .is_none()
+        );
+
+        app.update_settings(SettingsPatch {
+            language: None,
+            proxy_port: None,
+            proxy_enabled: None,
+            clients: None,
+            client_auth: Some(hsin_core::ClientAuthUpdate {
+                client: ClientKind::Codex,
+                disable_custom_auth: true,
+            }),
+        })
+        .await
+        .unwrap();
+        let official = app.ensure_official_provider(ClientKind::Codex).unwrap();
+        app.switch_provider(ProviderSwitchParams {
+            client: ClientKind::Codex,
+            provider_id: official.id,
+        })
+        .await
+        .unwrap();
+        assert_eq!(fs::read_to_string(&codex_auth).unwrap(), original_auth);
+        assert!(
+            app.settings()
+                .unwrap()
+                .client_auth
+                .codex_disable_custom_auth
+        );
+        assert!(
+            app.db
+                .protected_value(CODEX_AUTH_BACKUP_KEY)
+                .unwrap()
+                .is_none()
+        );
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn configuration_recovery_completes_codex_auth_write_and_restore() {
+        let root =
+            std::env::temp_dir().join(format!("hsind-auth-recovery-{}", uuid::Uuid::new_v4()));
+        let paths = Paths {
+            database: root.join("hsin.sqlite3"),
+            lock: root.join("hsind.lock"),
+            logs: root.join("logs"),
+            backups: root.join("backups"),
+            home: root.clone(),
+        };
+        let codex_config = root.join("codex/config.toml");
+        let codex_auth = root.join("codex/auth.json");
+        fs::create_dir_all(codex_config.parent().unwrap()).unwrap();
+        let original_auth =
+            "{\n  \"auth_mode\": \"chatgpt\",\n  \"tokens\": {\"access_token\": \"keep\"}\n}\n";
+        fs::write(&codex_auth, original_auth).unwrap();
+        let app = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
+        *app.config_paths.write() = HashMap::from([
+            (ClientKind::Codex, codex_config.clone()),
+            (ClientKind::Claude, root.join("claude/settings.json")),
+        ]);
+        let provider = app
+            .add_provider(ProviderAddParams {
+                provider: hsin_core::ProviderDraft {
+                    client: ClientKind::Codex,
+                    name: "Recovery".into(),
+                    description: String::new(),
+                    base_url: "https://recovery.example.test/v1".into(),
+                    auth_scheme: AuthScheme::Bearer,
+                    model: None,
+                },
+                secret: SecretInput::Replace("recovery-secret".into()),
+            })
+            .await
+            .unwrap();
+
+        let enable = app
+            .config_target(&provider, ConnectionMode::Direct, Some(true))
+            .unwrap();
+        app.ensure_codex_auth_backup(&codex_auth).unwrap();
+        let before_hash = config::file_hash(&codex_config).unwrap();
+        app.db
+            .begin_operation(
+                "apply_config",
+                ClientKind::Codex,
+                before_hash.as_deref(),
+                &serde_json::to_string(&enable).unwrap(),
+            )
+            .unwrap();
+        let credential = app.config_credential(&enable).unwrap().unwrap();
+        config::apply_with_credential(
+            &codex_config,
+            before_hash.as_deref(),
+            &enable,
+            Some(credential.expose_secret()),
+        )
+        .unwrap();
+        app.recover_operations().unwrap();
+        assert!(
+            fs::read_to_string(&codex_auth)
+                .unwrap()
+                .contains("\"OPENAI_API_KEY\": \"recovery-secret\"")
+        );
+        assert!(
+            app.settings()
+                .unwrap()
+                .client_auth
+                .codex_disable_custom_auth
+        );
+        assert!(app.db.pending_operations().unwrap().is_empty());
+
+        let disable = app
+            .config_target(&provider, ConnectionMode::Direct, Some(false))
+            .unwrap();
+        let before_hash = config::file_hash(&codex_config).unwrap();
+        app.db
+            .begin_operation(
+                "apply_config",
+                ClientKind::Codex,
+                before_hash.as_deref(),
+                &serde_json::to_string(&disable).unwrap(),
+            )
+            .unwrap();
+        config::apply_with_credential(&codex_config, before_hash.as_deref(), &disable, None)
+            .unwrap();
+        app.recover_operations().unwrap();
+        assert_eq!(fs::read_to_string(&codex_auth).unwrap(), original_auth);
+        assert!(
+            !app.settings()
+                .unwrap()
+                .client_auth
+                .codex_disable_custom_auth
+        );
+        assert!(
+            app.db
+                .protected_value(CODEX_AUTH_BACKUP_KEY)
+                .unwrap()
+                .is_none()
+        );
+        assert!(app.db.pending_operations().unwrap().is_empty());
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_reconciles_the_previous_experimental_bearer_token_format() {
+        let root =
+            std::env::temp_dir().join(format!("hsind-auth-upgrade-{}", uuid::Uuid::new_v4()));
+        let paths = Paths {
+            database: root.join("hsin.sqlite3"),
+            lock: root.join("hsind.lock"),
+            logs: root.join("logs"),
+            backups: root.join("backups"),
+            home: root.clone(),
+        };
+        let codex_config = root.join("codex/config.toml");
+        fs::create_dir_all(codex_config.parent().unwrap()).unwrap();
+        fs::write(
+            &codex_config,
+            format!(
+                "model_provider = \"hsin\"\n[model_providers.hsin]\nname = \"hsin\"\nbase_url = \"http://127.0.0.1:9999/codex/v1\"\nwire_api = \"responses\"\nexperimental_bearer_token = \"{}\"\n",
+                config::HSIN_MANAGED_KEY
+            ),
+        )
+        .unwrap();
+        let app = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
+        *app.config_paths.write() = HashMap::from([
+            (ClientKind::Codex, codex_config.clone()),
+            (ClientKind::Claude, root.join("claude/settings.json")),
+        ]);
+        let provider = app
+            .add_provider(ProviderAddParams {
+                provider: hsin_core::ProviderDraft {
+                    client: ClientKind::Codex,
+                    name: "Upgrade".into(),
+                    description: String::new(),
+                    base_url: "https://upgrade.example.test/v1".into(),
+                    auth_scheme: AuthScheme::Bearer,
+                    model: None,
+                },
+                secret: SecretInput::Replace("upgrade-secret".into()),
+            })
+            .await
+            .unwrap();
+        app.db
+            .set_active(ClientKind::Codex, &provider.id, "synchronized")
+            .unwrap();
+        app.db
+            .set_mode(ClientKind::Codex, ConnectionMode::Proxy)
+            .unwrap();
+        app.db
+            .set_setting(
+                "client_auth",
+                &serde_json::to_string(&ClientAuthSettings {
+                    codex_disable_custom_auth: true,
+                    claude_disable_custom_auth: false,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+        app.reconcile_client_auth_configuration().unwrap();
+        let configured = fs::read_to_string(&codex_config).unwrap();
+        assert!(configured.contains("requires_openai_auth = true"));
+        assert!(!configured.contains("experimental_bearer_token"));
+        let auth = fs::read_to_string(root.join("codex/auth.json")).unwrap();
+        assert!(auth.contains(&format!(
+            "\"OPENAI_API_KEY\": \"{}\"",
+            config::HSIN_MANAGED_KEY
+        )));
+
         drop(app);
         fs::remove_dir_all(root).unwrap();
     }
@@ -1468,6 +2088,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn client_proxy_toggle_enables_global_proxy_and_global_off_disables_all_clients() {
         let root = std::env::temp_dir().join(format!("hsind-toggle-{}", uuid::Uuid::new_v4()));
         let paths = Paths {
@@ -1521,6 +2142,18 @@ mod tests {
         app.db
             .set_active(ClientKind::Claude, &claude.id, "synchronized")
             .unwrap();
+        app.update_settings(SettingsPatch {
+            language: None,
+            proxy_port: None,
+            proxy_enabled: None,
+            clients: None,
+            client_auth: Some(hsin_core::ClientAuthUpdate {
+                client: ClientKind::Codex,
+                disable_custom_auth: true,
+            }),
+        })
+        .await
+        .unwrap();
 
         let proxy = tokio::spawn(crate::proxy::serve(app.clone()));
         tokio::task::yield_now().await;
@@ -1533,11 +2166,21 @@ mod tests {
             app.db.client_state(ClientKind::Codex).unwrap().mode,
             ConnectionMode::Proxy
         );
+        let codex_auth = fs::read_to_string(root.join("codex/auth.json")).unwrap();
+        assert!(codex_auth.contains(&format!(
+            "\"OPENAI_API_KEY\": \"{}\"",
+            config::HSIN_MANAGED_KEY
+        )));
 
         app.set_mode(ClientKind::Codex, ConnectionMode::Direct)
             .await
             .unwrap();
         assert!(app.proxy_enabled());
+        assert!(
+            fs::read_to_string(root.join("codex/auth.json"))
+                .unwrap()
+                .contains("\"OPENAI_API_KEY\": \"codex-secret\"")
+        );
         app.set_mode(ClientKind::Claude, ConnectionMode::Proxy)
             .await
             .unwrap();
@@ -1546,6 +2189,7 @@ mod tests {
             proxy_port: None,
             proxy_enabled: Some(false),
             clients: None,
+            client_auth: None,
         })
         .await
         .unwrap();

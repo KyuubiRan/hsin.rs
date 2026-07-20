@@ -69,6 +69,7 @@ pub(super) fn draw_settings_screen(
         .map(|client| client_label(*client, i18n))
         .collect::<Vec<_>>()
         .join(" → ");
+    let auth_warning = matches!(&screen.page, SettingsPage::ClientConfig { .. });
 
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -79,11 +80,7 @@ pub(super) fn draw_settings_screen(
         SettingsPage::Root => {
             let items = vec![
                 settings_option_item(i18n.text("proxy_master"), proxy, option_width),
-                settings_option_item(
-                    i18n.text("client_configuration"),
-                    &visible_clients,
-                    option_width,
-                ),
+                ListItem::new(i18n.text("client_configuration")),
                 settings_option_item(i18n.text("language"), language, option_width),
                 ListItem::new(i18n.text("import_current")),
             ];
@@ -102,7 +99,7 @@ pub(super) fn draw_settings_screen(
                     i18n.text("settings_options"),
                     i18n.text("client_configuration"),
                     i18n.text("settings_client_configuration_description"),
-                    Some(visible_clients.as_str()),
+                    None,
                 ),
                 2 => (
                     items,
@@ -186,21 +183,32 @@ pub(super) fn draw_settings_screen(
             )
         }
         SettingsPage::Clients { selected } => {
-            let (detail_title, description, current) = if *selected == 0 {
-                (
+            let (detail_title, description, current) = match *selected {
+                0 => (
+                    i18n.text("codex_configuration"),
+                    i18n.text("settings_codex_configuration_description"),
+                    None,
+                ),
+                1 => (
+                    i18n.text("claude_configuration"),
+                    i18n.text("settings_claude_configuration_description"),
+                    None,
+                ),
+                2 => (
                     i18n.text("client_visibility"),
                     i18n.text("settings_client_visibility_description"),
-                    visible_clients.as_str(),
-                )
-            } else {
-                (
+                    Some(visible_clients.as_str()),
+                ),
+                _ => (
                     i18n.text("client_order"),
                     i18n.text("settings_client_order_description"),
-                    client_order.as_str(),
-                )
+                    Some(client_order.as_str()),
+                ),
             };
             (
                 vec![
+                    ListItem::new(i18n.text("codex_configuration")),
+                    ListItem::new(i18n.text("claude_configuration")),
                     settings_option_item(
                         i18n.text("client_visibility"),
                         &visible_clients,
@@ -212,7 +220,30 @@ pub(super) fn draw_settings_screen(
                 i18n.text("client_configuration"),
                 detail_title,
                 description,
-                Some(current),
+                current,
+            )
+        }
+        SettingsPage::ClientConfig { client, selected } => {
+            let disabled = state.client_auth.disable_custom_auth(*client);
+            (
+                vec![settings_option_item(
+                    i18n.text("disable_custom_auth"),
+                    if disabled {
+                        i18n.text("on")
+                    } else {
+                        i18n.text("off")
+                    },
+                    option_width,
+                )],
+                *selected,
+                client_config_label(*client, i18n),
+                i18n.text("disable_custom_auth"),
+                i18n.text("settings_disable_custom_auth_description"),
+                Some(if disabled {
+                    i18n.text("on")
+                } else {
+                    i18n.text("off")
+                }),
             )
         }
         SettingsPage::ClientVisibility { selected } => {
@@ -323,7 +354,11 @@ pub(super) fn draw_settings_screen(
                     Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(""),
-                Line::from(description),
+                if auth_warning {
+                    auth_warning_line(i18n)
+                } else {
+                    Line::from(description)
+                },
             ]
             .into_iter()
             .chain(current.into_iter().flat_map(|current| {
@@ -356,6 +391,24 @@ fn client_label(client: ClientKind, i18n: &I18n) -> &str {
         ClientKind::Codex => i18n.text("codex"),
         ClientKind::Claude => i18n.text("claude"),
     }
+}
+
+fn client_config_label(client: ClientKind, i18n: &I18n) -> &str {
+    match client {
+        ClientKind::Codex => i18n.text("codex_configuration"),
+        ClientKind::Claude => i18n.text("claude_configuration"),
+    }
+}
+
+fn auth_warning_line(i18n: &I18n) -> Line<'_> {
+    Line::from(vec![
+        Span::raw(i18n.text("settings_disable_custom_auth_warning_prefix")),
+        Span::styled(
+            i18n.text("settings_disable_custom_auth_warning_red"),
+            Style::default().fg(RED),
+        ),
+        Span::raw(i18n.text("settings_disable_custom_auth_warning_suffix")),
+    ])
 }
 
 fn settings_option_item(label: &str, current: &str, width: usize) -> ListItem<'static> {

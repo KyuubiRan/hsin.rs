@@ -29,16 +29,20 @@ Version 1 supports direct and loopback-proxy modes on macOS, Linux, and Windows.
 
 Configuration writes are strict allowlists:
 
-- Codex: only top-level `model_provider` and the complete `[model_providers.hsin]` subtree.
+- Codex `config.toml`: only top-level `model_provider` and the complete `[model_providers.hsin]` subtree.
+- Codex `auth.json`: only top-level `auth_mode` and `OPENAI_API_KEY`, and only while a client explicitly enables "Disable custom Auth". Preserve and restore the prior values through encrypted daemon-owned backup state; never expose the backup through public DTOs or plaintext SQLite settings.
 - Claude Code: only `env.ANTHROPIC_BASE_URL`, `env.ANTHROPIC_API_KEY`, `env.ANTHROPIC_AUTH_TOKEN`, and root `apiKeyHelper`.
 
 Never modify model selection, `ANTHROPIC_MODEL`, MCP servers, hooks, permissions, profiles, features, approval policy, or sandbox settings.
 
 Use source-preserving edits. Any config patch change must retain non-owned fields, comments, ordering, line endings, and Unicode byte-for-byte. Keep CAS checks, file locking, permission preservation, atomic replacement, and saga recovery intact.
 
+When Hsin manages Codex API-key login, custom Providers must use `requires_openai_auth = true`; direct mode writes the active Provider key to `auth.json`, while proxy mode writes only `HSIN_MANAGED_KEY`. Disabling the option or switching to an Official Provider must restore the prior `auth_mode` and `OPENAI_API_KEY` values without changing tokens or other login fields.
+
 ## Security
 
 - Never log or print provider secrets, recovery keys, authorization headers, request bodies, databases, or raw sensitive RPC parameters.
+- Treat Codex `auth.json` and its encrypted backup as secret material. Never include either file's contents in operation JSON, logs, diagnostics, or error messages.
 - Keep the proxy bound to loopback. Do not introduce `0.0.0.0` or remote listening in v1.
 - Use `secrecy` and `zeroize` at sensitive in-memory boundaries where supported.
 - Do not fall back to plaintext secret storage when the system keyring is unavailable. The daemon must remain recoverably locked.

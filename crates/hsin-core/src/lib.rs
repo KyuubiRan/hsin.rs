@@ -12,7 +12,7 @@ use url::Url;
 pub const PROTOCOL_VERSION: u32 = 1;
 /// Monotonic CLI/daemon compatibility code. Bump when either side requires
 /// RPC fields or behavior that an older binary cannot provide.
-pub const VERSION_CODE: u32 = 10;
+pub const VERSION_CODE: u32 = 12;
 
 #[must_use]
 pub fn provider_name_from_url(value: &str) -> Option<String> {
@@ -111,6 +111,37 @@ pub struct ClientSettings {
     pub order: Vec<ClientKind>,
     #[serde(default = "default_client_order")]
     pub visible: Vec<ClientKind>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientAuthSettings {
+    #[serde(default)]
+    pub codex_disable_custom_auth: bool,
+    #[serde(default)]
+    pub claude_disable_custom_auth: bool,
+}
+
+impl ClientAuthSettings {
+    #[must_use]
+    pub const fn disable_custom_auth(self, client: ClientKind) -> bool {
+        match client {
+            ClientKind::Codex => self.codex_disable_custom_auth,
+            ClientKind::Claude => self.claude_disable_custom_auth,
+        }
+    }
+
+    pub fn set_disable_custom_auth(&mut self, client: ClientKind, disabled: bool) {
+        match client {
+            ClientKind::Codex => self.codex_disable_custom_auth = disabled,
+            ClientKind::Claude => self.claude_disable_custom_auth = disabled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientAuthUpdate {
+    pub client: ClientKind,
+    pub disable_custom_auth: bool,
 }
 
 impl ClientSettings {
@@ -492,6 +523,8 @@ pub struct Settings {
     pub proxy_enabled: bool,
     #[serde(default)]
     pub clients: ClientSettings,
+    #[serde(default)]
+    pub client_auth: ClientAuthSettings,
 }
 
 pub const LANGUAGE_SYSTEM: &str = "system";
@@ -506,6 +539,7 @@ impl Default for Settings {
             proxy_port: 9999,
             proxy_enabled: false,
             clients: ClientSettings::default(),
+            client_auth: ClientAuthSettings::default(),
         }
     }
 }
@@ -520,6 +554,8 @@ pub struct SettingsPatch {
     pub proxy_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clients: Option<ClientSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_auth: Option<ClientAuthUpdate>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

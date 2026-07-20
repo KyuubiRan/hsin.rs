@@ -14,7 +14,7 @@ use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
-    db::{Database, EncryptedSecret},
+    db::{Database, EncryptedProtectedValue, EncryptedSecret},
     error::{DaemonError, Result},
     model::{ClientKind, Provider},
 };
@@ -164,6 +164,21 @@ impl CryptoManager {
         Ok(SecretString::from(text))
     }
 
+    pub fn encrypt_protected(&self, key: &str, value: &[u8]) -> Result<EncryptedProtectedValue> {
+        let material = self.material.read();
+        let material = material.as_ref().ok_or(DaemonError::Locked)?;
+        encrypt_protected_value(key, value, material)
+    }
+
+    pub fn decrypt_protected(
+        &self,
+        encrypted: &EncryptedProtectedValue,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let material = self.material.read();
+        let material = material.as_ref().ok_or(DaemonError::Locked)?;
+        decrypt_protected(encrypted, material)
+    }
+
     pub fn export_recovery_key(&self) -> Result<SecretString> {
         let material = self.material.read();
         let material = material.as_ref().ok_or(DaemonError::Locked)?;
@@ -218,6 +233,15 @@ impl CryptoManager {
             let plaintext = decrypt_secret(provider, &encrypted, &old_material)?;
             rotated.push(encrypt_secret(provider, &plaintext, &new_material)?);
         }
+        let mut rotated_protected = Vec::new();
+        for encrypted in self.db.all_protected_values()? {
+            let plaintext = decrypt_protected(&encrypted, &old_material)?;
+            rotated_protected.push(encrypt_protected_value(
+                &encrypted.key,
+                &plaintext,
+                &new_material,
+            )?);
+        }
         self.store.store(
             new_material.version,
             &URL_SAFE_NO_PAD.encode(new_material.key),
@@ -225,6 +249,7 @@ impl CryptoManager {
         let (nonce, verifier) = make_verifier(&new_material.key, new_material.version)?;
         if let Err(error) = self.db.replace_secrets_and_key(
             &rotated,
+            &rotated_protected,
             old_version,
             new_material.version,
             &nonce,
@@ -313,8 +338,59 @@ fn decrypt_secret(
         .map_err(|_| DaemonError::Crypto)
 }
 
+fn encrypt_protected_value(
+    key: &str,
+    plaintext: &[u8],
+    material: &KeyMaterial,
+) -> Result<EncryptedProtectedValue> {
+    let mut nonce = [0_u8; NONCE_BYTES];
+    OsRng.fill_bytes(&mut nonce);
+    let cipher = XChaCha20Poly1305::new((&material.key).into());
+    let aad = protected_aad(key, material.version);
+    let ciphertext = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: aad.as_bytes(),
+            },
+        )
+        .map_err(|_| DaemonError::Crypto)?;
+    Ok(EncryptedProtectedValue {
+        key: key.to_owned(),
+        key_version: material.version,
+        nonce: nonce.to_vec(),
+        ciphertext,
+    })
+}
+
+fn decrypt_protected(
+    encrypted: &EncryptedProtectedValue,
+    material: &KeyMaterial,
+) -> Result<Zeroizing<Vec<u8>>> {
+    if encrypted.key_version != material.version || encrypted.nonce.len() != NONCE_BYTES {
+        return Err(DaemonError::Crypto);
+    }
+    let cipher = XChaCha20Poly1305::new((&material.key).into());
+    let aad = protected_aad(&encrypted.key, encrypted.key_version);
+    cipher
+        .decrypt(
+            XNonce::from_slice(&encrypted.nonce),
+            Payload {
+                msg: &encrypted.ciphertext,
+                aad: aad.as_bytes(),
+            },
+        )
+        .map(Zeroizing::new)
+        .map_err(|_| DaemonError::Crypto)
+}
+
 fn aad(provider: &Provider, version: u32) -> String {
     format!("hsin:v1:{}:{}:{version}", provider.client, provider.id)
+}
+
+fn protected_aad(key: &str, version: u32) -> String {
+    format!("hsin:v1:protected:{key}:{version}")
 }
 
 fn make_verifier(key: &[u8; KEY_BYTES], version: u32) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -456,6 +532,10 @@ mod tests {
             .unwrap();
         let encrypted = crypto.encrypt_for(&provider, "secret").unwrap();
         db.put_secret(&encrypted).unwrap();
+        let protected = crypto
+            .encrypt_protected("codex_auth_backup_v1", b"protected-secret")
+            .unwrap();
+        db.put_protected_value(&protected).unwrap();
         db.set_active(ClientKind::Codex, &provider.id, "managed")
             .unwrap();
         assert_eq!(
@@ -475,6 +555,14 @@ mod tests {
                 .expose_secret(),
             "secret"
         );
+        let protected = db.protected_value("codex_auth_backup_v1").unwrap().unwrap();
+        assert_eq!(
+            crypto.decrypt_protected(&protected).unwrap().as_slice(),
+            b"protected-secret"
+        );
+        let mut bad_protected = protected;
+        bad_protected.ciphertext[0] ^= 1;
+        assert!(crypto.decrypt_protected(&bad_protected).is_err());
         let mut bad = db.secret(&provider.id).unwrap();
         bad.ciphertext[0] ^= 1;
         assert!(crypto.decrypt_for(&provider, &bad).is_err());

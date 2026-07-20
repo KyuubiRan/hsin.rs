@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use hsin_core::{
-    ClientKind, ClientSettings, ConnectionMode, ImportCurrentParams, ImportCurrentResult,
-    ModeSetParams, ModelDiscoverParams, ModelUpdate, Provider, ProviderAddParams, ProviderDraft,
-    ProviderEditParams, ProviderPatch, ProviderRemoveParams, ProviderSwitchParams, SecretInput,
-    Settings, SettingsPatch,
+    ClientAuthUpdate, ClientKind, ClientSettings, ConnectionMode, ImportCurrentParams,
+    ImportCurrentResult, ModeSetParams, ModelDiscoverParams, ModelUpdate, Provider,
+    ProviderAddParams, ProviderDraft, ProviderEditParams, ProviderPatch, ProviderRemoveParams,
+    ProviderSwitchParams, SecretInput, Settings, SettingsPatch,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -25,6 +25,10 @@ pub(super) enum Effect {
     SetProxyEnabled(bool),
     SetProxyPort(u16),
     SetClients(ClientSettings),
+    SetClientAuth {
+        client: ClientKind,
+        disable_custom_auth: bool,
+    },
     ImportCurrent(ClientKind),
     ImportAll,
     Add(FormSubmission),
@@ -122,6 +126,7 @@ fn error_notice(error: &anyhow::Error) -> String {
     format!("{error:#}")
 }
 
+#[allow(clippy::too_many_lines)]
 async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<&'static str>> {
     match effect {
         Effect::Refresh => Ok(None),
@@ -146,6 +151,10 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
         Effect::SetProxyEnabled(enabled) => update_proxy_enabled(client, enabled).await,
         Effect::SetProxyPort(port) => update_proxy_port(client, port).await,
         Effect::SetClients(settings) => update_clients(client, settings).await,
+        Effect::SetClientAuth {
+            client: kind,
+            disable_custom_auth,
+        } => update_client_auth(client, kind, disable_custom_auth).await,
         Effect::ImportCurrent(kind) => {
             let imported = import_current(client, kind).await?;
             Ok(Some(if imported {
@@ -286,6 +295,7 @@ async fn update_proxy_enabled(
                 proxy_port: None,
                 proxy_enabled: Some(enabled),
                 clients: None,
+                client_auth: None,
             },
         )
         .await?;
@@ -305,6 +315,7 @@ async fn update_proxy_port(client: &DaemonClient, port: u16) -> Result<Option<&'
                 proxy_port: Some(port),
                 proxy_enabled: None,
                 clients: None,
+                client_auth: None,
             },
         )
         .await?;
@@ -320,6 +331,7 @@ async fn update_language(client: &DaemonClient, language: String) -> Result<Opti
                 proxy_port: None,
                 proxy_enabled: None,
                 clients: None,
+                client_auth: None,
             },
         )
         .await?;
@@ -338,10 +350,34 @@ async fn update_clients(
                 proxy_port: None,
                 proxy_enabled: None,
                 clients: Some(clients),
+                client_auth: None,
             },
         )
         .await?;
     Ok(Some("client_settings_changed"))
+}
+
+async fn update_client_auth(
+    client: &DaemonClient,
+    kind: ClientKind,
+    disable_custom_auth: bool,
+) -> Result<Option<&'static str>> {
+    let _: Value = client
+        .call(
+            "settings.set",
+            &SettingsPatch {
+                language: None,
+                proxy_port: None,
+                proxy_enabled: None,
+                clients: None,
+                client_auth: Some(ClientAuthUpdate {
+                    client: kind,
+                    disable_custom_auth,
+                }),
+            },
+        )
+        .await?;
+    Ok(Some("client_auth_changed"))
 }
 
 async fn load(client: &DaemonClient) -> Result<(Vec<Provider>, StatusSnapshot, Settings)> {

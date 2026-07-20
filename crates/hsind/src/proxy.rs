@@ -17,6 +17,7 @@ use tokio::{net::TcpListener, sync::Semaphore};
 
 use crate::{
     app::App,
+    config::HSIN_MANAGED_KEY,
     error::{DaemonError, Result},
     model::{AuthScheme, ClientKind},
 };
@@ -125,7 +126,12 @@ async fn forward(
         Ok(value) => value,
         Err(error) => return error_response(&error),
     };
-    if !authorized(request.headers(), capability.expose_secret()) {
+    let managed_key_enabled = state.app.disable_custom_auth(kind).unwrap_or(false);
+    if !authorized(
+        request.headers(),
+        capability.expose_secret(),
+        managed_key_enabled,
+    ) {
         return text_response(StatusCode::UNAUTHORIZED, "invalid local proxy capability");
     }
     let (provider, secret) = match state.app.upstream_snapshot(kind) {
@@ -196,7 +202,7 @@ async fn forward(
     })
 }
 
-fn authorized(headers: &HeaderMap, expected: &str) -> bool {
+fn authorized(headers: &HeaderMap, expected: &str, managed_key_enabled: bool) -> bool {
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -208,7 +214,11 @@ fn authorized(headers: &HeaderMap, expected: &str) -> bool {
         bearer.is_some_and(|actual| actual.as_bytes().ct_eq(expected.as_bytes()).into());
     let api_key_matches =
         api_key.is_some_and(|actual| actual.as_bytes().ct_eq(expected.as_bytes()).into());
-    bearer_matches | api_key_matches
+    let managed_key_matches = managed_key_enabled
+        && bearer
+            .or(api_key)
+            .is_some_and(|actual| actual == HSIN_MANAGED_KEY);
+    bearer_matches | api_key_matches | managed_key_matches
 }
 
 fn upstream_url(base_url: &str, prefix: &str, uri: &axum::http::Uri) -> String {
@@ -411,16 +421,30 @@ mod tests {
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer token"),
         );
-        assert!(authorized(&headers, "token"));
-        assert!(!authorized(&headers, "other"));
+        assert!(authorized(&headers, "token", false));
+        assert!(!authorized(&headers, "other", false));
         headers.clear();
         headers.insert("x-api-key", HeaderValue::from_static("token"));
-        assert!(authorized(&headers, "token"));
+        assert!(authorized(&headers, "token", false));
         headers.insert(
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer attacker"),
         );
-        assert!(authorized(&headers, "token"));
+        assert!(authorized(&headers, "token", false));
+    }
+
+    #[test]
+    fn managed_key_requires_the_client_setting() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer HSIN_MANAGED_KEY"),
+        );
+        assert!(!authorized(&headers, "capability", false));
+        assert!(authorized(&headers, "capability", true));
+        headers.clear();
+        headers.insert("x-api-key", HeaderValue::from_static("HSIN_MANAGED_KEY"));
+        assert!(authorized(&headers, "capability", true));
     }
 
     #[test]

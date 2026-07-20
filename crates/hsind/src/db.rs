@@ -13,7 +13,7 @@ use crate::{
     model::{AuthScheme, ClientKind, ClientState, ConnectionMode, Provider, ProviderInput},
 };
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const PROVIDER_COLUMNS: &str = "p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,EXISTS(SELECT 1 FROM provider_secrets configured WHERE configured.provider_id=p.id)";
 
@@ -27,6 +27,14 @@ pub type PendingOperation = (String, ClientKind, Option<String>, String);
 #[derive(Debug, Clone)]
 pub struct EncryptedSecret {
     pub provider_id: String,
+    pub key_version: u32,
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EncryptedProtectedValue {
+    pub key: String,
     pub key_version: u32,
     pub nonce: Vec<u8>,
     pub ciphertext: Vec<u8>,
@@ -290,9 +298,60 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn protected_value(&self, key: &str) -> Result<Option<EncryptedProtectedValue>> {
+        self.connection
+            .lock()
+            .query_row(
+                "SELECT key,key_version,nonce,ciphertext FROM protected_values WHERE key=?1",
+                [key],
+                |row| {
+                    Ok(EncryptedProtectedValue {
+                        key: row.get(0)?,
+                        key_version: row.get(1)?,
+                        nonce: row.get(2)?,
+                        ciphertext: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn put_protected_value(&self, value: &EncryptedProtectedValue) -> Result<()> {
+        self.connection.lock().execute(
+            "INSERT INTO protected_values(key,key_version,nonce,ciphertext,updated_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(key) DO UPDATE SET key_version=excluded.key_version,nonce=excluded.nonce,ciphertext=excluded.ciphertext,updated_at=excluded.updated_at",
+            params![value.key, value.key_version, value.nonce, value.ciphertext, unix_time()?],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_protected_value(&self, key: &str) -> Result<()> {
+        self.connection
+            .lock()
+            .execute("DELETE FROM protected_values WHERE key=?1", [key])?;
+        Ok(())
+    }
+
+    pub fn all_protected_values(&self) -> Result<Vec<EncryptedProtectedValue>> {
+        let connection = self.connection.lock();
+        let mut statement =
+            connection.prepare("SELECT key,key_version,nonce,ciphertext FROM protected_values")?;
+        let rows = statement.query_map([], |row| {
+            Ok(EncryptedProtectedValue {
+                key: row.get(0)?,
+                key_version: row.get(1)?,
+                nonce: row.get(2)?,
+                ciphertext: row.get(3)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     pub fn replace_secrets_and_key(
         &self,
         secrets: &[EncryptedSecret],
+        protected_values: &[EncryptedProtectedValue],
         old_version: u32,
         version: u32,
         verifier_nonce: &[u8],
@@ -302,6 +361,12 @@ impl Database {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for secret in secrets {
             transaction.execute("UPDATE provider_secrets SET key_version=?1,nonce=?2,ciphertext=?3,updated_at=?4 WHERE provider_id=?5", params![secret.key_version,secret.nonce,secret.ciphertext,unix_time()?,secret.provider_id])?;
+        }
+        for value in protected_values {
+            transaction.execute(
+                "UPDATE protected_values SET key_version=?1,nonce=?2,ciphertext=?3,updated_at=?4 WHERE key=?5",
+                params![value.key_version, value.nonce, value.ciphertext, unix_time()?, value.key],
+            )?;
         }
         transaction.execute("INSERT INTO encryption_keys(version,verifier_nonce,verifier,created_at,is_current) VALUES(?1,?2,?3,?4,1)", params![version,verifier_nonce,verifier,unix_time()?])?;
         transaction.execute(
@@ -393,7 +458,7 @@ impl Database {
 }
 
 fn migrate(connection: &Connection) -> Result<()> {
-    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let mut version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
         return Err(DaemonError::UnsupportedDatabaseVersion(version));
     }
@@ -409,9 +474,10 @@ fn migrate(connection: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,kind TEXT NOT NULL,client TEXT NOT NULL,state TEXT NOT NULL,before_hash TEXT,target_json TEXT NOT NULL,error TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS encryption_keys(version INTEGER PRIMARY KEY,verifier_nonce BLOB NOT NULL,verifier BLOB NOT NULL,created_at INTEGER NOT NULL,is_current INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS protected_values(key TEXT PRIMARY KEY,key_version INTEGER NOT NULL,nonce BLOB NOT NULL,ciphertext BLOB NOT NULL,updated_at INTEGER NOT NULL);
          INSERT OR IGNORE INTO client_state(client,mode,config_status,updated_at) VALUES('codex','direct','unmanaged',0),('claude','direct','unmanaged',0);
          INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES('language','system',0),('proxy_port','9999',0),('proxy_enabled','false',0);
-         PRAGMA user_version=3;
+         PRAGMA user_version=4;
          COMMIT;"
         )?;
     } else {
@@ -423,9 +489,11 @@ fn migrate(connection: &Connection) -> Result<()> {
                  PRAGMA user_version=2;
                  COMMIT;",
             )?;
+            version = 2;
         }
-        connection.execute_batch(
-            "PRAGMA foreign_keys=OFF;
+        if version == 2 {
+            connection.execute_batch(
+                "PRAGMA foreign_keys=OFF;
              BEGIN IMMEDIATE;
              CREATE TABLE providers_v3(id TEXT PRIMARY KEY,client TEXT NOT NULL CHECK(client IN ('codex','claude')),name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',base_url TEXT NOT NULL,auth_scheme TEXT NOT NULL CHECK(auth_scheme IN ('bearer','x_api_key','oauth')),model TEXT,revision INTEGER NOT NULL,official INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(client,name));
              INSERT INTO providers_v3(id,client,name,description,base_url,auth_scheme,model,revision,official,created_at,updated_at) SELECT id,client,name,description,base_url,auth_scheme,model,revision,0,created_at,updated_at FROM providers;
@@ -435,7 +503,17 @@ fn migrate(connection: &Connection) -> Result<()> {
              PRAGMA user_version=3;
              COMMIT;
              PRAGMA foreign_keys=ON;",
-        )?;
+            )?;
+            version = 3;
+        }
+        if version == 3 {
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE protected_values(key TEXT PRIMARY KEY,key_version INTEGER NOT NULL,nonce BLOB NOT NULL,ciphertext BLOB NOT NULL,updated_at INTEGER NOT NULL);
+                 PRAGMA user_version=4;
+                 COMMIT;",
+            )?;
+        }
     }
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version != SCHEMA_VERSION {
@@ -597,6 +675,26 @@ mod tests {
         };
         db.insert_provider(&second, Some(&encrypted)).unwrap();
         assert_eq!(db.secret(&second.id).unwrap().ciphertext, vec![1, 2, 3]);
+        let protected = EncryptedProtectedValue {
+            key: "codex_auth_backup_v1".into(),
+            key_version: 1,
+            nonce: vec![3; 24],
+            ciphertext: vec![7, 8, 9],
+        };
+        db.put_protected_value(&protected).unwrap();
+        assert_eq!(
+            db.protected_value("codex_auth_backup_v1")
+                .unwrap()
+                .unwrap()
+                .ciphertext,
+            vec![7, 8, 9]
+        );
+        db.delete_protected_value("codex_auth_backup_v1").unwrap();
+        assert!(
+            db.protected_value("codex_auth_backup_v1")
+                .unwrap()
+                .is_none()
+        );
         let (_, snapshot) = db.bound_secret(ClientKind::Claude, &second.id, 1).unwrap();
         assert_eq!(snapshot.ciphertext, vec![1, 2, 3]);
         let updated = Provider {
@@ -665,7 +763,7 @@ mod tests {
         assert_eq!(provider.model, None);
         assert!(!provider.official);
         assert!(!provider.credential_configured);
-        assert_eq!(database_version(&path).unwrap(), 3);
+        assert_eq!(database_version(&path).unwrap(), 4);
         assert_eq!(fs::read_dir(backups).unwrap().count(), 1);
         drop(db);
         fs::remove_dir_all(root).unwrap();
@@ -703,7 +801,35 @@ mod tests {
             db.setting("proxy_enabled").unwrap().as_deref(),
             Some("true")
         );
-        assert_eq!(database_version(&path).unwrap(), 3);
+        assert_eq!(database_version(&path).unwrap(), 4);
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn version_three_migration_adds_protected_values() {
+        let root = std::env::temp_dir().join(format!("hsind-v3-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("db.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL);
+                 PRAGMA user_version=3;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let db = Database::open(&path, &root.join("backups")).unwrap();
+        db.put_protected_value(&EncryptedProtectedValue {
+            key: "backup".into(),
+            key_version: 1,
+            nonce: vec![0; 24],
+            ciphertext: vec![1],
+        })
+        .unwrap();
+        assert_eq!(database_version(&path).unwrap(), 4);
+        assert!(db.protected_value("backup").unwrap().is_some());
         drop(db);
         fs::remove_dir_all(root).unwrap();
     }
