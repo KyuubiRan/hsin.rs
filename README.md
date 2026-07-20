@@ -1,8 +1,6 @@
 # 心 / hsin
 
-`hsin` is a daemon-first provider switcher for Codex and Claude Code. The daemon owns persistence, encrypted secrets, provider configuration, and the loopback proxy; the CLI and TUI communicate with it exclusively through local IPC.
-
-The project is under active development. Version 0.1 targets macOS, Linux and Windows and intentionally excludes tray UI, Gemini, remote proxy binds and FoxSwitcher database migration.
+WIP
 
 ## Workspace
 
