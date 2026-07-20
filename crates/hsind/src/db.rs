@@ -22,7 +22,7 @@ pub struct Database {
 }
 
 pub type KeyRecord = (u32, Vec<u8>, Vec<u8>);
-pub type PendingOperation = (String, ClientKind, Option<String>, String);
+pub type PendingOperation = (String, String, ClientKind, Option<String>, String);
 
 #[derive(Debug, Clone)]
 pub struct EncryptedSecret {
@@ -435,14 +435,15 @@ impl Database {
 
     pub fn pending_operations(&self) -> Result<Vec<PendingOperation>> {
         let connection = self.connection.lock();
-        let mut statement = connection.prepare("SELECT id,client,before_hash,target_json FROM operations WHERE state='pending' ORDER BY created_at")?;
+        let mut statement = connection.prepare("SELECT id,kind,client,before_hash,target_json FROM operations WHERE state='pending' ORDER BY created_at")?;
         let rows = statement.query_map([], |row| {
-            let client: String = row.get(1)?;
+            let client: String = row.get(2)?;
             Ok((
                 row.get(0)?,
+                row.get(1)?,
                 ClientKind::from_str(&client).map_err(parse_to_sql_error)?,
-                row.get(2)?,
                 row.get(3)?,
+                row.get(4)?,
             ))
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()

@@ -636,9 +636,7 @@ impl App {
         let mut detected = config::detect_current(&path, params.client)?;
         if detected.official {
             let provider = self.ensure_official_provider(params.client)?;
-            self.db
-                .set_active(params.client, &provider.id, "synchronized")?;
-            self.db.set_mode(params.client, ConnectionMode::Direct)?;
+            self.import_official_provider(&provider)?;
             return Ok(ImportCurrentResult {
                 provider,
                 imported: false,
@@ -662,6 +660,42 @@ impl App {
             .set_active(params.client, &provider.id, "synchronized")?;
         self.db.set_mode(params.client, ConnectionMode::Direct)?;
         Ok(ImportCurrentResult { provider, imported })
+    }
+
+    fn import_official_provider(&self, provider: &Provider) -> Result<()> {
+        if provider.client != ClientKind::Codex || self.codex_auth_backup()?.is_none() {
+            self.db
+                .set_active(provider.client, &provider.id, "synchronized")?;
+            self.db.set_mode(provider.client, ConnectionMode::Direct)?;
+            return Ok(());
+        }
+        let target = self.config_target(provider, ConnectionMode::Direct, None)?;
+        let before_hash = target.codex_auth_before_hash.clone();
+        let target_json = serde_json::to_string(&target)?;
+        let operation = self.db.begin_operation(
+            "import_official_auth",
+            provider.client,
+            before_hash.as_deref(),
+            &target_json,
+        )?;
+        if let Err(error) = self.recover_official_import_operation(
+            provider.client,
+            before_hash.as_deref(),
+            &target_json,
+        ) {
+            let conflict = matches!(error, DaemonError::Conflict(_));
+            self.db.finish_operation(
+                &operation,
+                if conflict { "conflict" } else { "failed" },
+                Some(&error.to_string()),
+            )?;
+            self.db.set_config_status(
+                provider.client,
+                if conflict { "conflict" } else { "unavailable" },
+            )?;
+            return Err(error);
+        }
+        self.db.finish_operation(&operation, "complete", None)
     }
 
     pub async fn switch_provider(&self, params: ProviderSwitchParams) -> Result<Provider> {
@@ -983,8 +1017,19 @@ impl App {
     }
 
     pub fn recover_operations(&self) -> Result<()> {
-        for (id, client, before_hash, target_json) in self.db.pending_operations()? {
-            match self.recover_operation(client, before_hash.as_deref(), &target_json) {
+        for (id, kind, client, before_hash, target_json) in self.db.pending_operations()? {
+            let outcome = match kind.as_str() {
+                "apply_config" | "edit_active_config" => {
+                    self.recover_operation(client, before_hash.as_deref(), &target_json)
+                }
+                "import_official_auth" => self
+                    .recover_official_import_operation(client, before_hash.as_deref(), &target_json)
+                    .map(|()| RecoveryOutcome::Complete),
+                _ => Err(DaemonError::Config(format!(
+                    "unknown pending operation kind {kind}"
+                ))),
+            };
+            match outcome {
                 Ok(RecoveryOutcome::Complete) => {
                     self.db.finish_operation(&id, "complete", None)?;
                 }
@@ -1007,6 +1052,37 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn recover_official_import_operation(
+        &self,
+        client: ClientKind,
+        before_hash: Option<&str>,
+        target_json: &str,
+    ) -> Result<()> {
+        let mut target: ConfigTarget = serde_json::from_str(target_json)?;
+        if client != ClientKind::Codex
+            || target.client != client
+            || target.mode != ConnectionMode::Direct
+            || !target.provider.official
+            || target.codex_auth_before_hash.as_deref() != before_hash
+        {
+            return Err(DaemonError::Conflict(
+                "official import recovery target is invalid".into(),
+            ));
+        }
+        let persisted = self.db.get_provider(&target.provider.id)?;
+        target.provider.official = persisted.official;
+        target.provider.credential_configured = persisted.credential_configured;
+        if persisted != target.provider {
+            return Err(DaemonError::Conflict(
+                "official provider state diverged during import recovery".into(),
+            ));
+        }
+        self.recover_codex_auth_target(&target, None)?;
+        self.db
+            .set_active(client, &target.provider.id, "synchronized")?;
+        self.db.set_mode(client, ConnectionMode::Direct)
     }
 
     fn recover_operation(
@@ -2058,6 +2134,158 @@ mod tests {
                 .as_deref(),
             Some("true")
         );
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn importing_official_codex_restores_auth_without_rewriting_config() {
+        let root =
+            std::env::temp_dir().join(format!("hsind-import-oauth-{}", uuid::Uuid::new_v4()));
+        let paths = Paths {
+            database: root.join("hsin.sqlite3"),
+            lock: root.join("hsind.lock"),
+            logs: root.join("logs"),
+            backups: root.join("backups"),
+            home: root.clone(),
+        };
+        let codex_config = root.join("codex/config.toml");
+        let codex_auth = root.join("codex/auth.json");
+        fs::create_dir_all(codex_config.parent().unwrap()).unwrap();
+        let original_auth =
+            "{\n  \"auth_mode\": \"chatgpt\",\n  \"tokens\": {\"access_token\": \"keep\"}\n}\n";
+        fs::write(&codex_auth, original_auth).unwrap();
+        let app = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
+        *app.config_paths.write() = HashMap::from([
+            (ClientKind::Codex, codex_config.clone()),
+            (ClientKind::Claude, root.join("claude/settings.json")),
+        ]);
+        let custom = app
+            .add_provider(ProviderAddParams {
+                provider: hsin_core::ProviderDraft {
+                    client: ClientKind::Codex,
+                    name: "Import OAuth".into(),
+                    description: String::new(),
+                    base_url: "https://oauth-import.example.test/v1".into(),
+                    auth_scheme: AuthScheme::Bearer,
+                    model: None,
+                },
+                secret: SecretInput::Replace("import-secret".into()),
+            })
+            .await
+            .unwrap();
+        app.switch_provider(ProviderSwitchParams {
+            client: ClientKind::Codex,
+            provider_id: custom.id,
+        })
+        .await
+        .unwrap();
+        let official_config = "# keep\nmodel_provider = \"openai\"\napproval_policy = \"never\"\n";
+        fs::write(&codex_config, official_config).unwrap();
+
+        let result = app
+            .import_current(ImportCurrentParams {
+                client: ClientKind::Codex,
+                name: String::new(),
+            })
+            .await
+            .unwrap();
+
+        assert!(result.provider.official);
+        assert!(!result.imported);
+        assert_eq!(fs::read_to_string(&codex_config).unwrap(), official_config);
+        assert_eq!(fs::read_to_string(&codex_auth).unwrap(), original_auth);
+        assert!(
+            app.db
+                .protected_value(CODEX_AUTH_BACKUP_KEY)
+                .unwrap()
+                .is_none()
+        );
+        let state = app.db.client_state(ClientKind::Codex).unwrap();
+        assert_eq!(state.active_provider_id.as_deref(), Some("official-codex"));
+        assert_eq!(state.mode, ConnectionMode::Direct);
+        assert!(app.db.pending_operations().unwrap().is_empty());
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_completes_pending_official_codex_import() {
+        let root =
+            std::env::temp_dir().join(format!("hsind-recover-oauth-{}", uuid::Uuid::new_v4()));
+        let paths = Paths {
+            database: root.join("hsin.sqlite3"),
+            lock: root.join("hsind.lock"),
+            logs: root.join("logs"),
+            backups: root.join("backups"),
+            home: root.clone(),
+        };
+        let codex_config = root.join("codex/config.toml");
+        let codex_auth = root.join("codex/auth.json");
+        fs::create_dir_all(codex_config.parent().unwrap()).unwrap();
+        let original_auth = "{\n  \"auth_mode\": \"chatgpt\"\n}\n";
+        fs::write(&codex_auth, original_auth).unwrap();
+        let app = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
+        *app.config_paths.write() = HashMap::from([
+            (ClientKind::Codex, codex_config.clone()),
+            (ClientKind::Claude, root.join("claude/settings.json")),
+        ]);
+        let custom = app
+            .add_provider(ProviderAddParams {
+                provider: hsin_core::ProviderDraft {
+                    client: ClientKind::Codex,
+                    name: "Recover OAuth".into(),
+                    description: String::new(),
+                    base_url: "https://oauth-recovery.example.test/v1".into(),
+                    auth_scheme: AuthScheme::Bearer,
+                    model: None,
+                },
+                secret: SecretInput::Replace("recovery-secret".into()),
+            })
+            .await
+            .unwrap();
+        app.switch_provider(ProviderSwitchParams {
+            client: ClientKind::Codex,
+            provider_id: custom.id,
+        })
+        .await
+        .unwrap();
+        let official_config = "model_provider = \"openai\"\n";
+        fs::write(&codex_config, official_config).unwrap();
+        let official = app.ensure_official_provider(ClientKind::Codex).unwrap();
+        let target = app
+            .config_target(&official, ConnectionMode::Direct, None)
+            .unwrap();
+        app.db
+            .begin_operation(
+                "import_official_auth",
+                ClientKind::Codex,
+                target.codex_auth_before_hash.as_deref(),
+                &serde_json::to_string(&target).unwrap(),
+            )
+            .unwrap();
+
+        app.recover_operations().unwrap();
+
+        assert_eq!(fs::read_to_string(&codex_config).unwrap(), official_config);
+        assert_eq!(fs::read_to_string(&codex_auth).unwrap(), original_auth);
+        assert!(
+            app.db
+                .protected_value(CODEX_AUTH_BACKUP_KEY)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            app.db
+                .client_state(ClientKind::Codex)
+                .unwrap()
+                .active_provider_id
+                .as_deref(),
+            Some("official-codex")
+        );
+        assert!(app.db.pending_operations().unwrap().is_empty());
+
         drop(app);
         fs::remove_dir_all(root).unwrap();
     }

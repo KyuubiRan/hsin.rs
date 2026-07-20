@@ -39,6 +39,8 @@ Use source-preserving edits. Any config patch change must retain non-owned field
 
 While Hsin Auth remains enabled, custom Codex Providers use the command-backed credential helper for model requests and write only `HSIN_MANAGED_KEY` to `auth.json` to maintain Codex's API-key login state. When a client enables "Disable custom Auth", custom Providers use `requires_openai_auth = true`; direct mode writes the active Provider key to `auth.json`, while proxy mode still writes only `HSIN_MANAGED_KEY`. Switching to an Official Provider must restore the prior `auth_mode` and `OPENAI_API_KEY` values without changing tokens or other login fields.
 
+Importing a detected Official Codex Provider must restore any daemon-owned `auth.json` backup before marking the Provider synchronized. The import must preserve the detected native Official `config.toml` representation and participate in operation recovery.
+
 ## Security
 
 - Never log or print provider secrets, recovery keys, authorization headers, request bodies, databases, or raw sensitive RPC parameters.
