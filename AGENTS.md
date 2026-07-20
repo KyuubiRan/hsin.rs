@@ -41,6 +41,8 @@ While Hsin Auth remains enabled, custom Codex Providers use the command-backed c
 
 Importing a detected Official Codex Provider must restore any daemon-owned `auth.json` backup before marking the Provider synchronized. The import must preserve the detected native Official `config.toml` representation and participate in operation recovery.
 
+Detect Claude Code as Official OAuth only when its base URL is official and `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and `apiKeyHelper` are all absent or empty. An API credential at the official URL is a custom Provider, while an unresolved helper must prevent import rather than being executed or mislabeled as OAuth.
+
 ## Security
 
 - Never log or print provider secrets, recovery keys, authorization headers, request bodies, databases, or raw sensitive RPC parameters.

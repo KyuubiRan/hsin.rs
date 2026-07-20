@@ -2380,6 +2380,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn importing_claude_official_url_respects_explicit_auth() {
+        let root =
+            std::env::temp_dir().join(format!("hsind-import-claude-{}", uuid::Uuid::new_v4()));
+        let paths = Paths {
+            database: root.join("hsin.sqlite3"),
+            lock: root.join("hsind.lock"),
+            logs: root.join("logs"),
+            backups: root.join("backups"),
+            home: root.clone(),
+        };
+        let claude = root.join("claude/settings.json");
+        fs::create_dir_all(claude.parent().unwrap()).unwrap();
+        fs::write(
+            &claude,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.anthropic.com","ANTHROPIC_API_KEY":"api-secret"}}"#,
+        )
+        .unwrap();
+        let app = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
+        *app.config_paths.write() = HashMap::from([
+            (ClientKind::Codex, root.join("codex/config.toml")),
+            (ClientKind::Claude, claude.clone()),
+        ]);
+
+        let imported = app
+            .import_current(ImportCurrentParams {
+                client: ClientKind::Claude,
+                name: "Official API key".into(),
+            })
+            .await
+            .unwrap();
+
+        assert!(imported.imported);
+        assert!(!imported.provider.official);
+        assert_eq!(imported.provider.auth_scheme, AuthScheme::XApiKey);
+        assert!(imported.provider.credential_configured);
+        assert!(app.db.secret(&imported.provider.id).is_ok());
+
+        let helper_marker = root.join("helper-ran");
+        fs::write(
+            &claude,
+            format!(
+                "{{\"env\":{{\"ANTHROPIC_BASE_URL\":\"https://api.anthropic.com\"}},\"apiKeyHelper\":\"touch {}\"}}",
+                helper_marker.display()
+            ),
+        )
+        .unwrap();
+        let helper_import = app
+            .import_current(ImportCurrentParams {
+                client: ClientKind::Claude,
+                name: String::new(),
+            })
+            .await;
+        assert!(matches!(
+            helper_import,
+            Err(DaemonError::CurrentCredentialUnavailable)
+        ));
+        assert!(!helper_marker.exists());
+        assert_eq!(
+            app.db
+                .client_state(ClientKind::Claude)
+                .unwrap()
+                .active_provider_id,
+            Some(imported.provider.id)
+        );
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn model_discovery_retries_with_v1_and_returns_resolved_url() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

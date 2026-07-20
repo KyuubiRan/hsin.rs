@@ -206,21 +206,31 @@ fn detect_claude(text: &str) -> Result<DetectedProvider> {
         .unwrap_or(CLAUDE_OFFICIAL_URL)
         .trim_end_matches('/')
         .to_owned();
-    if same_url(&base_url, CLAUDE_OFFICIAL_URL) {
-        return Ok(official_provider(ClientKind::Claude));
-    }
-    let auth_token = env
+    let auth_token_value = env
         .and_then(|env| env.get("ANTHROPIC_AUTH_TOKEN"))
         .and_then(serde_json::Value::as_str)
-        .filter(|value| is_importable_secret(value));
-    let api_key = env
+        .filter(|value| !value.trim().is_empty());
+    let api_key_value = env
         .and_then(|env| env.get("ANTHROPIC_API_KEY"))
         .and_then(serde_json::Value::as_str)
-        .filter(|value| is_importable_secret(value));
+        .filter(|value| !value.trim().is_empty());
+    let api_key_helper = value
+        .get("apiKeyHelper")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    if same_url(&base_url, CLAUDE_OFFICIAL_URL)
+        && auth_token_value.is_none()
+        && api_key_value.is_none()
+        && api_key_helper.is_none()
+    {
+        return Ok(official_provider(ClientKind::Claude));
+    }
+    let auth_token = auth_token_value.filter(|value| is_importable_secret(value));
+    let api_key = api_key_value.filter(|value| is_importable_secret(value));
     Ok(DetectedProvider {
         name: imported_name("Claude", &base_url),
         base_url,
-        auth_scheme: if auth_token.is_some() {
+        auth_scheme: if auth_token_value.is_some() {
             AuthScheme::Bearer
         } else {
             AuthScheme::XApiKey
@@ -1365,6 +1375,45 @@ mod tests {
         ))
         .unwrap();
         assert!(managed_claude.secret.is_none());
+    }
+
+    #[test]
+    fn claude_official_detection_rejects_custom_auth_fields() {
+        let official = detect_claude("{}\n").unwrap();
+        assert!(official.official);
+        assert_eq!(official.auth_scheme, AuthScheme::OAuth);
+
+        let api_key = detect_claude(
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://api.anthropic.com","ANTHROPIC_API_KEY":"api-secret"}}"#,
+        )
+        .unwrap();
+        assert!(!api_key.official);
+        assert_eq!(api_key.auth_scheme, AuthScheme::XApiKey);
+        assert_eq!(
+            api_key.secret.as_deref().map(String::as_str),
+            Some("api-secret")
+        );
+
+        let auth_token =
+            detect_claude(r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"bearer-secret"}}"#).unwrap();
+        assert!(!auth_token.official);
+        assert_eq!(auth_token.auth_scheme, AuthScheme::Bearer);
+        assert_eq!(
+            auth_token.secret.as_deref().map(String::as_str),
+            Some("bearer-secret")
+        );
+
+        let helper = detect_claude(r#"{"apiKeyHelper":"credential-helper"}"#).unwrap();
+        assert!(!helper.official);
+        assert_eq!(helper.auth_scheme, AuthScheme::XApiKey);
+        assert!(helper.secret.is_none());
+
+        let managed_key = detect_claude(&format!(
+            r#"{{"env":{{"ANTHROPIC_API_KEY":"{HSIN_MANAGED_KEY}"}}}}"#
+        ))
+        .unwrap();
+        assert!(!managed_key.official);
+        assert!(managed_key.secret.is_none());
     }
 
     #[test]
