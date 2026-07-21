@@ -107,7 +107,7 @@
   "settings_proxy_master_on_description": "启动代理监听；客户端不会自动改为代理模式，需要在首页按 p 单独开启。",
   "settings_proxy_master_off_description": "先将所有已托管客户端恢复为直连模式，再停止代理监听。",
   "settings_proxy_address_description": "代理监听 IP，支持回环地址、指定网卡地址以及 0.0.0.0 等通配地址。本机客户端配置会将 0.0.0.0 转为 127.0.0.1，并将 :: 转为 ::1。修改后立即应用；代理已开启时会自动重启监听。",
-  "settings_proxy_port_description": "代理监听端口，无论代理是否开启都可修改。修改后立即应用并自动重启监听，有效范围为 1024–65535。",
+  "settings_proxy_port_description": "代理监听端口。修改后立即应用并自动重启监听，有效范围为 1024–65535。",
   "settings_client_configuration_description": "分别配置 Codex 和 Claude Code 的认证行为，并管理客户端在 TUI 中的显示和切换顺序。",
   "settings_codex_configuration_description": "配置 Codex 的认证行为。",
   "settings_claude_configuration_description": "配置 Claude Code 的认证行为。",

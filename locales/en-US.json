@@ -107,7 +107,7 @@
   "settings_proxy_master_on_description": "Start the proxy listener. Client proxy modes are unchanged until enabled with p on the home screen.",
   "settings_proxy_master_off_description": "Return all managed clients to direct mode, then stop the proxy listener.",
   "settings_proxy_address_description": "Proxy listening IP. Loopback, specific interface, and wildcard addresses such as 0.0.0.0 are supported. Local client configuration uses 127.0.0.1 for 0.0.0.0 and ::1 for ::. Changes apply immediately and restart the listener when enabled.",
-  "settings_proxy_port_description": "Proxy listening port. It can be changed whether the proxy is enabled or disabled; changes apply immediately and restart the listener. Valid range: 1024–65535.",
+  "settings_proxy_port_description": "Proxy listening port. Changes apply immediately and restart the listener. Valid range: 1024–65535.",
   "settings_client_configuration_description": "Configure authentication for Codex and Claude Code separately, and manage their visibility and switching order in the TUI.",
   "settings_codex_configuration_description": "Configure Codex authentication behavior.",
   "settings_claude_configuration_description": "Configure Claude Code authentication behavior.",
