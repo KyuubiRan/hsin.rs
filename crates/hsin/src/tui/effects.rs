@@ -23,6 +23,7 @@ pub(super) enum Effect {
         mode: ConnectionMode,
     },
     SetProxyEnabled(bool),
+    SetProxyHost(String),
     SetProxyPort(u16),
     SetClients(ClientSettings),
     SetClientAuth {
@@ -148,6 +149,7 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
             Ok(Some("mode_changed"))
         }
         Effect::SetProxyEnabled(enabled) => update_proxy_enabled(client, enabled).await,
+        Effect::SetProxyHost(host) => update_proxy_host(client, host).await,
         Effect::SetProxyPort(port) => update_proxy_port(client, port).await,
         Effect::SetClients(settings) => update_clients(client, settings).await,
         Effect::SetClientAuth {
@@ -276,6 +278,7 @@ async fn update_proxy_enabled(
             "settings.set",
             &SettingsPatch {
                 language: None,
+                proxy_host: None,
                 proxy_port: None,
                 proxy_enabled: Some(enabled),
                 clients: None,
@@ -290,12 +293,30 @@ async fn update_proxy_enabled(
     }))
 }
 
+async fn update_proxy_host(client: &DaemonClient, host: String) -> Result<Option<&'static str>> {
+    let _: Value = client
+        .call(
+            "settings.set",
+            &SettingsPatch {
+                language: None,
+                proxy_host: Some(host),
+                proxy_port: None,
+                proxy_enabled: None,
+                clients: None,
+                client_auth: None,
+            },
+        )
+        .await?;
+    Ok(Some("proxy_address_changed"))
+}
+
 async fn update_proxy_port(client: &DaemonClient, port: u16) -> Result<Option<&'static str>> {
     let _: Value = client
         .call(
             "settings.set",
             &SettingsPatch {
                 language: None,
+                proxy_host: None,
                 proxy_port: Some(port),
                 proxy_enabled: None,
                 clients: None,
@@ -312,6 +333,7 @@ async fn update_language(client: &DaemonClient, language: String) -> Result<Opti
             "settings.set",
             &SettingsPatch {
                 language: Some(language),
+                proxy_host: None,
                 proxy_port: None,
                 proxy_enabled: None,
                 clients: None,
@@ -331,6 +353,7 @@ async fn update_clients(
             "settings.set",
             &SettingsPatch {
                 language: None,
+                proxy_host: None,
                 proxy_port: None,
                 proxy_enabled: None,
                 clients: Some(clients),
@@ -351,6 +374,7 @@ async fn update_client_auth(
             "settings.set",
             &SettingsPatch {
                 language: None,
+                proxy_host: None,
                 proxy_port: None,
                 proxy_enabled: None,
                 clients: None,

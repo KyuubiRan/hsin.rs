@@ -111,7 +111,12 @@ pub(super) fn draw_settings_screen(
                 _ => unreachable!("root settings selection is bounded"),
             }
         }
-        SettingsPage::Proxy { selected, port, .. } => {
+        SettingsPage::Proxy {
+            selected,
+            host,
+            port,
+            ..
+        } => {
             let (detail_title, description, current) = match *selected {
                 0 => (
                     i18n.text("proxy_switch"),
@@ -121,7 +126,7 @@ pub(super) fn draw_settings_screen(
                 1 => (
                     i18n.text("proxy_address"),
                     i18n.text("settings_proxy_address_description"),
-                    state.proxy_host.as_str(),
+                    host.as_str(),
                 ),
                 _ => (
                     i18n.text("proxy_port"),
@@ -132,11 +137,7 @@ pub(super) fn draw_settings_screen(
             (
                 vec![
                     settings_option_item(i18n.text("proxy_switch"), proxy_switch, option_width),
-                    settings_option_item(
-                        i18n.text("proxy_address"),
-                        &state.proxy_host,
-                        option_width,
-                    ),
+                    settings_option_item(i18n.text("proxy_address"), host, option_width),
                     settings_option_item(i18n.text("proxy_port"), port, option_width),
                 ],
                 *selected,

@@ -93,6 +93,7 @@ async fn run() -> Result<()> {
     app.recover_operations()?;
     app.initialize_providers()?;
     app.reconcile_client_auth_configuration()?;
+    app.reconcile_proxy_configurations()?;
     let mut rpc = tokio::spawn(rpc::serve(app.clone()));
     tokio::task::yield_now().await;
     let proxy = tokio::spawn(proxy::serve(app.clone()));

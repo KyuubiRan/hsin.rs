@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     sync::{
         Arc,
@@ -34,13 +35,29 @@ use crate::{
 
 const CODEX_AUTH_BACKUP_KEY: &str = "codex_auth_backup_v1";
 
+fn client_host_for_listener(host: IpAddr) -> IpAddr {
+    match host {
+        IpAddr::V4(host) if host.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(host) if host.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        host => host,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProxyRuntimeConfig {
+    pub enabled: bool,
+    pub address: SocketAddr,
+    pub revision: u64,
+}
+
 pub struct App {
     pub db: Arc<Database>,
     pub crypto: Arc<CryptoManager>,
     mutation: Mutex<()>,
     credential_command: PathBuf,
     proxy_listening: AtomicBool,
-    proxy_enabled: watch::Sender<bool>,
+    proxy_active_address: RwLock<Option<SocketAddr>>,
+    proxy_runtime: watch::Sender<ProxyRuntimeConfig>,
     shutdown_requested: AtomicBool,
     shutdown: tokio::sync::Notify,
     config_paths: RwLock<HashMap<ClientKind, PathBuf>>,
@@ -94,14 +111,29 @@ impl App {
         let enabled = db
             .setting("proxy_enabled")?
             .is_some_and(|value| value == "true");
-        let (proxy_enabled, _) = watch::channel(enabled);
+        let proxy_host = db
+            .setting("proxy_host")?
+            .unwrap_or_else(|| "127.0.0.1".into())
+            .parse::<IpAddr>()
+            .map_err(|_| DaemonError::Config("invalid stored proxy host".into()))?;
+        let proxy_port = db
+            .setting("proxy_port")?
+            .unwrap_or_else(|| "9999".into())
+            .parse::<u16>()
+            .map_err(|_| DaemonError::Config("invalid stored proxy port".into()))?;
+        let (proxy_runtime, _) = watch::channel(ProxyRuntimeConfig {
+            enabled,
+            address: SocketAddr::new(proxy_host, proxy_port),
+            revision: 0,
+        });
         Ok(Arc::new(Self {
             db,
             crypto,
             mutation: Mutex::new(()),
             credential_command,
             proxy_listening: AtomicBool::new(false),
-            proxy_enabled,
+            proxy_active_address: RwLock::new(None),
+            proxy_runtime,
             shutdown_requested: AtomicBool::new(false),
             shutdown: tokio::sync::Notify::new(),
             config_paths: RwLock::new(config_paths),
@@ -117,14 +149,29 @@ impl App {
             .map_err(|_| DaemonError::Database(rusqlite::Error::InvalidQuery))
     }
 
-    pub fn mark_proxy_listening(&self, listening: bool) {
-        self.proxy_listening.store(listening, Ordering::Release);
+    pub fn proxy_host(&self) -> Result<IpAddr> {
+        self.db
+            .setting("proxy_host")?
+            .unwrap_or_else(|| "127.0.0.1".into())
+            .parse()
+            .map_err(|_| DaemonError::Config("invalid stored proxy host".into()))
+    }
+    pub fn proxy_address(&self) -> Result<SocketAddr> {
+        Ok(SocketAddr::new(self.proxy_host()?, self.proxy_port()?))
+    }
+    fn proxy_client_host(&self) -> Result<IpAddr> {
+        Ok(client_host_for_listener(self.proxy_host()?))
+    }
+    pub fn mark_proxy_active(&self, address: Option<SocketAddr>) {
+        *self.proxy_active_address.write() = address;
+        self.proxy_listening
+            .store(address.is_some(), Ordering::Release);
     }
     pub fn proxy_enabled(&self) -> bool {
-        *self.proxy_enabled.borrow()
+        self.proxy_runtime.borrow().enabled
     }
-    pub fn subscribe_proxy_enabled(&self) -> watch::Receiver<bool> {
-        self.proxy_enabled.subscribe()
+    pub fn subscribe_proxy_runtime(&self) -> watch::Receiver<ProxyRuntimeConfig> {
+        self.proxy_runtime.subscribe()
     }
     pub fn notify_shutdown(&self) {
         self.shutdown_requested.store(true, Ordering::Release);
@@ -859,6 +906,7 @@ impl App {
             mode,
             provider: provider.clone(),
             credential_command: self.credential_command.to_string_lossy().into_owned(),
+            proxy_host: self.proxy_client_host()?.to_string(),
             proxy_port: self.proxy_port()?,
             disable_custom_auth: disable_custom_auth
                 .unwrap_or(self.disable_custom_auth(provider.client)?),
@@ -1131,13 +1179,12 @@ impl App {
     }
 
     pub fn status(&self) -> Result<DaemonStatus> {
-        let port = self.proxy_port()?;
         Ok(DaemonStatus {
             version: env!("CARGO_PKG_VERSION").into(),
             locked: !self.crypto.is_unlocked(),
             proxy_listening: self.proxy_listening.load(Ordering::Acquire),
             proxy_enabled: self.proxy_enabled(),
-            proxy_address: format!("127.0.0.1:{port}"),
+            proxy_address: self.proxy_address()?.to_string(),
             clients: vec![
                 self.db.client_state(ClientKind::Codex)?,
                 self.db.client_state(ClientKind::Claude)?,
@@ -1151,7 +1198,7 @@ impl App {
                 .db
                 .setting("language")?
                 .unwrap_or_else(|| hsin_core::LANGUAGE_SYSTEM.into()),
-            proxy_host: "127.0.0.1".into(),
+            proxy_host: self.proxy_host()?.to_string(),
             proxy_port: self.proxy_port()?,
             proxy_enabled: self.proxy_enabled(),
             clients: self.client_settings()?,
@@ -1185,17 +1232,36 @@ impl App {
 
     pub async fn update_settings(&self, patch: SettingsPatch) -> Result<Settings> {
         let _guard = self.mutation.lock().await;
-        if patch
-            .clients
-            .as_ref()
-            .is_some_and(|clients| !clients.is_valid())
-        {
+        let SettingsPatch {
+            language,
+            proxy_host,
+            proxy_port,
+            proxy_enabled,
+            clients,
+            client_auth,
+        } = patch;
+        if clients.as_ref().is_some_and(|clients| !clients.is_valid()) {
             return Err(DaemonError::Invalid(
                 "client settings must contain each client once and keep at least one visible"
                     .into(),
             ));
         }
-        if let Some(language) = patch.language {
+        let old_host = self.proxy_host()?;
+        let old_port = self.proxy_port()?;
+        let new_host = match proxy_host {
+            Some(host) => host
+                .trim()
+                .parse::<IpAddr>()
+                .map_err(|_| DaemonError::Invalid("proxy host must be an IP address".into()))?,
+            None => old_host,
+        };
+        let new_port = proxy_port.unwrap_or(old_port);
+        if new_port < 1024 {
+            return Err(DaemonError::Invalid(
+                "proxy port must be at least 1024".into(),
+            ));
+        }
+        if let Some(language) = language {
             if !matches!(
                 language.as_str(),
                 hsin_core::LANGUAGE_SYSTEM | hsin_core::LANGUAGE_EN_US | hsin_core::LANGUAGE_ZH_CN
@@ -1206,28 +1272,32 @@ impl App {
             }
             self.db.set_setting("language", &language)?;
         }
-        if patch.proxy_enabled == Some(false) {
+        if proxy_enabled == Some(false) {
             self.disable_all_client_proxies_locked()?;
             self.set_proxy_enabled_locked(false).await?;
         }
-        if let Some(port) = patch.proxy_port {
-            if port < 1024 {
-                return Err(DaemonError::Invalid(
-                    "proxy port must be at least 1024".into(),
-                ));
+        let binding_changed = new_host != old_host || new_port != old_port;
+        if binding_changed {
+            self.set_proxy_binding_settings(new_host, new_port)?;
+            if let Err(error) = self.reconcile_proxy_configurations() {
+                self.set_proxy_binding_settings(old_host, old_port)?;
+                let _ = self.reconcile_proxy_configurations();
+                return Err(error);
             }
-            if self.proxy_listening.load(Ordering::Acquire) && port != self.proxy_port()? {
-                return Err(DaemonError::Conflict(
-                    "restart daemon to change the proxy port".into(),
-                ));
+            if self.proxy_enabled()
+                && let Err(error) = self.restart_proxy_locked().await
+            {
+                self.set_proxy_binding_settings(old_host, old_port)?;
+                let _ = self.reconcile_proxy_configurations();
+                let _ = self.restart_proxy_locked().await;
+                return Err(error);
             }
-            self.db.set_setting("proxy_port", &port.to_string())?;
         }
-        if let Some(clients) = patch.clients {
+        if let Some(clients) = clients {
             self.db
                 .set_setting("clients", &serde_json::to_string(&clients)?)?;
         }
-        if let Some(update) = patch.client_auth {
+        if let Some(update) = client_auth {
             let mut client_auth = self.client_auth_settings()?;
             if update.disable_custom_auth != client_auth.disable_custom_auth(update.client) {
                 let state = self.db.client_state(update.client)?;
@@ -1244,10 +1314,29 @@ impl App {
                     .set_setting("client_auth", &serde_json::to_string(&client_auth)?)?;
             }
         }
-        if patch.proxy_enabled == Some(true) {
+        if proxy_enabled == Some(true) {
             self.set_proxy_enabled_locked(true).await?;
         }
         self.settings()
+    }
+
+    fn set_proxy_binding_settings(&self, host: IpAddr, port: u16) -> Result<()> {
+        self.db.set_setting("proxy_host", &host.to_string())?;
+        self.db.set_setting("proxy_port", &port.to_string())
+    }
+
+    pub(crate) fn reconcile_proxy_configurations(&self) -> Result<()> {
+        for client in ClientKind::ALL {
+            let state = self.db.client_state(client)?;
+            if state.mode != ConnectionMode::Proxy {
+                continue;
+            }
+            if let Some(provider_id) = state.active_provider_id {
+                let provider = self.db.get_provider(&provider_id)?;
+                self.apply_configuration(&provider, ConnectionMode::Proxy)?;
+            }
+        }
+        Ok(())
     }
 
     fn disable_all_client_proxies_locked(&self) -> Result<()> {
@@ -1275,24 +1364,54 @@ impl App {
         if self.proxy_enabled() != enabled {
             self.db
                 .set_setting("proxy_enabled", if enabled { "true" } else { "false" })?;
-            self.proxy_enabled.send_replace(enabled);
         }
-        for _ in 0..50 {
-            if self.proxy_listening.load(Ordering::Acquire) == enabled {
-                return Ok(());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let address = self.proxy_address()?;
+        self.replace_proxy_runtime(enabled, address);
+        if self.wait_for_proxy_state(enabled, address).await {
+            return Ok(());
         }
         if enabled {
             self.db.set_setting("proxy_enabled", "false")?;
-            self.proxy_enabled.send_replace(false);
-            return Err(DaemonError::Config(
-                "local proxy did not become ready".into(),
-            ));
+            self.replace_proxy_runtime(false, address);
+            return Err(DaemonError::Config("proxy did not become ready".into()));
         }
-        Err(DaemonError::Config(
-            "local proxy did not stop in time".into(),
-        ))
+        Err(DaemonError::Config("proxy did not stop in time".into()))
+    }
+
+    async fn restart_proxy_locked(&self) -> Result<()> {
+        let address = self.proxy_address()?;
+        self.replace_proxy_runtime(true, address);
+        if self.wait_for_proxy_state(true, address).await {
+            Ok(())
+        } else {
+            Err(DaemonError::Config(
+                "proxy did not restart with the updated address".into(),
+            ))
+        }
+    }
+
+    fn replace_proxy_runtime(&self, enabled: bool, address: SocketAddr) {
+        let revision = self.proxy_runtime.borrow().revision.wrapping_add(1);
+        self.proxy_runtime.send_replace(ProxyRuntimeConfig {
+            enabled,
+            address,
+            revision,
+        });
+    }
+
+    async fn wait_for_proxy_state(&self, enabled: bool, address: SocketAddr) -> bool {
+        for _ in 0..100 {
+            let ready = if enabled {
+                *self.proxy_active_address.read() == Some(address)
+            } else {
+                !self.proxy_listening.load(Ordering::Acquire)
+            };
+            if ready {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        false
     }
 
     pub fn security_status(&self) -> Result<SecurityStatus> {
@@ -1512,6 +1631,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn wildcard_listener_hosts_use_loopback_client_destinations() {
+        assert_eq!(
+            client_host_for_listener("0.0.0.0".parse().unwrap()),
+            "127.0.0.1".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            client_host_for_listener("::".parse().unwrap()),
+            "::1".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            client_host_for_listener("192.168.1.10".parse().unwrap()),
+            "192.168.1.10".parse::<IpAddr>().unwrap()
+        );
+    }
+
     fn leave_pending_configuration_operation(
         app: &App,
         path: &std::path::Path,
@@ -1610,6 +1745,7 @@ mod tests {
         let settings = app
             .update_settings(SettingsPatch {
                 language: None,
+                proxy_host: None,
                 proxy_port: None,
                 proxy_enabled: None,
                 clients: Some(clients.clone()),
@@ -1623,6 +1759,7 @@ mod tests {
         let invalid = app
             .update_settings(SettingsPatch {
                 language: None,
+                proxy_host: None,
                 proxy_port: None,
                 proxy_enabled: None,
                 clients: Some(ClientSettings {
@@ -1705,6 +1842,7 @@ mod tests {
         let settings = app
             .update_settings(SettingsPatch {
                 language: None,
+                proxy_host: None,
                 proxy_port: None,
                 proxy_enabled: None,
                 clients: None,
@@ -1744,6 +1882,7 @@ mod tests {
         let settings = app
             .update_settings(SettingsPatch {
                 language: None,
+                proxy_host: None,
                 proxy_port: None,
                 proxy_enabled: None,
                 clients: None,
@@ -1775,6 +1914,7 @@ mod tests {
 
         app.update_settings(SettingsPatch {
             language: None,
+            proxy_host: None,
             proxy_port: None,
             proxy_enabled: None,
             clients: None,
@@ -2511,7 +2651,19 @@ mod tests {
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = probe.local_addr().unwrap().port();
         drop(probe);
-        app.db.set_setting("proxy_port", &port.to_string()).unwrap();
+        let disabled_settings = app
+            .update_settings(SettingsPatch {
+                language: None,
+                proxy_host: Some("127.0.0.1".into()),
+                proxy_port: Some(port),
+                proxy_enabled: None,
+                clients: None,
+                client_auth: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(disabled_settings.proxy_port, port);
+        assert!(!disabled_settings.proxy_enabled);
 
         let codex = app
             .add_provider(ProviderAddParams {
@@ -2549,6 +2701,7 @@ mod tests {
             .unwrap();
         app.update_settings(SettingsPatch {
             language: None,
+            proxy_host: None,
             proxy_port: None,
             proxy_enabled: None,
             clients: None,
@@ -2577,6 +2730,46 @@ mod tests {
             config::HSIN_MANAGED_KEY
         )));
 
+        let next_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let next_port = next_probe.local_addr().unwrap().port();
+        drop(next_probe);
+        let restarted = app
+            .update_settings(SettingsPatch {
+                language: None,
+                proxy_host: Some("0.0.0.0".into()),
+                proxy_port: Some(next_port),
+                proxy_enabled: None,
+                clients: None,
+                client_auth: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(restarted.proxy_host, "0.0.0.0");
+        assert_eq!(restarted.proxy_port, next_port);
+        assert!(restarted.proxy_enabled);
+        assert_eq!(
+            app.status().unwrap().proxy_address,
+            format!("0.0.0.0:{next_port}")
+        );
+        tokio::net::TcpStream::connect(("127.0.0.1", next_port))
+            .await
+            .expect("the restarted wildcard listener should accept loopback connections");
+        let codex_config_path = root.join("codex/config.toml");
+        let configured_proxy_url = format!("http://127.0.0.1:{next_port}/codex/v1");
+        let stale_proxy_url = format!("http://0.0.0.0:{next_port}/codex/v1");
+        let configured = fs::read_to_string(&codex_config_path).unwrap();
+        assert!(configured.contains(&configured_proxy_url));
+
+        fs::write(
+            &codex_config_path,
+            configured.replace(&configured_proxy_url, &stale_proxy_url),
+        )
+        .unwrap();
+        app.reconcile_proxy_configurations().unwrap();
+        let reconciled = fs::read_to_string(&codex_config_path).unwrap();
+        assert!(reconciled.contains(&configured_proxy_url));
+        assert!(!reconciled.contains(&stale_proxy_url));
+
         app.set_mode(ClientKind::Codex, ConnectionMode::Direct)
             .await
             .unwrap();
@@ -2591,6 +2784,7 @@ mod tests {
             .unwrap();
         app.update_settings(SettingsPatch {
             language: None,
+            proxy_host: None,
             proxy_port: None,
             proxy_enabled: Some(false),
             clients: None,

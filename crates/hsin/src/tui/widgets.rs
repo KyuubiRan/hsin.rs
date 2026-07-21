@@ -66,6 +66,9 @@ pub(super) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
         InputMode::Settings(screen) => match &screen.page {
             SettingsPage::Root => i18n.text("settings_root_help"),
             SettingsPage::Proxy {
+                editing_host: true, ..
+            } => i18n.text("settings_address_help"),
+            SettingsPage::Proxy {
                 editing_port: true, ..
             } => i18n.text("settings_port_help"),
             SettingsPage::Proxy { .. } => i18n.text("settings_proxy_help"),

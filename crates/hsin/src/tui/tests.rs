@@ -445,11 +445,24 @@ fn settings_menu_queues_proxy_and_language_changes() {
 }
 
 #[test]
-fn proxy_settings_edits_port_only_while_disabled() {
-    let mut state = State::default();
+fn proxy_settings_edits_address_and_port_while_enabled() {
+    let mut state = State {
+        proxy_enabled: true,
+        ..State::default()
+    };
     state.reduce(key(KeyCode::Char('o')));
     state.reduce(key(KeyCode::Enter));
     state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Enter));
+    for character in "0.0.0.0".chars() {
+        state.reduce(key(KeyCode::Char(character)));
+    }
+    state.reduce(key(KeyCode::Enter));
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::SetProxyHost(host)) if host == "0.0.0.0"
+    ));
+
     state.reduce(key(KeyCode::Down));
     state.reduce(key(KeyCode::Enter));
     for character in "1234".chars() {
@@ -460,22 +473,6 @@ fn proxy_settings_edits_port_only_while_disabled() {
         state.take_effect(),
         Some(Effect::SetProxyPort(1234))
     ));
-
-    let mut enabled = State {
-        proxy_enabled: true,
-        input: InputMode::Settings(SettingsScreen {
-            selected: 0,
-            page: SettingsPage::Proxy {
-                selected: 2,
-                port: "9999".into(),
-                editing_port: false,
-            },
-        }),
-        ..State::default()
-    };
-    enabled.reduce(key(KeyCode::Enter));
-    assert!(enabled.take_effect().is_none());
-    assert_eq!(enabled.notice.as_deref(), Some("@proxy_port_disable_first"));
 }
 
 #[test]
@@ -1421,7 +1418,9 @@ fn proxy_settings_renders_switch_address_and_port() {
             selected: 0,
             page: SettingsPage::Proxy {
                 selected: 0,
+                host: "127.0.0.1".into(),
                 port: "9999".into(),
+                editing_host: false,
                 editing_port: false,
             },
         }),

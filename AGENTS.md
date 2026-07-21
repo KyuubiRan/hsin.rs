@@ -13,7 +13,7 @@ The Cargo workspace contains:
 - `crates/hsind`: the daemon and sole persistent-state owner.
 - `crates/hsin`: the CLI and Ratatui TUI.
 
-Version 1 supports direct and loopback-proxy modes on macOS, Linux, and Windows. Tray UI, Gemini, WebDAV, remote proxy binding, and FoxSwitcher migration are out of scope.
+Version 1 supports direct and configurable proxy-listener modes on macOS, Linux, and Windows. Tray UI, Gemini, WebDAV, and FoxSwitcher migration are out of scope.
 
 ## Required Boundaries
 
@@ -47,7 +47,7 @@ Detect Claude Code as Official OAuth only when its base URL is official and `ANT
 
 - Never log or print provider secrets, recovery keys, authorization headers, request bodies, databases, or raw sensitive RPC parameters.
 - Treat Codex `auth.json` and its encrypted backup as secret material. Never include either file's contents in operation JSON, logs, diagnostics, or error messages.
-- Keep the proxy bound to loopback. Do not introduce `0.0.0.0` or remote listening in v1.
+- Proxy listeners may bind to loopback, a specific interface, or wildcard addresses such as `0.0.0.0`. Non-loopback requests must require the random client capability; never accept the fixed `HSIN_MANAGED_KEY` from a non-loopback peer.
 - Use `secrecy` and `zeroize` at sensitive in-memory boundaries where supported.
 - Do not fall back to plaintext secret storage when the system keyring is unavailable. The daemon must remain recoverably locked.
 - Keep credential helpers bound to provider identity and revision so stale client configurations cannot obtain a different provider's key.

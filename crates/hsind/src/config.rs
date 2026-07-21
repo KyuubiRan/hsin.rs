@@ -39,11 +39,17 @@ pub struct ConfigTarget {
     pub mode: ConnectionMode,
     pub provider: Provider,
     pub credential_command: String,
+    #[serde(default = "default_proxy_host")]
+    pub proxy_host: String,
     pub proxy_port: u16,
     #[serde(default)]
     pub disable_custom_auth: bool,
     #[serde(default)]
     pub codex_auth_before_hash: Option<String>,
+}
+
+fn default_proxy_host() -> String {
+    "127.0.0.1".into()
 }
 
 #[derive(Serialize, Deserialize, Zeroize)]
@@ -455,7 +461,7 @@ fn parse_toml(text: &str) -> Result<ImDocument<String>> {
 fn codex_provider_table(target: &ConfigTarget, credential: Option<&str>) -> Result<Table> {
     let base_url = match target.mode {
         ConnectionMode::Direct => target.provider.base_url.trim_end_matches('/').to_owned(),
-        ConnectionMode::Proxy => format!("http://127.0.0.1:{}/codex/v1", target.proxy_port),
+        ConnectionMode::Proxy => proxy_url(target, "/codex/v1")?,
     };
     let mut provider = Table::new();
     provider.set_implicit(false);
@@ -649,7 +655,7 @@ pub fn patch_claude_with_credential(
     }
     let base_url = match target.mode {
         ConnectionMode::Direct => target.provider.base_url.trim_end_matches('/').to_owned(),
-        ConnectionMode::Proxy => format!("http://127.0.0.1:{}/claude", target.proxy_port),
+        ConnectionMode::Proxy => proxy_url(target, "/claude")?,
     };
     output = set_nested_string(&output, "env", "ANTHROPIC_BASE_URL", Some(&base_url))?;
     if target.disable_custom_auth {
@@ -677,6 +683,18 @@ pub fn patch_claude_with_credential(
     )?;
     validate_jsonc(&output)?;
     Ok(output)
+}
+
+fn proxy_url(target: &ConfigTarget, path: &str) -> Result<String> {
+    let host = target
+        .proxy_host
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| DaemonError::Config("invalid proxy host in configuration target".into()))?;
+    let authority = match host {
+        std::net::IpAddr::V4(host) => host.to_string(),
+        std::net::IpAddr::V6(host) => format!("[{host}]"),
+    };
+    Ok(format!("http://{authority}:{}{path}", target.proxy_port))
 }
 
 fn configured_key<'a>(target: &ConfigTarget, credential: Option<&'a str>) -> Result<&'a str> {
@@ -1323,10 +1341,26 @@ mod tests {
                 revision: 1,
             },
             credential_command: "/opt/hsin".into(),
+            proxy_host: "127.0.0.1".into(),
             proxy_port: 9999,
             disable_custom_auth: false,
             codex_auth_before_hash: None,
         }
+    }
+
+    #[test]
+    fn proxy_urls_support_ipv6_listener_hosts() {
+        let mut codex = target(ClientKind::Codex);
+        codex.mode = ConnectionMode::Proxy;
+        codex.proxy_host = "::1".into();
+        let codex_output = patch_codex("", &codex).unwrap();
+        assert!(codex_output.contains("http://[::1]:9999/codex/v1"));
+
+        let mut claude = target(ClientKind::Claude);
+        claude.mode = ConnectionMode::Proxy;
+        claude.proxy_host = "::1".into();
+        let claude_output = patch_claude("", &claude).unwrap();
+        assert!(claude_output.contains("http://[::1]:9999/claude"));
     }
 
     #[test]

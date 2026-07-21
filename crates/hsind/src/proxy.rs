@@ -1,12 +1,9 @@
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
-};
+use std::{future::IntoFuture, net::SocketAddr, sync::Arc};
 
 use axum::{
     Router,
     body::Body,
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, header},
     routing::any,
 };
@@ -30,25 +27,26 @@ struct ProxyState {
 }
 
 pub async fn serve(app: Arc<App>) -> Result<()> {
-    let mut enabled = app.subscribe_proxy_enabled();
+    let mut runtime = app.subscribe_proxy_runtime();
     loop {
-        while !*enabled.borrow() {
+        while !runtime.borrow().enabled {
             tokio::select! {
                 () = app.wait_shutdown() => return Ok(()),
-                changed = enabled.changed() => {
+                changed = runtime.changed() => {
                     if changed.is_err() {
                         return Ok(());
                     }
                 }
             }
         }
-        if let Err(error) = serve_enabled(app.clone(), &mut enabled).await {
-            app.mark_proxy_listening(false);
-            tracing::warn!(%error, "local proxy failed; retrying while enabled");
+        let desired = *runtime.borrow();
+        if let Err(error) = serve_enabled(app.clone(), &mut runtime, desired).await {
+            app.mark_proxy_active(None);
+            tracing::warn!(%error, "proxy failed; retrying while enabled");
             tokio::select! {
                 () = app.wait_shutdown() => return Ok(()),
                 () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
-                changed = enabled.changed() => {
+                changed = runtime.changed() => {
                     if changed.is_err() {
                         return Ok(());
                     }
@@ -63,10 +61,10 @@ pub async fn serve(app: Arc<App>) -> Result<()> {
 
 async fn serve_enabled(
     app: Arc<App>,
-    enabled: &mut tokio::sync::watch::Receiver<bool>,
+    runtime: &mut tokio::sync::watch::Receiver<crate::app::ProxyRuntimeConfig>,
+    desired: crate::app::ProxyRuntimeConfig,
 ) -> Result<()> {
-    let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), app.proxy_port()?);
-    let listener = TcpListener::bind(address).await?;
+    let listener = TcpListener::bind(desired.address).await?;
     let state = ProxyState {
         app: app.clone(),
         client: reqwest::Client::builder()
@@ -80,40 +78,48 @@ async fn serve_enabled(
         .route("/codex/v1/{*path}", any(codex))
         .route("/claude/{*path}", any(claude))
         .with_state(state);
-    app.mark_proxy_listening(true);
-    let result = axum::serve(listener, router)
-        .with_graceful_shutdown({
-            let app = app.clone();
-            let mut enabled = enabled.clone();
-            async move {
-                loop {
-                    tokio::select! {
-                        () = app.wait_shutdown() => break,
-                        changed = enabled.changed() => {
-                            if changed.is_err() || !*enabled.borrow() {
-                                break;
-                            }
-                        }
-                    }
+    app.mark_proxy_active(Some(desired.address));
+    let server = axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .into_future();
+    tokio::pin!(server);
+    let result = loop {
+        tokio::select! {
+            result = &mut server => break result.map_err(DaemonError::Io),
+            () = app.wait_shutdown() => break Ok(()),
+            changed = runtime.changed() => {
+                if changed.is_err() || *runtime.borrow() != desired {
+                    break Ok(());
                 }
             }
-        })
-        .await;
-    app.mark_proxy_listening(false);
-    result.map_err(DaemonError::Io)
+        }
+    };
+    app.mark_proxy_active(None);
+    result
 }
 
-async fn codex(State(state): State<ProxyState>, request: Request<Body>) -> Response<Body> {
-    forward(state, ClientKind::Codex, "/codex/v1", request).await
+async fn codex(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<ProxyState>,
+    request: Request<Body>,
+) -> Response<Body> {
+    forward(state, ClientKind::Codex, "/codex/v1", peer, request).await
 }
-async fn claude(State(state): State<ProxyState>, request: Request<Body>) -> Response<Body> {
-    forward(state, ClientKind::Claude, "/claude", request).await
+async fn claude(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<ProxyState>,
+    request: Request<Body>,
+) -> Response<Body> {
+    forward(state, ClientKind::Claude, "/claude", peer, request).await
 }
 
 async fn forward(
     state: ProxyState,
     kind: ClientKind,
     prefix: &str,
+    peer: SocketAddr,
     request: Request<Body>,
 ) -> Response<Body> {
     let Ok(permit) = state.concurrency.clone().try_acquire_owned() else {
@@ -131,6 +137,7 @@ async fn forward(
         request.headers(),
         capability.expose_secret(),
         managed_key_enabled,
+        peer.ip().is_loopback(),
     ) {
         return text_response(StatusCode::UNAUTHORIZED, "invalid local proxy capability");
     }
@@ -202,7 +209,12 @@ async fn forward(
     })
 }
 
-fn authorized(headers: &HeaderMap, expected: &str, managed_key_enabled: bool) -> bool {
+fn authorized(
+    headers: &HeaderMap,
+    expected: &str,
+    managed_key_enabled: bool,
+    peer_is_loopback: bool,
+) -> bool {
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -215,6 +227,7 @@ fn authorized(headers: &HeaderMap, expected: &str, managed_key_enabled: bool) ->
     let api_key_matches =
         api_key.is_some_and(|actual| actual.as_bytes().ct_eq(expected.as_bytes()).into());
     let managed_key_matches = managed_key_enabled
+        && peer_is_loopback
         && bearer
             .or(api_key)
             .is_some_and(|actual| actual == HSIN_MANAGED_KEY);
@@ -274,7 +287,7 @@ fn error_response(error: &DaemonError) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::HashMap, convert::Infallible, fs, path::PathBuf};
+    use std::{collections::HashMap, convert::Infallible, fs, net::Ipv4Addr, path::PathBuf};
 
     use axum::{body::Bytes, extract::State as AxumState, response::Response as AxumResponse};
     use hsin_core::{Provider, ProviderAddParams, ProviderDraft, SecretInput};
@@ -376,6 +389,19 @@ mod tests {
             .unwrap()
     }
 
+    fn loopback_peer() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 12345))
+    }
+
+    async fn forward_loopback(
+        state: ProxyState,
+        kind: ClientKind,
+        prefix: &str,
+        request: Request<Body>,
+    ) -> Response<Body> {
+        forward(state, kind, prefix, loopback_peer(), request).await
+    }
+
     async fn spawn_server(router: Router) -> (SocketAddr, JoinHandle<()>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -421,16 +447,16 @@ mod tests {
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer token"),
         );
-        assert!(authorized(&headers, "token", false));
-        assert!(!authorized(&headers, "other", false));
+        assert!(authorized(&headers, "token", false, true));
+        assert!(!authorized(&headers, "other", false, true));
         headers.clear();
         headers.insert("x-api-key", HeaderValue::from_static("token"));
-        assert!(authorized(&headers, "token", false));
+        assert!(authorized(&headers, "token", false, true));
         headers.insert(
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer attacker"),
         );
-        assert!(authorized(&headers, "token", false));
+        assert!(authorized(&headers, "token", false, true));
     }
 
     #[test]
@@ -440,11 +466,13 @@ mod tests {
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer HSIN_MANAGED_KEY"),
         );
-        assert!(!authorized(&headers, "capability", false));
-        assert!(authorized(&headers, "capability", true));
+        assert!(!authorized(&headers, "capability", false, true));
+        assert!(authorized(&headers, "capability", true, true));
+        assert!(!authorized(&headers, "capability", true, false));
         headers.clear();
         headers.insert("x-api-key", HeaderValue::from_static("HSIN_MANAGED_KEY"));
-        assert!(authorized(&headers, "capability", true));
+        assert!(authorized(&headers, "capability", true, true));
+        assert!(!authorized(&headers, "capability", true, false));
     }
 
     #[test]
@@ -523,7 +551,7 @@ mod tests {
             .body(Body::from("codex-body"))
             .unwrap();
         let codex_response =
-            forward(state.clone(), ClientKind::Codex, "/codex/v1", codex_request).await;
+            forward_loopback(state.clone(), ClientKind::Codex, "/codex/v1", codex_request).await;
         assert_eq!(codex_response.status(), StatusCode::ACCEPTED);
         assert!(!codex_response.headers().contains_key(header::CONNECTION));
         assert!(!codex_response.headers().contains_key("x-response-hop"));
@@ -557,7 +585,7 @@ mod tests {
             .body(Body::from("claude-body"))
             .unwrap();
         let claude_response =
-            forward(state.clone(), ClientKind::Claude, "/claude", claude_request).await;
+            forward_loopback(state.clone(), ClientKind::Claude, "/claude", claude_request).await;
         assert_eq!(claude_response.status(), StatusCode::ACCEPTED);
         let seen = requests.recv().await.unwrap();
         assert_eq!(seen.uri, "/anthropic/v1/messages?beta=true");
@@ -619,6 +647,7 @@ mod tests {
                 proxy_state(test.app.clone()),
                 ClientKind::Codex,
                 "/codex/v1",
+                loopback_peer(),
                 proxy_request(
                     "/codex/v1/responses?stream=true",
                     capability.expose_secret(),
@@ -724,7 +753,14 @@ mod tests {
         let first_request = proxy_request("/codex/v1/responses", capability.expose_secret());
         let first_state = state.clone();
         let first = tokio::spawn(async move {
-            forward(first_state, ClientKind::Codex, "/codex/v1", first_request).await
+            forward(
+                first_state,
+                ClientKind::Codex,
+                "/codex/v1",
+                loopback_peer(),
+                first_request,
+            )
+            .await
         });
         timeout(Duration::from_secs(2), arrived.notified())
             .await
@@ -748,6 +784,7 @@ mod tests {
             state,
             ClientKind::Codex,
             "/codex/v1",
+            loopback_peer(),
             proxy_request("/codex/v1/responses", capability.expose_secret()),
         )
         .await;

@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hsin_core::{
     AuthScheme, ClientAuthSettings, ClientKind, ClientSettings, ConnectionMode, LANGUAGE_EN_US,
@@ -99,7 +101,9 @@ pub(super) enum SettingsPage {
     Root,
     Proxy {
         selected: usize,
+        host: String,
         port: String,
+        editing_host: bool,
         editing_port: bool,
     },
     Language {
@@ -179,55 +183,7 @@ impl State {
                 providers,
                 status,
                 settings,
-            } => {
-                self.providers = providers;
-                self.status = status;
-                self.language = settings.language;
-                self.proxy_enabled = settings.proxy_enabled;
-                self.proxy_host = settings.proxy_host;
-                self.proxy_port = settings.proxy_port;
-                self.client_settings = settings.clients;
-                self.client_auth = settings.client_auth;
-                if !self.client_settings.visible.contains(&self.client)
-                    && let Some(client) = self.client_settings.visible_in_order().first().copied()
-                {
-                    self.client = client;
-                }
-                if let InputMode::Settings(SettingsScreen {
-                    page:
-                        SettingsPage::Proxy {
-                            port,
-                            editing_port: false,
-                            ..
-                        },
-                    ..
-                }) = &mut self.input
-                {
-                    *port = self.proxy_port.to_string();
-                }
-                if let InputMode::Settings(SettingsScreen {
-                    page:
-                        SettingsPage::ClientOrder {
-                            order,
-                            moving: false,
-                            ..
-                        },
-                    ..
-                }) = &mut self.input
-                {
-                    order.clone_from(&self.client_settings.order);
-                }
-                self.loading = false;
-                self.clamp_selection();
-                if let Some(active) = self.active_id()
-                    && let Some(index) = self
-                        .visible_providers()
-                        .iter()
-                        .position(|provider| provider.id == active)
-                {
-                    self.selected = index;
-                }
-            }
+            } => self.apply_loaded(providers, status, settings),
             Action::Notice(key) => {
                 self.notice = Some(format!("@{key}"));
                 self.loading = false;
@@ -274,6 +230,68 @@ impl State {
         Transition::Continue
     }
 
+    fn apply_loaded(
+        &mut self,
+        providers: Vec<Provider>,
+        status: StatusSnapshot,
+        settings: Settings,
+    ) {
+        self.providers = providers;
+        self.status = status;
+        self.language = settings.language;
+        self.proxy_enabled = settings.proxy_enabled;
+        self.proxy_host = settings.proxy_host;
+        self.proxy_port = settings.proxy_port;
+        self.client_settings = settings.clients;
+        self.client_auth = settings.client_auth;
+        if !self.client_settings.visible.contains(&self.client)
+            && let Some(client) = self.client_settings.visible_in_order().first().copied()
+        {
+            self.client = client;
+        }
+        if let InputMode::Settings(SettingsScreen {
+            page:
+                SettingsPage::Proxy {
+                    host,
+                    port,
+                    editing_host,
+                    editing_port,
+                    ..
+                },
+            ..
+        }) = &mut self.input
+        {
+            if !*editing_host {
+                host.clone_from(&self.proxy_host);
+            }
+            if !*editing_port {
+                *port = self.proxy_port.to_string();
+            }
+        }
+        if let InputMode::Settings(SettingsScreen {
+            page:
+                SettingsPage::ClientOrder {
+                    order,
+                    moving: false,
+                    ..
+                },
+            ..
+        }) = &mut self.input
+        {
+            order.clone_from(&self.client_settings.order);
+        }
+        self.loading = false;
+        self.clamp_selection();
+        if let Some(active) = self.active_id()
+            && let Some(index) = self
+                .visible_providers()
+                .iter()
+                .position(|provider| provider.id == active)
+        {
+            self.selected = index;
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn reduce_key(&mut self, key: KeyEvent) -> Transition {
         if matches!(&self.input, InputMode::Form(form) if form.discovering_models) {
@@ -281,6 +299,7 @@ impl State {
         }
         let current_mode = self.mode();
         let proxy_enabled = self.proxy_enabled;
+        let proxy_host = self.proxy_host.clone();
         let proxy_port = self.proxy_port;
         let client_settings = self.client_settings.clone();
         let client_auth = self.client_auth;
@@ -466,7 +485,9 @@ impl State {
                         0 => {
                             screen.page = SettingsPage::Proxy {
                                 selected: 0,
+                                host: proxy_host.clone(),
                                 port: proxy_port.to_string(),
+                                editing_host: false,
                                 editing_port: false,
                             };
                         }
@@ -483,10 +504,42 @@ impl State {
                 },
                 SettingsPage::Proxy {
                     selected,
+                    host,
                     port,
+                    editing_host,
                     editing_port,
                 } => {
-                    if *editing_port {
+                    if *editing_host {
+                        match key.code {
+                            KeyCode::Esc => {
+                                host.clone_from(&proxy_host);
+                                *editing_host = false;
+                            }
+                            KeyCode::Backspace => {
+                                host.pop();
+                            }
+                            KeyCode::Char(character)
+                                if (character.is_ascii_hexdigit()
+                                    || matches!(character, '.' | ':'))
+                                    && host.len() < 45 =>
+                            {
+                                host.push(character);
+                            }
+                            KeyCode::Enter => match host.trim().parse::<IpAddr>() {
+                                Ok(value) => {
+                                    let value = value.to_string();
+                                    host.clone_from(&value);
+                                    *editing_host = false;
+                                    if value != proxy_host {
+                                        self.pending_effect = Some(Effect::SetProxyHost(value));
+                                        self.loading = true;
+                                    }
+                                }
+                                Err(_) => self.notice = Some("@validation_proxy_address".into()),
+                            },
+                            _ => {}
+                        }
+                    } else if *editing_port {
                         match key.code {
                             KeyCode::Esc => {
                                 *port = proxy_port.to_string();
@@ -531,10 +584,8 @@ impl State {
                                         self.loading = true;
                                     }
                                     1 => {
-                                        self.notice = Some("@proxy_address_read_only".into());
-                                    }
-                                    _ if proxy_enabled => {
-                                        self.notice = Some("@proxy_port_disable_first".into());
+                                        *editing_host = true;
+                                        host.clear();
                                     }
                                     _ => {
                                         *editing_port = true;

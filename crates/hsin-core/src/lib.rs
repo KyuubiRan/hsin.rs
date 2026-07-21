@@ -12,7 +12,7 @@ use url::Url;
 pub const PROTOCOL_VERSION: u32 = 1;
 /// Monotonic CLI/daemon compatibility code. Bump when either side requires
 /// RPC fields or behavior that an older binary cannot provide.
-pub const VERSION_CODE: u32 = 16;
+pub const VERSION_CODE: u32 = 19;
 
 #[must_use]
 pub fn provider_name_from_url(value: &str) -> Option<String> {
@@ -548,6 +548,8 @@ impl Default for Settings {
 pub struct SettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
