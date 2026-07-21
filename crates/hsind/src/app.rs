@@ -954,7 +954,7 @@ impl App {
 
     fn ensure_codex_auth_backup(&self, path: &std::path::Path) -> Result<bool> {
         if let Some(snapshot) = self.codex_auth_backup()? {
-            if snapshot.auth_path != path.to_string_lossy() {
+            if std::path::Path::new(&snapshot.auth_path) != path {
                 return Err(DaemonError::Conflict(
                     "Codex auth backup belongs to a different CODEX_HOME".into(),
                 ));
@@ -988,7 +988,7 @@ impl App {
             let key = Self::managed_codex_auth_key(target, credential)?;
             config::apply_codex_auth(&auth_path, target.codex_auth_before_hash.as_deref(), key)?;
         } else if let Some(snapshot) = self.codex_auth_backup()? {
-            if snapshot.auth_path != auth_path.to_string_lossy() {
+            if std::path::Path::new(&snapshot.auth_path) != auth_path {
                 return Err(DaemonError::Conflict(
                     "Codex auth backup belongs to a different CODEX_HOME".into(),
                 ));
@@ -1024,7 +1024,7 @@ impl App {
         let Some(snapshot) = self.codex_auth_backup()? else {
             return Ok(true);
         };
-        if snapshot.auth_path != auth_path.to_string_lossy() {
+        if std::path::Path::new(&snapshot.auth_path) != auth_path {
             return Err(DaemonError::Conflict(
                 "Codex auth backup belongs to a different CODEX_HOME".into(),
             ));
@@ -2560,10 +2560,11 @@ mod tests {
         let helper_marker = root.join("helper-ran");
         fs::write(
             &claude,
-            format!(
-                "{{\"env\":{{\"ANTHROPIC_BASE_URL\":\"https://api.anthropic.com\"}},\"apiKeyHelper\":\"touch {}\"}}",
-                helper_marker.display()
-            ),
+            serde_json::to_vec(&json!({
+                "env": {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+                "apiKeyHelper": format!("touch {}", helper_marker.display()),
+            }))
+            .unwrap(),
         )
         .unwrap();
         let helper_import = app
