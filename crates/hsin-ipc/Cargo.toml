@@ -3,6 +3,9 @@ name = "hsin-ipc"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Versioned local JSON-RPC protocol and IPC transport for hsin"
 
 [dependencies]
 hsin-core = { path = "../hsin-core" }

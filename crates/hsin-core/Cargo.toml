@@ -3,6 +3,9 @@ name = "hsin-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Domain types, validation, and stable error codes for hsin"
 
 [lib]
 path = "src/lib.rs"
