@@ -112,6 +112,7 @@ try {
         Copy-Item -Force $Source (Join-Path $Output "$Binary$Suffix")
     }
     Copy-Item -Force (Join-Path $RepoRoot "README.md") (Join-Path $Output "README.md")
+    Copy-Item -Force (Join-Path $RepoRoot "LICENSE") (Join-Path $Output "LICENSE")
 
     Write-Host ""
     Write-Host "build outputs:"

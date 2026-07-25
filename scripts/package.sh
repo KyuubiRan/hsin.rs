@@ -15,6 +15,7 @@ mkdir -p "$root"
 cp "target/${target}/release/hsin" "$root/hsin"
 cp "target/${target}/release/hsind" "$root/hsind"
 cp README.md "$root/README.md"
+cp LICENSE "$root/LICENSE"
 
 binary_bytes="$(wc -c < "$root/hsin")"
 daemon_bytes="$(wc -c < "$root/hsind")"
@@ -30,4 +31,11 @@ size_kib="$(du -k "${root}.tar.gz" | awk '{print $1}')"
 if [ "$size_kib" -gt 15360 ]; then
   echo "release archive exceeds 15 MiB: ${size_kib} KiB" >&2
   exit 1
+fi
+
+archive="$(basename "${root}.tar.gz")"
+if command -v sha256sum >/dev/null 2>&1; then
+  (cd dist && sha256sum "$archive" >"${archive}.sha256")
+else
+  (cd dist && shasum -a 256 "$archive" >"${archive}.sha256")
 fi

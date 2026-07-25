@@ -198,6 +198,7 @@ for binary in hsin hsind; do
 done
 
 cp -f -- "$repo_root/README.md" "$output/README.md"
+cp -f -- "$repo_root/LICENSE" "$output/LICENSE"
 
 echo
 echo "build outputs:"
