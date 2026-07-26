@@ -24,10 +24,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             archive: tar
-          - os: macos-13
+          # GitHub retired every Intel macOS runner, so this target is built on
+          # an Apple Silicon runner. Rosetta 2 still runs the result, which keeps
+          # the --version smoke test meaningful.
+          - os: macos-15
             target: x86_64-apple-darwin
             archive: tar
           - os: ubuntu-24.04
@@ -46,6 +49,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
       - run: cargo build --release --target ${{ matrix.target }} --workspace
       - if: runner.os != 'Windows'
         run: |
