@@ -52,6 +52,7 @@ try {
             "linux-arm64" { "aarch64-unknown-linux-gnu" }
             "linux-x64" { "x86_64-unknown-linux-gnu" }
             { $_ -in "windows-x64", "win-x64" } { "x86_64-pc-windows-msvc" }
+            { $_ -in "windows-arm64", "win-arm64" } { "aarch64-pc-windows-msvc" }
             default { $Platform }
         }
     }

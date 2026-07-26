@@ -14,6 +14,7 @@ Platforms:
   linux-arm64     aarch64-unknown-linux-gnu
   linux-x64       x86_64-unknown-linux-gnu
   windows-x64     x86_64-pc-windows-msvc
+  windows-arm64   aarch64-pc-windows-msvc
   <target-triple> Any installed Rust target triple
 
 Options:
@@ -121,6 +122,7 @@ if [ -z "$target" ]; then
     linux-arm64) target=aarch64-unknown-linux-gnu ;;
     linux-x64) target=x86_64-unknown-linux-gnu ;;
     windows-x64|win-x64) target=x86_64-pc-windows-msvc ;;
+    windows-arm64|win-arm64) target=aarch64-pc-windows-msvc ;;
     *) target=$platform ;;
   esac
 fi

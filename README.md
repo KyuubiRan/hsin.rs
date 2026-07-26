@@ -45,6 +45,7 @@ Release archives are produced for:
 - `aarch64-unknown-linux-gnu`
 - `x86_64-unknown-linux-gnu`
 - `x86_64-pc-windows-msvc`
+- `aarch64-pc-windows-msvc`
 
 Intel macOS has no published archive because GitHub retired its Intel macOS
 runners. `scripts/build.sh` still builds `x86_64-apple-darwin` locally.
