@@ -27,12 +27,6 @@ jobs:
           - os: macos-15
             target: aarch64-apple-darwin
             archive: tar
-          # GitHub retired every Intel macOS runner, so this target is built on
-          # an Apple Silicon runner. Rosetta 2 still runs the result, which keeps
-          # the --version smoke test meaningful.
-          - os: macos-15
-            target: x86_64-apple-darwin
-            archive: tar
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             archive: tar
