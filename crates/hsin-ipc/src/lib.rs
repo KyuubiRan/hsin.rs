@@ -500,7 +500,7 @@ fn resolve_endpoint(
             .filter(|value| value != &default_home)
             .map(|value| home_scope(&value))
             .map_or_else(String::new, |value| format!("-{value}"));
-        IpcEndpoint::Namespaced(format!("hsin-{user}{scope}-hsind"))
+        IpcEndpoint::Namespaced(format!("{DATA_DIR_NAME}-{user}{scope}-hsind"))
     }
     #[cfg(not(windows))]
     {
@@ -515,6 +515,17 @@ fn resolve_endpoint(
     }
 }
 
+/// Directory name for the data home.
+///
+/// Debug builds use a separate directory so a development daemon never shares
+/// storage, keyring entries, the IPC endpoint, or the installed service
+/// identity with a release build installed on the same machine.
+pub const DATA_DIR_NAME: &str = if cfg!(debug_assertions) {
+    "hsin-debug"
+} else {
+    "hsin"
+};
+
 fn platform_data_home(
     xdg_data: Option<&OsStr>,
     local_app_data: Option<&OsStr>,
@@ -523,16 +534,17 @@ fn platform_data_home(
     #[cfg(windows)]
     {
         let _ = (xdg_data, home);
-        local_app_data
-            .map(PathBuf::from)
-            .map_or_else(|| PathBuf::from(r"C:\hsin"), |path| path.join("hsin"))
+        local_app_data.map(PathBuf::from).map_or_else(
+            || PathBuf::from(r"C:\").join(DATA_DIR_NAME),
+            |path| path.join(DATA_DIR_NAME),
+        )
     }
     #[cfg(target_os = "macos")]
     {
         let _ = (xdg_data, local_app_data);
         home.map(PathBuf::from).map_or_else(
-            || PathBuf::from("/tmp/hsin"),
-            |path| path.join("Library/Application Support/hsin"),
+            || PathBuf::from("/tmp").join(DATA_DIR_NAME),
+            |path| path.join("Library/Application Support").join(DATA_DIR_NAME),
         )
     }
     #[cfg(all(not(windows), not(target_os = "macos")))]
@@ -540,12 +552,12 @@ fn platform_data_home(
         let _ = local_app_data;
         xdg_data
             .map(PathBuf::from)
-            .map(|path| path.join("hsin"))
+            .map(|path| path.join(DATA_DIR_NAME))
             .or_else(|| {
                 home.map(PathBuf::from)
-                    .map(|path| path.join(".local/share/hsin"))
+                    .map(|path| path.join(".local/share").join(DATA_DIR_NAME))
             })
-            .unwrap_or_else(|| PathBuf::from("/tmp/hsin"))
+            .unwrap_or_else(|| PathBuf::from("/tmp").join(DATA_DIR_NAME))
     }
 }
 
@@ -927,10 +939,37 @@ mod tests {
         assert_eq!(
             endpoint,
             IpcEndpoint::Namespaced(format!(
-                "hsin-test-{}-hsind",
+                "{DATA_DIR_NAME}-test-{}-hsind",
                 home_scope(Path::new("/custom/hsin"))
             ))
         );
+    }
+
+    #[test]
+    fn debug_builds_never_share_a_data_home_with_release_builds() {
+        // A development daemon must not touch the storage, keyring entries, IPC
+        // endpoint, or service identity of an installed release build, so the
+        // directory name differs by profile.
+        assert_eq!(
+            DATA_DIR_NAME,
+            if cfg!(debug_assertions) {
+                "hsin-debug"
+            } else {
+                "hsin"
+            }
+        );
+
+        let home = platform_data_home(
+            None,
+            Some(OsStr::new(r"C:\Users\t\AppData\Local")),
+            Some(OsStr::new("/home/test")),
+        );
+        assert!(
+            home.ends_with(DATA_DIR_NAME),
+            "data home {} must end with {DATA_DIR_NAME}",
+            home.display()
+        );
+        assert_eq!(home.ends_with("hsin-debug"), cfg!(debug_assertions));
     }
 
     #[test]
