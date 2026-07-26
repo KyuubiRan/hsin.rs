@@ -158,14 +158,3 @@ pub(super) fn centered_fixed(area: Rect, width: u16, height: u16) -> Rect {
         ])
         .split(vertical[1])[1]
 }
-
-pub(super) fn bottom_centered_fixed(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width);
-    let height = height.min(area.height);
-    Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.bottom().saturating_sub(height),
-        width,
-        height,
-    }
-}

@@ -11,7 +11,7 @@ use crate::i18n::I18n;
 use super::super::{
     state::ProviderForm,
     theme::{INPUT_BG, MUTED, RED, WHITE},
-    widgets::{bottom_centered_fixed, content_width, display_width, draw_input_field},
+    widgets::{centered_fixed, content_width, display_width, draw_input_field},
 };
 
 const FORM_FIELD_COUNT: usize = 5;
@@ -50,7 +50,7 @@ pub(super) fn draw_form(frame: &mut Frame<'_>, area: Rect, form: &ProviderForm, 
     let width = content_width(area, longest, 64, 100)
         .max(proportional_width)
         .min(area.width);
-    let popup = bottom_centered_fixed(area, width, FORM_POPUP_HEIGHT);
+    let popup = centered_fixed(area, width, FORM_POPUP_HEIGHT);
     frame.render_widget(Clear, popup);
     let title = form_title(form, i18n);
     let block = Block::default()

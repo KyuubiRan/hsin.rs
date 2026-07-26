@@ -18,7 +18,7 @@ use super::{
         SettingsPage, SettingsScreen, take_form_submission,
     },
     theme::{INPUT_BG, RED, WHITE},
-    widgets::bottom_centered_fixed,
+    widgets::centered_fixed,
 };
 
 fn key(code: KeyCode) -> Action {
@@ -691,13 +691,36 @@ fn control_h_toggles_api_key_visibility() {
 
 #[test]
 fn form_fields_keep_equal_content_height() {
-    let popup = bottom_centered_fixed(Rect::new(0, 0, 100, 20), 80, 17);
+    let popup = centered_fixed(Rect::new(0, 0, 100, 20), 80, 17);
     let inner = Block::default().borders(Borders::ALL).inner(popup);
     let fields = form_field_areas(inner, 0);
     assert_eq!(fields.len(), 5);
     assert!(fields.iter().all(|(_, field)| field.height == 3));
-    assert_eq!(popup.y, 3);
+    // The dialog is centered, so the gap above it matches the gap below.
+    assert_eq!(popup.y, 1);
+    assert_eq!(popup.y + popup.height, 18);
     assert_eq!(popup.width, 80);
+}
+
+#[test]
+fn dialogs_stay_centered_as_the_terminal_grows() {
+    // A taller terminal must keep the dialog centered rather than pinning it to
+    // an edge, so the space above and below stays balanced.
+    for height in [20, 40, 60] {
+        let popup = centered_fixed(Rect::new(0, 0, 120, height), 80, 17);
+        let above = popup.y;
+        let below = height - (popup.y + popup.height);
+        assert!(
+            above.abs_diff(below) <= 1,
+            "height {height}: {above} above vs {below} below"
+        );
+        let left = popup.x;
+        let right = 120 - (popup.x + popup.width);
+        assert!(
+            left.abs_diff(right) <= 1,
+            "height {height}: {left} left vs {right} right"
+        );
+    }
 }
 
 #[test]
