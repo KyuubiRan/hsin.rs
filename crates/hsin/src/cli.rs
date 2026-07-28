@@ -19,6 +19,10 @@ pub struct Cli {
     #[arg(long, global = true, env = "HSIN_LANGUAGE")]
     pub language: Option<String>,
 
+    /// Run without the background daemon (direct connection mode only).
+    #[arg(long, global = true, env = "HSIN_NO_DAEMON")]
+    pub no_daemon: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }

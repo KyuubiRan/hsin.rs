@@ -16,6 +16,14 @@ The proxy listening IP and port are daemon-owned settings. They can be changed w
 
 The only client-side bootstrap operation is launching `hsind service install --start` when the local IPC endpoint is absent. All provider, settings and security operations require a successful protocol handshake.
 
+## Standalone (daemon-less) mode
+
+For headless or single-binary deployments, `hsin` can embed the daemon core in-process instead of talking to `hsind`. Standalone mode activates when `--no-daemon` (or `HSIN_NO_DAEMON=true`) is set, or automatically when no `hsind` binary is deployed next to the CLI. The embedded core acquires the same exclusive instance lock as `hsind`, so state ownership stays unique: if a daemon is running, the IPC path is used; if the lock is held but IPC is unreachable, standalone mode refuses to start. Proxy mode requires the persistent daemon listener and is rejected in standalone mode with `proxy_requires_daemon`; direct mode, provider management, security, and credential-helper operations are fully supported.
+
+## Key store backends
+
+The master key lives in the operating-system keyring by default. Headless hosts without a keyring service can opt into a file-backed store (`HSIN_KEYSTORE=file`, or `hsind run --keystore file`) that keeps the master key in a user-only file under `<data home>/keys`; provider secrets remain encrypted in SQLite either way.
+
 ## Configuration ownership
 
 - Codex: `model_provider` and the `model_providers.hsin` subtree.

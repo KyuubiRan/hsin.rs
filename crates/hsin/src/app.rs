@@ -20,7 +20,7 @@ use crate::{
 pub async fn run(cli: Cli, i18n: &mut I18n) -> Result<()> {
     let language_overridden = cli.language.is_some();
     let Some(command) = cli.command else {
-        let client = DaemonClient::connect_or_bootstrap().await?;
+        let client = DaemonClient::connect_or_bootstrap(cli.no_daemon).await?;
         synchronize_language(&client, i18n, language_overridden).await;
         return tui::run(client, i18n, !language_overridden).await;
     };
@@ -29,7 +29,7 @@ pub async fn run(cli: Cli, i18n: &mut I18n) -> Result<()> {
         return run_daemon_command(command, cli.json).await;
     }
 
-    let client = DaemonClient::connect_or_bootstrap().await?;
+    let client = DaemonClient::connect_or_bootstrap(cli.no_daemon).await?;
     synchronize_language(&client, i18n, language_overridden).await;
     match command {
         Command::Provider { command } => run_provider(command, &client, cli.json).await,

@@ -12,7 +12,7 @@ use url::Url;
 pub const PROTOCOL_VERSION: u32 = 1;
 /// Monotonic CLI/daemon compatibility code. Bump when either side requires
 /// RPC fields or behavior that an older binary cannot provide.
-pub const VERSION_CODE: u32 = 20;
+pub const VERSION_CODE: u32 = 21;
 
 #[must_use]
 pub fn provider_name_from_url(value: &str) -> Option<String> {
@@ -616,6 +616,7 @@ pub enum ErrorCode {
     Timeout,
     DaemonUnavailable,
     OAuthProxyUnsupported,
+    ProxyRequiresDaemon,
     NoActiveProvider,
     CurrentCredentialUnavailable,
     Internal,
@@ -640,6 +641,7 @@ impl ErrorCode {
             Self::Timeout => "timeout",
             Self::DaemonUnavailable => "daemon_unavailable",
             Self::OAuthProxyUnsupported => "oauth_proxy_unsupported",
+            Self::ProxyRequiresDaemon => "proxy_requires_daemon",
             Self::NoActiveProvider => "no_active_provider",
             Self::CurrentCredentialUnavailable => "current_credential_unavailable",
             Self::Internal => "internal",

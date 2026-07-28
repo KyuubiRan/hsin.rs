@@ -44,7 +44,7 @@ fn client_host_for_listener(host: IpAddr) -> IpAddr {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ProxyRuntimeConfig {
+pub struct ProxyRuntimeConfig {
     pub enabled: bool,
     pub address: SocketAddr,
     pub revision: u64,
@@ -184,7 +184,7 @@ impl App {
         self.shutdown.notified().await;
     }
 
-    pub(crate) fn initialize_providers(&self) -> Result<()> {
+    pub fn initialize_providers(&self) -> Result<()> {
         if self.db.setting("providers_initialized_v1")?.as_deref() == Some("true") {
             return Ok(());
         }
@@ -217,7 +217,7 @@ impl App {
         self.db.set_setting("providers_initialized_v1", "true")
     }
 
-    pub(crate) fn reconcile_client_auth_configuration(&self) -> Result<()> {
+    pub fn reconcile_client_auth_configuration(&self) -> Result<()> {
         let state = self.db.client_state(ClientKind::Codex)?;
         let Some(provider_id) = state.active_provider_id else {
             return Ok(());
@@ -1325,7 +1325,7 @@ impl App {
         self.db.set_setting("proxy_port", &port.to_string())
     }
 
-    pub(crate) fn reconcile_proxy_configurations(&self) -> Result<()> {
+    pub fn reconcile_proxy_configurations(&self) -> Result<()> {
         for client in ClientKind::ALL {
             let state = self.db.client_state(client)?;
             if state.mode != ConnectionMode::Proxy {

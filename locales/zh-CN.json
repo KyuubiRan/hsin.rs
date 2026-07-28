@@ -9,6 +9,7 @@
   "cli.value.command": "命令",
   "cli.arg.json": "输出便于程序处理的 JSON",
   "cli.arg.language": "覆盖界面语言（system、en-US 或 zh-CN）",
+  "cli.arg.no_daemon": "不使用后台守护进程运行（仅支持 direct 直连模式）",
   "cli.arg.help": "显示帮助",
   "cli.arg.version": "显示版本",
   "cli.arg.subcommand": "显示指定子命令的帮助",
@@ -223,6 +224,7 @@
   "error.timeout": "操作超时",
   "error.daemon_unavailable": "后台服务不可用",
   "error.oauth_proxy_unsupported": "Official OAuth 使用客户端原生登录状态，不能通过本地代理转发",
+  "error.proxy_requires_daemon": "代理模式需要 hsind 守护进程；standalone 模式仅支持 direct 直连",
   "error.no_active_provider": "请先配置或导入 Provider，再切换代理模式",
   "error.current_credential_unavailable": "当前配置没有可导入的 API Key",
   "error.internal": "daemon 发生内部错误"

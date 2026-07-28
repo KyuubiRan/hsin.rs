@@ -9,6 +9,7 @@
   "cli.value.command": "COMMAND",
   "cli.arg.json": "Print machine-readable JSON",
   "cli.arg.language": "Override the UI language (system, en-US, or zh-CN)",
+  "cli.arg.no_daemon": "Run without the background daemon (direct connection mode only)",
   "cli.arg.help": "Print help",
   "cli.arg.version": "Print version",
   "cli.arg.subcommand": "Print help for the selected subcommand",
@@ -223,6 +224,7 @@
   "error.timeout": "The operation timed out",
   "error.daemon_unavailable": "The daemon is unavailable",
   "error.oauth_proxy_unsupported": "Official OAuth providers use the client's native session and cannot use the local proxy",
+  "error.proxy_requires_daemon": "Proxy mode needs the hsind daemon; standalone mode supports direct connections only",
   "error.no_active_provider": "Configure or import a Provider before changing proxy mode",
   "error.current_credential_unavailable": "The current configuration does not expose an API key that can be imported",
   "error.internal": "An internal daemon error occurred"

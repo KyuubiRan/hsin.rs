@@ -19,6 +19,27 @@ cargo test --workspace
 
 Run `hsind run` during development, then open the TUI with `hsin` or use the scriptable commands exposed by `hsin --help`.
 
+## Headless and daemon-less operation
+
+Two independent switches support servers, containers, and other headless
+environments:
+
+- `hsin --no-daemon …` (or `HSIN_NO_DAEMON=true`) runs the daemon core inside
+  the CLI process, so no `hsind` service needs to be installed. When the
+  `hsind` binary is not deployed next to `hsin` at all, this fallback engages
+  automatically, making single-binary installs work out of the box. Standalone
+  mode supports direct connection mode only; proxy mode still requires the
+  daemon.
+- `HSIN_KEYSTORE=file` (or `hsind run --keystore file`) stores the encryption
+  master key in a user-only file under the hsin data directory instead of the
+  OS keyring, for hosts without a keyring service. Provider secrets remain
+  encrypted in SQLite. The default (`system`) keeps using the OS keyring.
+
+```bash
+# fully headless, single binary, no keyring service required
+HSIN_KEYSTORE=file hsin --no-daemon provider list
+```
+
 For frequent local builds, use the host-aware helper. It defaults to a native
 debug build and copies `hsin` and `hsind` into one directory under `artifacts/`:
 

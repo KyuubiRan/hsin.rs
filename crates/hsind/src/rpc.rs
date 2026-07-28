@@ -128,7 +128,7 @@ async fn serve_connection(
     }
 }
 
-async fn dispatch(
+pub async fn dispatch(
     app: Arc<App>,
     id: u64,
     method_name: &str,

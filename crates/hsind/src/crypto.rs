@@ -1,4 +1,7 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chacha20poly1305::{
@@ -77,6 +80,130 @@ impl KeyStore for SystemKeyStore {
         match self.entry(version)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(error) => Err(DaemonError::Keyring(error.to_string())),
+        }
+    }
+}
+
+/// Master-key store backend selection.
+///
+/// `File` keeps provider secrets encrypted in `SQLite` but stores the master
+/// key in a user-only file inside the hsin data directory instead of the
+/// operating-system keyring. It is an explicit opt-in for headless hosts
+/// (servers, containers, CI) where no keyring service is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyStoreKind {
+    #[default]
+    System,
+    File,
+}
+
+impl KeyStoreKind {
+    pub const ENV: &'static str = "HSIN_KEYSTORE";
+
+    /// Resolve the backend from the `HSIN_KEYSTORE` environment variable.
+    pub fn from_env() -> Result<Self> {
+        match std::env::var(Self::ENV) {
+            Ok(value) => value.parse(),
+            Err(std::env::VarError::NotPresent) => Ok(Self::System),
+            Err(std::env::VarError::NotUnicode(_)) => Err(DaemonError::Invalid(format!(
+                "{} contains invalid characters",
+                Self::ENV
+            ))),
+        }
+    }
+
+    pub fn open(self, home: &Path) -> Arc<dyn KeyStore> {
+        match self {
+            Self::System => Arc::new(SystemKeyStore::for_home(home)),
+            Self::File => Arc::new(FileKeyStore::for_home(home)),
+        }
+    }
+}
+
+impl std::str::FromStr for KeyStoreKind {
+    type Err = DaemonError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "system" | "keyring" => Ok(Self::System),
+            "file" => Ok(Self::File),
+            other => Err(DaemonError::Invalid(format!(
+                "unknown key store backend {other:?}; expected system or file"
+            ))),
+        }
+    }
+}
+
+/// Stores master keys in user-only files under `<data home>/keys`.
+///
+/// The keys directory and each key file are restricted to the current user.
+/// Anyone able to read these files can decrypt stored provider credentials,
+/// which matches the trust boundary of the user-only data directory itself.
+pub struct FileKeyStore {
+    directory: PathBuf,
+}
+
+impl FileKeyStore {
+    pub fn for_home(home: &Path) -> Self {
+        Self {
+            directory: home.join("keys"),
+        }
+    }
+
+    fn key_path(&self, version: u32) -> PathBuf {
+        self.directory.join(format!("master-key-v{version}"))
+    }
+
+    fn prepare_directory(&self) -> Result<()> {
+        std::fs::create_dir_all(&self.directory)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.directory, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+}
+
+impl KeyStore for FileKeyStore {
+    fn load(&self, version: u32) -> Result<Option<String>> {
+        match std::fs::read_to_string(self.key_path(version)) {
+            Ok(value) => Ok(Some(value.trim().to_owned())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(DaemonError::Keyring(format!(
+                "file key store read failed: {error}"
+            ))),
+        }
+    }
+
+    fn store(&self, version: u32, value: &str) -> Result<()> {
+        use std::io::Write;
+
+        self.prepare_directory()?;
+        let path = self.key_path(version);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path).map_err(|error| {
+            DaemonError::Keyring(format!("file key store write failed: {error}"))
+        })?;
+        file.write_all(value.as_bytes())
+            .and_then(|()| file.write_all(b"\n"))
+            .and_then(|()| file.sync_all())
+            .map_err(|error| DaemonError::Keyring(format!("file key store write failed: {error}")))
+    }
+
+    fn delete(&self, version: u32) -> Result<()> {
+        match std::fs::remove_file(self.key_path(version)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(DaemonError::Keyring(format!(
+                "file key store delete failed: {error}"
+            ))),
         }
     }
 }
@@ -502,6 +629,64 @@ mod tests {
             self.0.lock().remove(&version);
             Ok(())
         }
+    }
+
+    #[test]
+    fn key_store_kind_parses_backend_names() {
+        assert_eq!(
+            "system".parse::<KeyStoreKind>().unwrap(),
+            KeyStoreKind::System
+        );
+        assert_eq!(
+            "keyring".parse::<KeyStoreKind>().unwrap(),
+            KeyStoreKind::System
+        );
+        assert_eq!(
+            " FILE ".parse::<KeyStoreKind>().unwrap(),
+            KeyStoreKind::File
+        );
+        assert!("plaintext".parse::<KeyStoreKind>().is_err());
+    }
+
+    #[test]
+    fn file_key_store_round_trips_and_restricts_permissions() {
+        let root = std::env::temp_dir().join(format!("hsind-filestore-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let store = FileKeyStore::for_home(&root);
+        assert_eq!(store.load(1).unwrap(), None);
+        store.store(1, "key-material").unwrap();
+        assert_eq!(store.load(1).unwrap().as_deref(), Some("key-material"));
+        store.store(1, "rotated").unwrap();
+        assert_eq!(store.load(1).unwrap().as_deref(), Some("rotated"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(root.join("keys"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        store.delete(1).unwrap();
+        store.delete(1).unwrap();
+        assert_eq!(store.load(1).unwrap(), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn crypto_manager_works_with_the_file_key_store() {
+        let root = std::env::temp_dir().join(format!("hsind-filecrypto-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let db = Arc::new(Database::open(&root.join("db"), &root.join("backups")).unwrap());
+        let crypto =
+            CryptoManager::initialize(db.clone(), Arc::new(FileKeyStore::for_home(&root))).unwrap();
+        assert!(crypto.is_unlocked());
+        drop(crypto);
+        let reopened =
+            CryptoManager::initialize(db, Arc::new(FileKeyStore::for_home(&root))).unwrap();
+        assert!(reopened.is_unlocked());
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

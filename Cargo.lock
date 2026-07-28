@@ -1094,6 +1094,7 @@ dependencies = [
  "futures-util",
  "hsin-core",
  "hsin-ipc",
+ "hsind",
  "ratatui",
  "serde",
  "serde_json",

@@ -11,6 +11,12 @@ pub async fn install_and_start() -> Result<()> {
     run_service(&["install", "--start"]).await
 }
 
+/// Whether a daemon binary is deployed next to this CLI (or via `HSIND_PATH`).
+/// Single-binary installs without `hsind` run in standalone mode instead.
+pub fn daemon_available() -> bool {
+    sibling_daemon().is_ok()
+}
+
 pub async fn service_status() -> Result<bool> {
     let daemon = sibling_daemon()?;
     let output = Command::new(&daemon)

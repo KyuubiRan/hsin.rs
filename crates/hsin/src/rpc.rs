@@ -1,8 +1,15 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow};
 use hsin_core::{
-    ClientKind, ConnectionMode, DaemonStatus, ErrorCode, Provider, ProviderListParams,
+    AppError, ClientKind, ConnectionMode, DaemonStatus, ErrorCode, ModeSetParams, Provider,
+    ProviderListParams, SettingsPatch,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -49,7 +56,83 @@ const fn direct() -> ConnectionMode {
 }
 
 pub struct DaemonClient {
-    inner: tokio::sync::Mutex<hsin_ipc::IpcClient>,
+    backend: Backend,
+}
+
+enum Backend {
+    Remote(tokio::sync::Mutex<hsin_ipc::IpcClient>),
+    Embedded(Embedded),
+}
+
+/// In-process daemon core for standalone (daemon-less) operation. It owns the
+/// same exclusive instance lock as `hsind`, so state ownership stays unique.
+/// Proxy mode requires a persistent listener and is rejected here.
+struct Embedded {
+    app: Arc<hsind::app::App>,
+    _guard: hsind::paths::InstanceGuard,
+    next_id: AtomicU64,
+}
+
+impl Embedded {
+    fn open() -> Result<Self> {
+        let paths = hsind::paths::Paths::discover();
+        paths.prepare().map_err(|error| daemon_error(&error))?;
+        let guard = hsind::paths::InstanceGuard::acquire(&paths.lock).map_err(|_| {
+            anyhow!(
+                "hsind appears to be running but its IPC endpoint is unreachable; \
+                 standalone mode cannot open the shared state"
+            )
+        })?;
+        let store = hsind::crypto::KeyStoreKind::from_env()
+            .map_err(|error| daemon_error(&error))?
+            .open(&paths.home);
+        let app = hsind::app::App::open_with_store(&paths, store)
+            .map_err(|error| daemon_error(&error))?;
+        app.recover_operations()
+            .map_err(|error| daemon_error(&error))?;
+        app.initialize_providers()
+            .map_err(|error| daemon_error(&error))?;
+        app.reconcile_client_auth_configuration()
+            .map_err(|error| daemon_error(&error))?;
+        Ok(Self {
+            app,
+            _guard: guard,
+            next_id: AtomicU64::new(1),
+        })
+    }
+
+    async fn call(&self, method: &str, params: Value) -> Result<Value> {
+        reject_proxy_request(method, &params)?;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        hsind::rpc::dispatch(self.app.clone(), id, method, params)
+            .await
+            .into_result()
+            .map_err(|error| anyhow::Error::new(hsin_ipc::TransportError::Rpc(error)))
+    }
+}
+
+fn daemon_error(error: &hsind::error::DaemonError) -> anyhow::Error {
+    anyhow::Error::new(hsin_ipc::TransportError::Rpc(
+        hsin_ipc::RpcError::application(AppError::from(error)),
+    ))
+}
+
+/// Proxy mode needs the long-lived `hsind` listener; a standalone CLI process
+/// exits after each command, so enabling it here would break the clients.
+fn reject_proxy_request(method: &str, params: &Value) -> Result<()> {
+    let rejected = match method {
+        "mode.set" => serde_json::from_value::<ModeSetParams>(params.clone())
+            .is_ok_and(|request| request.mode == ConnectionMode::Proxy),
+        "settings.set" => serde_json::from_value::<SettingsPatch>(params.clone())
+            .is_ok_and(|patch| patch.proxy_enabled == Some(true)),
+        _ => false,
+    };
+    if rejected {
+        return Err(anyhow::Error::new(hsin_ipc::TransportError::Rpc(
+            hsin_ipc::RpcError::application(AppError::new(ErrorCode::ProxyRequiresDaemon)),
+        )));
+    }
+    Ok(())
 }
 
 impl DaemonClient {
@@ -65,15 +148,30 @@ impl DaemonClient {
             .await
             .context("negotiate hsind protocol")?;
         Ok(Self {
-            inner: tokio::sync::Mutex::new(inner),
+            backend: Backend::Remote(tokio::sync::Mutex::new(inner)),
         })
     }
 
-    pub async fn connect_or_bootstrap() -> Result<Self> {
+    /// Open the daemon core in-process, without a running `hsind`.
+    pub fn open_standalone() -> Result<Self> {
+        Ok(Self {
+            backend: Backend::Embedded(Embedded::open()?),
+        })
+    }
+
+    pub async fn connect_or_bootstrap(no_daemon: bool) -> Result<Self> {
         let initial_error = match Self::connect().await {
             Ok(client) => return Ok(client),
             Err(error) => error,
         };
+
+        // Standalone fallback: explicit opt-in, or a deployment that never
+        // shipped the hsind binary (single-binary headless installs).
+        if no_daemon || !bootstrap::daemon_available() {
+            return Self::open_standalone().with_context(|| {
+                format!("hsind is unavailable ({initial_error:#}) and standalone mode failed")
+            });
+        }
 
         if requires_reinstall(&initial_error) {
             bootstrap::install_and_start().await?;
@@ -119,12 +217,23 @@ impl DaemonClient {
         P: Serialize + ?Sized,
         R: DeserializeOwned,
     {
-        self.inner
-            .lock()
-            .await
-            .call(method, params)
-            .await
-            .with_context(|| format!("RPC {method} failed"))
+        match &self.backend {
+            Backend::Remote(inner) => inner
+                .lock()
+                .await
+                .call(method, params)
+                .await
+                .with_context(|| format!("RPC {method} failed")),
+            Backend::Embedded(embedded) => {
+                let params = serde_json::to_value(params)
+                    .with_context(|| format!("encode {method} parameters"))?;
+                let value = embedded
+                    .call(method, params)
+                    .await
+                    .with_context(|| format!("RPC {method} failed"))?;
+                serde_json::from_value(value).with_context(|| format!("decode {method} response"))
+            }
+        }
     }
 
     pub async fn provider_list(&self, client: Option<ClientKind>) -> Result<Vec<Provider>> {
@@ -234,6 +343,28 @@ fn decode_client_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standalone_mode_rejects_proxy_operations_with_a_stable_code() {
+        let rejects = |method: &str, params: Value| {
+            let error = reject_proxy_request(method, &params).expect_err("must be rejected");
+            let rpc = error
+                .downcast_ref::<hsin_ipc::TransportError>()
+                .and_then(|transport| match transport {
+                    hsin_ipc::TransportError::Rpc(rpc) => rpc.data.as_ref(),
+                    _ => None,
+                })
+                .expect("application error payload");
+            assert_eq!(rpc.code, ErrorCode::ProxyRequiresDaemon);
+        };
+        rejects("mode.set", json!({"client": "codex", "mode": "proxy"}));
+        rejects("settings.set", json!({"proxy_enabled": true}));
+        assert!(
+            reject_proxy_request("mode.set", &json!({"client": "codex", "mode": "direct"})).is_ok()
+        );
+        assert!(reject_proxy_request("settings.set", &json!({"proxy_enabled": false})).is_ok());
+        assert!(reject_proxy_request("provider.list", &json!({})).is_ok());
+    }
 
     #[test]
     fn only_compatibility_failures_require_daemon_reinstallation() {

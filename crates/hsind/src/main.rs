@@ -1,17 +1,8 @@
-mod app;
-mod config;
-mod crypto;
-mod db;
-mod error;
-mod model;
-mod paths;
-mod proxy;
-mod rpc;
-mod service;
-
 use clap::{Parser, Subcommand};
-use error::Result;
-use paths::{InstanceGuard, Paths};
+use hsind::crypto::KeyStoreKind;
+use hsind::error::{self, Result};
+use hsind::paths::{InstanceGuard, Paths};
+use hsind::{app, proxy, rpc, service};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -24,7 +15,13 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the daemon in the foreground.
-    Run,
+    Run {
+        /// Master-key store backend: system (OS keyring) or file
+        /// (key file inside the hsin data directory, for headless hosts).
+        /// Defaults to the `HSIN_KEYSTORE` environment variable, then system.
+        #[arg(long, value_enum)]
+        keystore: Option<KeyStoreArg>,
+    },
     /// Install and control the per-user daemon service.
     Service {
         #[command(subcommand)]
@@ -62,9 +59,30 @@ async fn main() {
     }
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum KeyStoreArg {
+    System,
+    File,
+}
+
+impl From<KeyStoreArg> for KeyStoreKind {
+    fn from(value: KeyStoreArg) -> Self {
+        match value {
+            KeyStoreArg::System => Self::System,
+            KeyStoreArg::File => Self::File,
+        }
+    }
+}
+
 async fn execute(cli: Cli) -> Result<()> {
-    match cli.command.unwrap_or(Command::Run) {
-        Command::Run => run().await,
+    match cli.command.unwrap_or(Command::Run { keystore: None }) {
+        Command::Run { keystore } => {
+            let keystore = match keystore {
+                Some(kind) => kind.into(),
+                None => KeyStoreKind::from_env()?,
+            };
+            run(keystore).await
+        }
         Command::Service { command } => {
             match command {
                 ServiceCommand::Install { start } => service::install(start)?,
@@ -85,11 +103,11 @@ async fn execute(cli: Cli) -> Result<()> {
     }
 }
 
-async fn run() -> Result<()> {
+async fn run(keystore: KeyStoreKind) -> Result<()> {
     let paths = Paths::discover();
     paths.prepare()?;
     let _instance = InstanceGuard::acquire(&paths.lock)?;
-    let app = app::App::open(&paths)?;
+    let app = app::App::open_with_store(&paths, keystore.open(&paths.home))?;
     app.recover_operations()?;
     app.initialize_providers()?;
     app.reconcile_client_auth_configuration()?;
