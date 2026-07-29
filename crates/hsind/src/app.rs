@@ -53,6 +53,7 @@ pub struct ProxyRuntimeConfig {
 pub struct App {
     pub db: Arc<Database>,
     pub crypto: Arc<CryptoManager>,
+    proxy_runtime_available: bool,
     mutation: Mutex<()>,
     credential_command: PathBuf,
     proxy_listening: AtomicBool,
@@ -86,6 +87,21 @@ impl App {
     }
 
     pub fn open_with_store(paths: &Paths, store: Arc<dyn KeyStore>) -> Result<Arc<Self>> {
+        Self::open_with_store_and_proxy_runtime(paths, store, true)
+    }
+
+    pub fn open_standalone_with_store(
+        paths: &Paths,
+        store: Arc<dyn KeyStore>,
+    ) -> Result<Arc<Self>> {
+        Self::open_with_store_and_proxy_runtime(paths, store, false)
+    }
+
+    fn open_with_store_and_proxy_runtime(
+        paths: &Paths,
+        store: Arc<dyn KeyStore>,
+        proxy_runtime_available: bool,
+    ) -> Result<Arc<Self>> {
         paths.prepare()?;
         let db = Arc::new(Database::open(&paths.database, &paths.backups)?);
         let crypto = Arc::new(CryptoManager::initialize(db.clone(), store)?);
@@ -126,9 +142,10 @@ impl App {
             address: SocketAddr::new(proxy_host, proxy_port),
             revision: 0,
         });
-        Ok(Arc::new(Self {
+        let app = Arc::new(Self {
             db,
             crypto,
+            proxy_runtime_available,
             mutation: Mutex::new(()),
             credential_command,
             proxy_listening: AtomicBool::new(false),
@@ -138,7 +155,32 @@ impl App {
             shutdown: tokio::sync::Notify::new(),
             config_paths: RwLock::new(config_paths),
             http_client,
-        }))
+        });
+        app.ensure_runtime_compatible()?;
+        Ok(app)
+    }
+
+    fn require_proxy_runtime(&self) -> Result<()> {
+        if self.proxy_runtime_available {
+            Ok(())
+        } else {
+            Err(DaemonError::ProxyRequiresDaemon)
+        }
+    }
+
+    fn ensure_runtime_compatible(&self) -> Result<()> {
+        if self.proxy_runtime_available {
+            return Ok(());
+        }
+        if self.proxy_enabled() {
+            return Err(DaemonError::ProxyRequiresDaemon);
+        }
+        for client in ClientKind::ALL {
+            if self.db.client_state(client)?.mode == ConnectionMode::Proxy {
+                return Err(DaemonError::ProxyRequiresDaemon);
+            }
+        }
+        Ok(())
     }
 
     pub fn proxy_port(&self) -> Result<u16> {
@@ -774,6 +816,9 @@ impl App {
 
     pub async fn set_mode(&self, client: ClientKind, mode: ConnectionMode) -> Result<()> {
         let _guard = self.mutation.lock().await;
+        if mode == ConnectionMode::Proxy {
+            self.require_proxy_runtime()?;
+        }
         let state = self.db.client_state(client)?;
         let id = state
             .active_provider_id
@@ -1240,6 +1285,13 @@ impl App {
             clients,
             client_auth,
         } = patch;
+        if proxy_enabled == Some(true)
+            || (proxy_enabled != Some(false)
+                && self.proxy_enabled()
+                && (proxy_host.is_some() || proxy_port.is_some()))
+        {
+            self.require_proxy_runtime()?;
+        }
         if clients.as_ref().is_some_and(|clients| !clients.is_valid()) {
             return Err(DaemonError::Invalid(
                 "client settings must contain each client once and keep at least one visible"
@@ -1331,6 +1383,7 @@ impl App {
             if state.mode != ConnectionMode::Proxy {
                 continue;
             }
+            self.require_proxy_runtime()?;
             if let Some(provider_id) = state.active_provider_id {
                 let provider = self.db.get_provider(&provider_id)?;
                 self.apply_configuration(&provider, ConnectionMode::Proxy)?;
@@ -1356,6 +1409,9 @@ impl App {
     }
 
     async fn set_proxy_enabled_locked(&self, enabled: bool) -> Result<()> {
+        if enabled {
+            self.require_proxy_runtime()?;
+        }
         if self.proxy_enabled() == enabled
             && self.proxy_listening.load(Ordering::Acquire) == enabled
         {
@@ -1379,6 +1435,7 @@ impl App {
     }
 
     async fn restart_proxy_locked(&self) -> Result<()> {
+        self.require_proxy_runtime()?;
         let address = self.proxy_address()?;
         self.replace_proxy_runtime(true, address);
         if self.wait_for_proxy_state(true, address).await {
@@ -1459,6 +1516,7 @@ impl App {
         }
         let state = self.db.client_state(client)?;
         if state.mode == ConnectionMode::Proxy {
+            self.require_proxy_runtime()?;
             self.proxy_capability(client)
         } else {
             self.crypto.credential_for(client)
@@ -1588,6 +1646,7 @@ impl From<&DaemonError> for AppError {
             DaemonError::Conflict(_) => ErrorCode::ConfigConflict,
             DaemonError::Invalid(_) => ErrorCode::InvalidArgument,
             DaemonError::OAuthProxyUnsupported => ErrorCode::OAuthProxyUnsupported,
+            DaemonError::ProxyRequiresDaemon => ErrorCode::ProxyRequiresDaemon,
             DaemonError::NoActiveProvider => ErrorCode::NoActiveProvider,
             DaemonError::CurrentCredentialUnavailable => ErrorCode::CurrentCredentialUnavailable,
             DaemonError::Config(_) | DaemonError::Io(_) => ErrorCode::ConfigUnavailable,

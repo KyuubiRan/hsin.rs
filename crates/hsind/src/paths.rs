@@ -52,9 +52,15 @@ impl InstanceGuard {
             .read(true)
             .write(true)
             .open(path)?;
-        file.try_lock_exclusive().map_err(|_| {
-            DaemonError::Conflict("another hsind instance is already running".into())
-        })?;
+        match file.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
+                return Err(DaemonError::Conflict(
+                    "another hsin state owner is already running".into(),
+                ));
+            }
+            Err(error) => return Err(DaemonError::Io(error)),
+        }
         Ok(Self { _file: file })
     }
 }

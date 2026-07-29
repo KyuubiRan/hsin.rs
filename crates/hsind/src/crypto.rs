@@ -3,6 +3,7 @@ use std::{
     sync::Arc,
 };
 
+use atomic_write_file::AtomicWriteFile;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
@@ -34,6 +35,10 @@ struct KeyMaterial {
 }
 
 pub trait KeyStore: Send + Sync {
+    fn backend_name(&self) -> &'static str {
+        "configured key store"
+    }
+
     fn load(&self, version: u32) -> Result<Option<String>>;
     fn store(&self, version: u32, value: &str) -> Result<()>;
     fn delete(&self, version: u32) -> Result<()>;
@@ -62,6 +67,10 @@ impl SystemKeyStore {
 }
 
 impl KeyStore for SystemKeyStore {
+    fn backend_name(&self) -> &'static str {
+        "system keyring"
+    }
+
     fn load(&self, version: u32) -> Result<Option<String>> {
         match self.entry(version)?.get_password() {
             Ok(value) => Ok(Some(value)),
@@ -100,9 +109,20 @@ pub enum KeyStoreKind {
 impl KeyStoreKind {
     pub const ENV: &'static str = "HSIN_KEYSTORE";
 
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::File => "file",
+        }
+    }
+
     /// Resolve the backend from the `HSIN_KEYSTORE` environment variable.
     pub fn from_env() -> Result<Self> {
-        match std::env::var(Self::ENV) {
+        Self::from_env_result(std::env::var(Self::ENV))
+    }
+
+    fn from_env_result(value: std::result::Result<String, std::env::VarError>) -> Result<Self> {
+        match value {
             Ok(value) => value.parse(),
             Err(std::env::VarError::NotPresent) => Ok(Self::System),
             Err(std::env::VarError::NotUnicode(_)) => Err(DaemonError::Invalid(format!(
@@ -166,6 +186,10 @@ impl FileKeyStore {
 }
 
 impl KeyStore for FileKeyStore {
+    fn backend_name(&self) -> &'static str {
+        "file key store"
+    }
+
     fn load(&self, version: u32) -> Result<Option<String>> {
         match std::fs::read_to_string(self.key_path(version)) {
             Ok(value) => Ok(Some(value.trim().to_owned())),
@@ -181,19 +205,30 @@ impl KeyStore for FileKeyStore {
 
         self.prepare_directory()?;
         let path = self.key_path(version);
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        let mut options = AtomicWriteFile::options();
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+            atomic_write_file::unix::OpenOptionsExt::preserve_mode(&mut options, false);
         }
         let mut file = options.open(&path).map_err(|error| {
             DaemonError::Keyring(format!("file key store write failed: {error}"))
         })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| {
+                    DaemonError::Keyring(format!("file key store write failed: {error}"))
+                })?;
+        }
         file.write_all(value.as_bytes())
             .and_then(|()| file.write_all(b"\n"))
-            .and_then(|()| file.sync_all())
+            .map_err(|error| {
+                DaemonError::Keyring(format!("file key store write failed: {error}"))
+            })?;
+        file.commit()
             .map_err(|error| DaemonError::Keyring(format!("file key store write failed: {error}")))
     }
 
@@ -236,11 +271,17 @@ impl CryptoManager {
                     }
                 },
                 Ok(None) => {
-                    *manager.lock_reason.write() =
-                        Some("master key is missing from the system keyring".into());
+                    *manager.lock_reason.write() = Some(format!(
+                        "master key is missing from the {}",
+                        manager.store.backend_name()
+                    ));
                 }
                 Err(error) => {
-                    tracing::warn!(%error,"system keyring unavailable; daemon is locked");
+                    tracing::warn!(
+                        %error,
+                        key_store = manager.store.backend_name(),
+                        "master-key store unavailable; daemon is locked"
+                    );
                     *manager.lock_reason.write() = Some(error.to_string());
                 }
             }
@@ -249,7 +290,11 @@ impl CryptoManager {
             let version = 1;
             let encoded = URL_SAFE_NO_PAD.encode(key);
             if let Err(error) = manager.store.store(version, &encoded) {
-                tracing::warn!(%error,"system keyring unavailable; daemon is locked");
+                tracing::warn!(
+                    %error,
+                    key_store = manager.store.backend_name(),
+                    "master-key store unavailable; daemon is locked"
+                );
                 *manager.lock_reason.write() = Some(error.to_string());
                 return Ok(manager);
             }
@@ -649,6 +694,65 @@ mod tests {
     }
 
     #[test]
+    fn key_store_kind_handles_missing_and_non_unicode_environment_values() {
+        assert_eq!(
+            KeyStoreKind::from_env_result(Err(std::env::VarError::NotPresent)).unwrap(),
+            KeyStoreKind::System
+        );
+        #[cfg(unix)]
+        let invalid = {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(vec![0xff])
+        };
+        #[cfg(windows)]
+        let invalid = {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[0xd800])
+        };
+        assert!(matches!(
+            KeyStoreKind::from_env_result(Err(std::env::VarError::NotUnicode(invalid))),
+            Err(DaemonError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn key_store_kind_from_env_rejects_a_non_unicode_value() {
+        const CHILD_MARKER: &str = "HSIN_TEST_INVALID_KEYSTORE_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            assert!(matches!(
+                KeyStoreKind::from_env(),
+                Err(DaemonError::Invalid(_))
+            ));
+            return;
+        }
+
+        #[cfg(unix)]
+        let invalid = {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(vec![0xff])
+        };
+        #[cfg(windows)]
+        let invalid = {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[0xd800])
+        };
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "crypto::tests::key_store_kind_from_env_rejects_a_non_unicode_value",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env(KeyStoreKind::ENV, invalid)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn file_key_store_round_trips_and_restricts_permissions() {
         let root = std::env::temp_dir().join(format!("hsind-filestore-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
@@ -656,16 +760,26 @@ mod tests {
         assert_eq!(store.load(1).unwrap(), None);
         store.store(1, "key-material").unwrap();
         assert_eq!(store.load(1).unwrap().as_deref(), Some("key-material"));
+        let key_path = root.join("keys/master-key-v1");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_mode = fs::metadata(&key_path).unwrap().permissions().mode();
+            assert_eq!(file_mode & 0o777, 0o600);
+            fs::set_permissions(&key_path, fs::Permissions::from_mode(0o666)).unwrap();
+        }
         store.store(1, "rotated").unwrap();
         assert_eq!(store.load(1).unwrap().as_deref(), Some("rotated"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(root.join("keys"))
+            let directory_mode = fs::metadata(root.join("keys"))
                 .unwrap()
                 .permissions()
                 .mode();
-            assert_eq!(mode & 0o777, 0o700);
+            assert_eq!(directory_mode & 0o777, 0o700);
+            let file_mode = fs::metadata(key_path).unwrap().permissions().mode();
+            assert_eq!(file_mode & 0o777, 0o600);
         }
         store.delete(1).unwrap();
         store.delete(1).unwrap();

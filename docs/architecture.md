@@ -8,7 +8,7 @@ hsin CLI/TUI ── framed JSON-RPC over user-only IPC ── hsind
                                                        └─ configurable HTTP proxy listener
 ```
 
-`hsind` is the sole persistent state owner. The client never opens the database, reads the operating-system keyring, parses managed application configuration, or holds proxy routes. The daemon restores active routes before accepting control RPCs.
+`hsind` is the sole persistent state owner in the standard deployment. The client never opens the database, reads the operating-system keyring, parses managed application configuration, or holds proxy routes. The daemon restores active routes before accepting control RPCs. Standalone mode is the explicit single-process exception described below and takes the same exclusive state-owner lock.
 
 Each client has one active provider and one connection mode. A direct-mode switch uses a recoverable configuration saga. A proxy-mode switch commits state and swaps the in-memory route without touching external configuration. Requests retain the immutable provider snapshot captured when forwarding begins.
 
@@ -18,7 +18,7 @@ The only client-side bootstrap operation is launching `hsind service install --s
 
 ## Standalone (daemon-less) mode
 
-For headless or single-binary deployments, `hsin` can embed the daemon core in-process instead of talking to `hsind`. Standalone mode activates when `--no-daemon` (or `HSIN_NO_DAEMON=true`) is set, or automatically when no `hsind` binary is deployed next to the CLI. The embedded core acquires the same exclusive instance lock as `hsind`, so state ownership stays unique: if a daemon is running, the IPC path is used; if the lock is held but IPC is unreachable, standalone mode refuses to start. Proxy mode requires the persistent daemon listener and is rejected in standalone mode with `proxy_requires_daemon`; direct mode, provider management, security, and credential-helper operations are fully supported.
+For headless or single-binary deployments, `hsin` can embed the daemon core in-process instead of talking to `hsind`. Standalone mode activates immediately when `--no-daemon` (or `HSIN_NO_DAEMON=true`) is set, or automatically after IPC fails when no `hsind` binary is deployed next to the CLI. The embedded core acquires the same exclusive instance lock as `hsind`, so state ownership stays unique; explicit standalone mode refuses to start while a daemon owns that lock. Proxy mode requires the persistent daemon listener. New proxy operations and persisted proxy client or listener state are rejected in standalone mode with `proxy_requires_daemon`; direct mode, provider management, security, and credential-helper operations are fully supported. Standalone support is a default `hsin` Cargo feature and can be omitted from daemon-only builds with `--no-default-features`.
 
 ## Key store backends
 

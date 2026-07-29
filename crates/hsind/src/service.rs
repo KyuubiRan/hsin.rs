@@ -9,7 +9,7 @@ use std::{
 use std::fmt::Write as _;
 
 use crate::{
-    crypto::{KeyStore, SystemKeyStore},
+    crypto::{KeyStore, KeyStoreKind, SystemKeyStore},
     error::{DaemonError, Result},
     paths::Paths,
 };
@@ -518,11 +518,25 @@ fn exe_name(name: &str) -> String {
 }
 
 fn service_environment(paths: &Paths) -> Result<Vec<(&'static str, String)>> {
+    service_environment_with(paths, |key| std::env::var_os(key))
+}
+
+fn service_environment_with(
+    paths: &Paths,
+    environment: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Vec<(&'static str, String)>> {
     let mut variables = vec![("HSIN_HOME", absolute_path(&paths.home)?)];
     for key in ["CODEX_HOME", "CLAUDE_CONFIG_DIR"] {
-        if let Some(value) = std::env::var_os(key) {
+        if let Some(value) = environment(key) {
             variables.push((key, absolute_path(&PathBuf::from(value))?));
         }
+    }
+    if let Some(value) = environment(KeyStoreKind::ENV) {
+        let value = value.into_string().map_err(|_| {
+            DaemonError::Invalid(format!("{} contains invalid characters", KeyStoreKind::ENV))
+        })?;
+        let kind = value.parse::<KeyStoreKind>()?;
+        variables.push((KeyStoreKind::ENV, kind.as_str().to_owned()));
     }
     Ok(variables)
 }
@@ -551,7 +565,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn instance_status_tracks_the_instance_lock() {
+    fn service_environment_propagates_the_key_store_backend() {
+        let directory =
+            std::env::temp_dir().join(format!("hsin-service-environment-{}", uuid::Uuid::new_v4()));
+        let paths = Paths {
+            database: directory.join("hsin.sqlite3"),
+            lock: directory.join("hsind.lock"),
+            logs: directory.join("logs"),
+            backups: directory.join("backups"),
+            home: directory,
+        };
+        let variables = service_environment_with(&paths, |key| match key {
+            "CODEX_HOME" => Some(std::ffi::OsString::from("/tmp/codex")),
+            KeyStoreKind::ENV => Some(std::ffi::OsString::from(" FILE ")),
+            _ => None,
+        })
+        .unwrap();
+
+        assert!(variables.contains(&("HSIN_KEYSTORE", "file".to_owned())));
+        assert!(variables.contains(&("CODEX_HOME", "/tmp/codex".to_owned())));
+    }
+
+    #[test]
+    fn service_status_treats_any_state_owner_lock_as_running() {
         let directory = std::env::temp_dir().join(format!("hsin-service-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
         let lock_path = directory.join("hsind.lock");

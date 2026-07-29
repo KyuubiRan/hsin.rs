@@ -5,7 +5,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
-    #[error("daemon is locked because the system keyring is unavailable")]
+    #[error("daemon is locked because the master-key store is unavailable")]
     Locked,
     #[error("not found: {0}")]
     NotFound(String),
@@ -15,6 +15,8 @@ pub enum DaemonError {
     Invalid(String),
     #[error("Official OAuth providers cannot use the local proxy")]
     OAuthProxyUnsupported,
+    #[error("proxy mode requires the persistent hsind daemon")]
+    ProxyRequiresDaemon,
     #[error("no active Provider is configured for this client")]
     NoActiveProvider,
     #[error("the current client configuration does not expose an importable API key")]
@@ -33,7 +35,7 @@ pub enum DaemonError {
     Json(#[from] serde_json::Error),
     #[error("cryptographic operation failed")]
     Crypto,
-    #[error("system keyring error: {0}")]
+    #[error("master-key store error: {0}")]
     Keyring(String),
     #[error("internal error: {0}")]
     Internal(String),
@@ -47,6 +49,7 @@ impl DaemonError {
             Self::Conflict(_) => "conflict",
             Self::Invalid(_) => "invalid_input",
             Self::OAuthProxyUnsupported => "oauth_proxy_unsupported",
+            Self::ProxyRequiresDaemon => "proxy_requires_daemon",
             Self::NoActiveProvider => "no_active_provider",
             Self::CurrentCredentialUnavailable => "current_credential_unavailable",
             Self::Config(_) => "config_error",

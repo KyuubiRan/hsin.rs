@@ -1,20 +1,19 @@
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use hsin_core::{
-    AppError, ClientKind, ConnectionMode, DaemonStatus, ErrorCode, ModeSetParams, Provider,
-    ProviderListParams, SettingsPatch,
+    ClientKind, ConnectionMode, DaemonStatus, ErrorCode, Provider, ProviderListParams,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 use crate::bootstrap;
+
+#[cfg(feature = "standalone")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 const DAEMON_READY_RETRIES: usize = 300;
 const DAEMON_READY_RETRY_DELAY: Duration = Duration::from_millis(100);
@@ -61,32 +60,50 @@ pub struct DaemonClient {
 
 enum Backend {
     Remote(tokio::sync::Mutex<hsin_ipc::IpcClient>),
+    #[cfg(feature = "standalone")]
     Embedded(Embedded),
 }
 
 /// In-process daemon core for standalone (daemon-less) operation. It owns the
 /// same exclusive instance lock as `hsind`, so state ownership stays unique.
 /// Proxy mode requires a persistent listener and is rejected here.
+#[cfg(feature = "standalone")]
 struct Embedded {
     app: Arc<hsind::app::App>,
     _guard: hsind::paths::InstanceGuard,
     next_id: AtomicU64,
 }
 
+#[cfg(feature = "standalone")]
 impl Embedded {
     fn open() -> Result<Self> {
         let paths = hsind::paths::Paths::discover();
-        paths.prepare().map_err(|error| daemon_error(&error))?;
-        let guard = hsind::paths::InstanceGuard::acquire(&paths.lock).map_err(|_| {
-            anyhow!(
-                "hsind appears to be running but its IPC endpoint is unreachable; \
-                 standalone mode cannot open the shared state"
-            )
-        })?;
         let store = hsind::crypto::KeyStoreKind::from_env()
             .map_err(|error| daemon_error(&error))?
             .open(&paths.home);
-        let app = hsind::app::App::open_with_store(&paths, store)
+        Self::open_with(&paths, store)
+    }
+
+    fn open_with(
+        paths: &hsind::paths::Paths,
+        store: Arc<dyn hsind::crypto::KeyStore>,
+    ) -> Result<Self> {
+        paths.prepare().map_err(|error| daemon_error(&error))?;
+        let guard = match hsind::paths::InstanceGuard::acquire(&paths.lock) {
+            Ok(guard) => guard,
+            Err(hsind::error::DaemonError::Conflict(_)) => {
+                return Err(anyhow!(
+                    "another hsin process owns the shared state, but no daemon IPC endpoint is \
+                     reachable; standalone mode cannot start"
+                ));
+            }
+            Err(error) => {
+                return Err(
+                    anyhow::Error::new(error).context("acquire the standalone state-owner lock")
+                );
+            }
+        };
+        let app = hsind::app::App::open_standalone_with_store(paths, store)
             .map_err(|error| daemon_error(&error))?;
         app.recover_operations()
             .map_err(|error| daemon_error(&error))?;
@@ -102,7 +119,6 @@ impl Embedded {
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
-        reject_proxy_request(method, &params)?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         hsind::rpc::dispatch(self.app.clone(), id, method, params)
             .await
@@ -111,28 +127,11 @@ impl Embedded {
     }
 }
 
+#[cfg(feature = "standalone")]
 fn daemon_error(error: &hsind::error::DaemonError) -> anyhow::Error {
     anyhow::Error::new(hsin_ipc::TransportError::Rpc(
-        hsin_ipc::RpcError::application(AppError::from(error)),
+        hsin_ipc::RpcError::application(hsin_core::AppError::from(error)),
     ))
-}
-
-/// Proxy mode needs the long-lived `hsind` listener; a standalone CLI process
-/// exits after each command, so enabling it here would break the clients.
-fn reject_proxy_request(method: &str, params: &Value) -> Result<()> {
-    let rejected = match method {
-        "mode.set" => serde_json::from_value::<ModeSetParams>(params.clone())
-            .is_ok_and(|request| request.mode == ConnectionMode::Proxy),
-        "settings.set" => serde_json::from_value::<SettingsPatch>(params.clone())
-            .is_ok_and(|patch| patch.proxy_enabled == Some(true)),
-        _ => false,
-    };
-    if rejected {
-        return Err(anyhow::Error::new(hsin_ipc::TransportError::Rpc(
-            hsin_ipc::RpcError::application(AppError::new(ErrorCode::ProxyRequiresDaemon)),
-        )));
-    }
-    Ok(())
 }
 
 impl DaemonClient {
@@ -153,21 +152,34 @@ impl DaemonClient {
     }
 
     /// Open the daemon core in-process, without a running `hsind`.
+    #[cfg(feature = "standalone")]
     pub fn open_standalone() -> Result<Self> {
         Ok(Self {
             backend: Backend::Embedded(Embedded::open()?),
         })
     }
 
+    /// Report that this build does not contain the optional embedded daemon core.
+    #[cfg(not(feature = "standalone"))]
+    pub fn open_standalone() -> Result<Self> {
+        Err(anyhow!(
+            "this hsin build does not include standalone support; install hsind or rebuild with \
+             the standalone feature"
+        ))
+    }
+
     pub async fn connect_or_bootstrap(no_daemon: bool) -> Result<Self> {
+        if no_daemon {
+            return Self::open_standalone().context("standalone mode was requested");
+        }
+
         let initial_error = match Self::connect().await {
             Ok(client) => return Ok(client),
             Err(error) => error,
         };
 
-        // Standalone fallback: explicit opt-in, or a deployment that never
-        // shipped the hsind binary (single-binary headless installs).
-        if no_daemon || !bootstrap::daemon_available() {
+        // A deployment that never shipped hsind falls back to the embedded core.
+        if !bootstrap::daemon_available() {
             return Self::open_standalone().with_context(|| {
                 format!("hsind is unavailable ({initial_error:#}) and standalone mode failed")
             });
@@ -178,6 +190,8 @@ impl DaemonClient {
             return Self::wait_until_ready(Some(initial_error)).await;
         }
 
+        // Service status follows the shared instance lock, including an
+        // embedded owner, so this branch must never launch a second daemon.
         if bootstrap::service_status().await.unwrap_or(false) {
             return Self::wait_for_running_daemon(initial_error).await;
         }
@@ -224,6 +238,7 @@ impl DaemonClient {
                 .call(method, params)
                 .await
                 .with_context(|| format!("RPC {method} failed")),
+            #[cfg(feature = "standalone")]
             Backend::Embedded(embedded) => {
                 let params = serde_json::to_value(params)
                     .with_context(|| format!("encode {method} parameters"))?;
@@ -344,26 +359,126 @@ fn decode_client_state(
 mod tests {
     use super::*;
 
-    #[test]
-    fn standalone_mode_rejects_proxy_operations_with_a_stable_code() {
-        let rejects = |method: &str, params: Value| {
-            let error = reject_proxy_request(method, &params).expect_err("must be rejected");
-            let rpc = error
-                .downcast_ref::<hsin_ipc::TransportError>()
-                .and_then(|transport| match transport {
-                    hsin_ipc::TransportError::Rpc(rpc) => rpc.data.as_ref(),
-                    _ => None,
-                })
-                .expect("application error payload");
-            assert_eq!(rpc.code, ErrorCode::ProxyRequiresDaemon);
-        };
-        rejects("mode.set", json!({"client": "codex", "mode": "proxy"}));
-        rejects("settings.set", json!({"proxy_enabled": true}));
-        assert!(
-            reject_proxy_request("mode.set", &json!({"client": "codex", "mode": "direct"})).is_ok()
+    #[cfg(feature = "standalone")]
+    #[derive(Default)]
+    struct MemoryStore(std::sync::Mutex<std::collections::HashMap<u32, String>>);
+
+    #[cfg(feature = "standalone")]
+    impl hsind::crypto::KeyStore for MemoryStore {
+        fn load(&self, version: u32) -> hsind::error::Result<Option<String>> {
+            Ok(self.0.lock().unwrap().get(&version).cloned())
+        }
+
+        fn store(&self, version: u32, value: &str) -> hsind::error::Result<()> {
+            self.0.lock().unwrap().insert(version, value.to_owned());
+            Ok(())
+        }
+
+        fn delete(&self, version: u32) -> hsind::error::Result<()> {
+            self.0.lock().unwrap().remove(&version);
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "standalone")]
+    fn standalone_paths(label: &str) -> hsind::paths::Paths {
+        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+        let home = std::env::temp_dir().join(format!(
+            "hsin-standalone-{label}-{}-{}",
+            std::process::id(),
+            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
+        ));
+        hsind::paths::Paths {
+            database: home.join("hsin.sqlite3"),
+            lock: home.join("hsind.lock"),
+            logs: home.join("logs"),
+            backups: home.join("backups"),
+            home,
+        }
+    }
+
+    #[cfg(feature = "standalone")]
+    fn seed_standalone_database(
+        paths: &hsind::paths::Paths,
+        configure: impl FnOnce(&hsind::db::Database),
+    ) {
+        std::fs::create_dir_all(&paths.home).unwrap();
+        let db = hsind::db::Database::open(&paths.database, &paths.backups).unwrap();
+        db.set_setting("providers_initialized_v1", "true").unwrap();
+        configure(&db);
+    }
+
+    #[cfg(feature = "standalone")]
+    fn application_error_code(error: &anyhow::Error) -> ErrorCode {
+        error
+            .chain()
+            .find_map(|source| {
+                let hsin_ipc::TransportError::Rpc(rpc) =
+                    source.downcast_ref::<hsin_ipc::TransportError>()?
+                else {
+                    return None;
+                };
+                rpc.data.as_ref().map(|application| application.code)
+            })
+            .expect("application error payload")
+    }
+
+    #[cfg(feature = "standalone")]
+    #[tokio::test]
+    async fn embedded_dispatch_rejects_proxy_operations_with_a_stable_code() {
+        let paths = standalone_paths("dispatch");
+        seed_standalone_database(&paths, |_| {});
+        let embedded = Embedded::open_with(&paths, Arc::new(MemoryStore::default())).unwrap();
+
+        let status = embedded.call("status", json!({})).await.unwrap();
+        assert_eq!(status["proxy_enabled"], false);
+
+        let error = embedded
+            .call("mode.set", json!({"client": "codex", "mode": "proxy"}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            application_error_code(&error),
+            ErrorCode::ProxyRequiresDaemon
         );
-        assert!(reject_proxy_request("settings.set", &json!({"proxy_enabled": false})).is_ok());
-        assert!(reject_proxy_request("provider.list", &json!({})).is_ok());
+        let error = embedded
+            .call("settings.set", json!({"proxy_enabled": true}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            application_error_code(&error),
+            ErrorCode::ProxyRequiresDaemon
+        );
+
+        drop(embedded);
+        std::fs::remove_dir_all(paths.home).unwrap();
+    }
+
+    #[cfg(feature = "standalone")]
+    #[test]
+    fn embedded_open_rejects_persisted_proxy_state() {
+        type ProxyStateCase = (&'static str, fn(&hsind::db::Database));
+        let cases: [ProxyStateCase; 2] = [
+            ("client-mode", |db: &hsind::db::Database| {
+                db.set_mode(ClientKind::Codex, ConnectionMode::Proxy)
+                    .unwrap();
+            }),
+            ("listener-enabled", |db: &hsind::db::Database| {
+                db.set_setting("proxy_enabled", "true").unwrap();
+            }),
+        ];
+        for (label, configure) in cases {
+            let paths = standalone_paths(label);
+            seed_standalone_database(&paths, configure);
+            let error = Embedded::open_with(&paths, Arc::new(MemoryStore::default()))
+                .err()
+                .expect("persisted proxy state must be rejected");
+            assert_eq!(
+                application_error_code(&error),
+                ErrorCode::ProxyRequiresDaemon
+            );
+            std::fs::remove_dir_all(paths.home).unwrap();
+        }
     }
 
     #[test]

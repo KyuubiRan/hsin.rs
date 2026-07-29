@@ -29,7 +29,8 @@ environments:
   `hsind` binary is not deployed next to `hsin` at all, this fallback engages
   automatically, making single-binary installs work out of the box. Standalone
   mode supports direct connection mode only; proxy mode still requires the
-  daemon.
+  daemon. Because both runtimes use the same state-owner lock, explicit
+  standalone mode refuses to start while `hsind` is running.
 - `HSIN_KEYSTORE=file` (or `hsind run --keystore file`) stores the encryption
   master key in a user-only file under the hsin data directory instead of the
   OS keyring, for hosts without a keyring service. Provider secrets remain
@@ -39,6 +40,9 @@ environments:
 # fully headless, single binary, no keyring service required
 HSIN_KEYSTORE=file hsin --no-daemon provider list
 ```
+
+Standalone support is a default Cargo feature of `hsin`. Daemon-only builds can
+omit the embedded core and its dependencies with `--no-default-features`.
 
 For frequent local builds, use the host-aware helper. It defaults to a native
 debug build and copies `hsin` and `hsind` into one directory under `artifacts/`:
