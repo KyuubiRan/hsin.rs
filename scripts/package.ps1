@@ -14,7 +14,9 @@ $combined = (Get-Item "$root/hsin.exe").Length + (Get-Item "$root/hsind.exe").Le
 if ($combined -gt 25MB) {
     throw "stripped binaries exceed 25 MiB combined"
 }
-Compress-Archive -Force "$root/*" "$root.zip"
+# Compress the directory itself, not its contents, so the archive expands into
+# one top-level folder like the tar archives do.
+Compress-Archive -Force -Path $root -DestinationPath "$root.zip"
 if ((Get-Item "$root.zip").Length -gt 15MB) {
     throw "release archive exceeds 15 MiB"
 }
