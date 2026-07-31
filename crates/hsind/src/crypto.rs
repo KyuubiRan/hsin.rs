@@ -109,8 +109,9 @@ impl CryptoManager {
                     }
                 },
                 Ok(None) => {
-                    *manager.lock_reason.write() =
-                        Some("master key is missing from the system keyring".into());
+                    let reason = "master key is missing from the system keyring".to_string();
+                    tracing::error!(%reason, "daemon is locked; import the recovery key");
+                    *manager.lock_reason.write() = Some(reason);
                 }
                 Err(error) => {
                     tracing::warn!(%error,"system keyring unavailable; daemon is locked");

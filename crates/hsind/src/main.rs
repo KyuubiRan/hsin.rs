@@ -90,10 +90,16 @@ async fn run() -> Result<()> {
     paths.prepare()?;
     let _instance = InstanceGuard::acquire(&paths.lock)?;
     let app = app::App::open(&paths)?;
-    app.recover_operations()?;
-    app.initialize_providers()?;
-    app.reconcile_client_auth_configuration()?;
-    app.reconcile_proxy_configurations()?;
+    tolerate_locked("recover operations", app.recover_operations())?;
+    tolerate_locked("initialize providers", app.initialize_providers())?;
+    tolerate_locked(
+        "reconcile client auth configuration",
+        app.reconcile_client_auth_configuration(),
+    )?;
+    tolerate_locked(
+        "reconcile proxy configurations",
+        app.reconcile_proxy_configurations(),
+    )?;
     let mut rpc = tokio::spawn(rpc::serve(app.clone()));
     tokio::task::yield_now().await;
     let proxy = tokio::spawn(proxy::serve(app.clone()));
@@ -137,6 +143,22 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
+/// Startup reconciliation needs the master key. A locked key store must not
+/// take the daemon down: the CLI has to stay reachable so a recovery key can be
+/// imported.
+fn tolerate_locked(step: &'static str, result: Result<()>) -> Result<()> {
+    match result {
+        Err(error::DaemonError::Locked) => {
+            tracing::warn!(
+                step,
+                "skipped startup reconciliation; the key store is locked"
+            );
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 async fn shutdown_signal() -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -150,5 +172,23 @@ async fn shutdown_signal() -> std::io::Result<()> {
     #[cfg(not(unix))]
     {
         tokio::signal::ctrl_c().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_locked_key_store_never_aborts_startup() {
+        // Aborting here would crash-loop the service and leave no IPC socket,
+        // so `hsin security import-recovery-key` could never reach the daemon.
+        assert!(tolerate_locked("step", Err(error::DaemonError::Locked)).is_ok());
+    }
+
+    #[test]
+    fn other_startup_failures_still_stop_the_daemon() {
+        let error = tolerate_locked("step", Err(error::DaemonError::Crypto)).unwrap_err();
+        assert_eq!(error.code(), error::DaemonError::Crypto.code());
     }
 }
