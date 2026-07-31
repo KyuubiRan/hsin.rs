@@ -100,7 +100,9 @@ impl DaemonClient {
                 Err(error) => last_error = error,
             }
         }
-        Err(last_error.context("hsind service is running but IPC did not become ready"))
+        Err(unreachable_daemon(last_error.context(
+            "hsind service is running but IPC did not become ready",
+        )))
     }
 
     async fn wait_until_ready(mut last_error: Option<anyhow::Error>) -> Result<Self> {
@@ -111,7 +113,9 @@ impl DaemonClient {
                 Err(error) => last_error = Some(error),
             }
         }
-        Err(last_error.unwrap_or_else(|| anyhow!("daemon did not become ready")))
+        Err(unreachable_daemon(
+            last_error.unwrap_or_else(|| anyhow!("daemon did not become ready")),
+        ))
     }
 
     pub async fn call<P, R>(&self, method: &str, params: &P) -> Result<R>
@@ -147,6 +151,17 @@ impl DaemonClient {
         let value: Value = self.call("status", &json!({})).await?;
         decode_status(&value)
     }
+}
+
+/// A missing socket only says the daemon is not listening. Point at the daemon
+/// log so a crash-looping service reports its own failure instead of a bare
+/// "No such file or directory".
+fn unreachable_daemon(error: anyhow::Error) -> anyhow::Error {
+    let log = hsin_ipc::data_home().join("logs").join("hsind.stderr.log");
+    error.context(format!(
+        "hsind is not reachable and may be failing to start; see {}",
+        log.display()
+    ))
 }
 
 fn requires_reinstall(error: &anyhow::Error) -> bool {
