@@ -34,6 +34,10 @@ use crate::{
 };
 
 const CODEX_AUTH_BACKUP_KEY: &str = "codex_auth_backup_v1";
+/// Records that the operator holds a copy of the current master key. Losing the
+/// keyring entry without one is unrecoverable, so this must track the actual
+/// export instead of merely asserting that a key exists.
+const RECOVERY_KEY_EXPORTED_KEY: &str = "recovery_key_exported";
 
 fn client_host_for_listener(host: IpAddr) -> IpAddr {
     match host {
@@ -1423,23 +1427,42 @@ impl App {
                 KeyStoreState::Locked
             },
             key_version: version,
-            recovery_key_configured: version > 0,
+            recovery_key_configured: self.recovery_key_exported()?,
         })
     }
 
-    pub fn export_recovery_key(&self) -> Result<String> {
+    fn recovery_key_exported(&self) -> Result<bool> {
         Ok(self
+            .db
+            .setting(RECOVERY_KEY_EXPORTED_KEY)?
+            .is_some_and(|value| !value.is_empty()))
+    }
+
+    pub fn export_recovery_key(&self) -> Result<String> {
+        let recovery = self
             .crypto
             .export_recovery_key()?
             .expose_secret()
-            .to_owned())
+            .to_owned();
+        self.mark_recovery_key_held()?;
+        Ok(recovery)
     }
     pub fn import_recovery_key(&self, value: &str) -> Result<()> {
-        self.crypto.import_recovery_key(value)
+        self.crypto.import_recovery_key(value)?;
+        // A successful import proves the operator still holds the key.
+        self.mark_recovery_key_held()
     }
     pub async fn rotate_key(&self) -> Result<u32> {
         let _guard = self.mutation.lock().await;
-        self.crypto.rotate()
+        let version = self.crypto.rotate()?;
+        // Rotation invalidates every previously exported recovery key, because
+        // an import only accepts the current key version.
+        self.db.set_setting(RECOVERY_KEY_EXPORTED_KEY, "")?;
+        Ok(version)
+    }
+
+    fn mark_recovery_key_held(&self) -> Result<()> {
+        self.db.set_setting(RECOVERY_KEY_EXPORTED_KEY, "1")
     }
 
     pub fn credential(
@@ -1496,6 +1519,14 @@ impl App {
             let mut item = finding("key_cleanup_pending", DoctorSeverity::Warning);
             item.args.insert("message".into(), error.to_string());
             findings.push(item);
+        }
+        // Without an exported recovery key, losing the keyring entry destroys
+        // every stored credential, so warn for as long as none is held.
+        if self.db.current_key_record()?.is_some() && !self.recovery_key_exported()? {
+            findings.push(finding(
+                "recovery_key_not_exported",
+                DoctorSeverity::Warning,
+            ));
         }
         if self.db.integrity_check()? != "ok" {
             findings.push(finding("database_integrity_failed", DoctorSeverity::Error));
@@ -1687,6 +1718,54 @@ mod tests {
             "sk-abc***yz"
         );
         assert_eq!(credential_preview("short-key"), "••••••••");
+    }
+
+    #[tokio::test]
+    async fn recovery_key_status_tracks_the_actual_export() {
+        // Reporting a recovery key that was never exported would tell operators
+        // they are protected while a lost keyring entry destroys every secret.
+        let root = std::env::temp_dir().join(format!("hsind-recovery-{}", uuid::Uuid::new_v4()));
+        let paths = Paths {
+            database: root.join("hsin.sqlite3"),
+            lock: root.join("hsind.lock"),
+            logs: root.join("logs"),
+            backups: root.join("backups"),
+            home: root.clone(),
+        };
+        let app = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
+
+        let status = app.security_status().unwrap();
+        assert_eq!(status.key_version, 1, "a master key exists");
+        assert!(
+            !status.recovery_key_configured,
+            "nothing was exported yet, so no recovery key is held"
+        );
+        assert!(
+            app.doctor()
+                .unwrap()
+                .findings
+                .iter()
+                .any(|item| item.code == "recovery_key_not_exported"),
+            "doctor must surface the missing recovery key"
+        );
+
+        let recovery = app.export_recovery_key().unwrap();
+        assert!(app.security_status().unwrap().recovery_key_configured);
+
+        // Rotation invalidates the exported key, so the warning must return.
+        app.rotate_key().await.unwrap();
+        assert!(
+            !app.security_status().unwrap().recovery_key_configured,
+            "the exported key no longer matches the current key version"
+        );
+        assert!(app.import_recovery_key(&recovery).is_err());
+
+        // Re-exporting after rotation restores the held state.
+        app.export_recovery_key().unwrap();
+        assert!(app.security_status().unwrap().recovery_key_configured);
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
