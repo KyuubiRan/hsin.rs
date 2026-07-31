@@ -141,6 +141,8 @@
   "language_system": "Follow system",
   "help": "q quit · tab client · ↑/↓ select · enter switch · a add · e edit · d delete · c copy · v paste · p proxy · o settings · r refresh",
   "loading": "Loading…",
+  "banner_key_store_locked": "Key store locked - run `hsin security import-recovery-key` to restore access",
+  "banner_recovery_key_missing": "No recovery key exported - run `hsin security export-recovery-key` and store it safely, or losing the system keyring loses every credential",
   "no_providers": "No providers configured",
   "active": "active",
   "direct": "direct",

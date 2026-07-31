@@ -3,6 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use hsin_core::{
     ClientKind, ConnectionMode, DaemonStatus, ErrorCode, Provider, ProviderListParams,
+    SecurityStatus,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -28,6 +29,10 @@ pub struct StatusSnapshot {
     pub proxy_enabled: bool,
     #[serde(default)]
     pub security_locked: bool,
+    /// False until the operator has exported (or re-imported) a recovery key.
+    /// Defaults to held so a daemon that cannot report it raises no false alarm.
+    #[serde(default = "assume_held")]
+    pub recovery_key_exported: bool,
 }
 
 impl Default for StatusSnapshot {
@@ -40,12 +45,17 @@ impl Default for StatusSnapshot {
             claude_mode: ConnectionMode::Direct,
             proxy_enabled: false,
             security_locked: false,
+            recovery_key_exported: true,
         }
     }
 }
 
 const fn direct() -> ConnectionMode {
     ConnectionMode::Direct
+}
+
+const fn assume_held() -> bool {
+    true
 }
 
 pub struct DaemonClient {
@@ -150,6 +160,10 @@ impl DaemonClient {
     pub async fn status(&self) -> Result<StatusSnapshot> {
         let value: Value = self.call("status", &json!({})).await?;
         decode_status(&value)
+    }
+
+    pub async fn security_status(&self) -> Result<SecurityStatus> {
+        self.call("security.status", &json!({})).await
     }
 }
 

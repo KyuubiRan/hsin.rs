@@ -52,6 +52,36 @@ pub(super) fn draw_input_field(
     }
 }
 
+/// A persistent warning strip for conditions the operator must act on. Unlike
+/// `state.notice`, which is transient feedback in the footer, these stay until
+/// the underlying condition is gone.
+pub(super) fn banner_text<'a>(state: &State, i18n: &'a I18n) -> Option<&'a str> {
+    if state.status.security_locked {
+        return Some(i18n.text("banner_key_store_locked"));
+    }
+    if !state.status.recovery_key_exported {
+        return Some(i18n.text("banner_recovery_key_missing"));
+    }
+    None
+}
+
+pub(super) fn draw_banner(frame: &mut Frame<'_>, area: Rect, state: &State, i18n: &I18n) {
+    let Some(text) = banner_text(state, i18n) else {
+        return;
+    };
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            text,
+            Style::default().fg(WHITE).bg(RED),
+        )))
+        .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
 pub(super) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &State, i18n: &I18n) {
     let help = match &state.input {
         InputMode::Normal => i18n.text("help"),

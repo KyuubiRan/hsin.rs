@@ -141,6 +141,8 @@
   "language_system": "跟随系统",
   "help": "q 退出 · tab 切换客户端 · ↑/↓ 选择 · enter 切换 · a 添加 · e 编辑 · d 删除 · c 复制 · v 粘贴 · p 代理 · o 设置 · r 刷新",
   "loading": "正在加载…",
+  "banner_key_store_locked": "密钥库已锁定 - 运行 `hsin security import-recovery-key` 恢复访问",
+  "banner_recovery_key_missing": "尚未导出恢复密钥 - 运行 `hsin security export-recovery-key` 并妥善保存，否则系统钥匙串一旦丢失，所有凭证都无法恢复",
   "no_providers": "尚未配置 Provider",
   "active": "当前",
   "direct": "直连",

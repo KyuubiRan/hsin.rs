@@ -390,7 +390,8 @@ async fn update_client_auth(
 
 async fn load(client: &DaemonClient) -> Result<(Vec<Provider>, StatusSnapshot, Settings)> {
     let providers = client.provider_list(None).await?;
-    let status = client.status().await?;
+    let mut status = client.status().await?;
+    status.recovery_key_exported = client.security_status().await?.recovery_key_configured;
     let settings = client.call("settings.get", &serde_json::json!({})).await?;
     Ok((providers, status, settings))
 }

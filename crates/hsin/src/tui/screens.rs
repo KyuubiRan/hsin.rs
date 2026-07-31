@@ -7,7 +7,7 @@ use crate::i18n::I18n;
 
 use super::{
     state::{InputMode, State},
-    widgets::draw_footer,
+    widgets::{draw_banner, draw_footer},
 };
 
 mod header;
@@ -29,17 +29,19 @@ use settings::{draw_confirm, draw_settings_screen};
 pub(super) fn draw(frame: &mut Frame<'_>, state: &mut State, i18n: &I18n) {
     let area = frame.area();
     let header_height = if area.height >= 21 { 7 } else { 3 };
+    let banner_height = u16::from(super::widgets::banner_text(state, i18n).is_some());
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(header_height),
-            Constraint::Length(0),
+            Constraint::Length(banner_height),
             Constraint::Min(7),
             Constraint::Length(3),
         ])
         .split(area);
 
     draw_header(frame, rows[0], state, i18n);
+    draw_banner(frame, rows[1], state, i18n);
 
     if let InputMode::Settings(screen) = &state.input {
         draw_settings_screen(frame, rows[2], state, screen, i18n);

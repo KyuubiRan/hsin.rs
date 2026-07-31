@@ -1583,3 +1583,49 @@ fn client_configuration_renders_import_current_provider() {
     assert!(!rendered.contains("Import all"));
     assert!(!rendered.contains("reduces security"));
 }
+
+fn rendered_with(status: crate::rpc::StatusSnapshot) -> String {
+    let mut state = State {
+        providers: vec![example_provider()],
+        loading: false,
+        status,
+        ..State::default()
+    };
+    let locale = I18n::new(Some(LANGUAGE_EN_US));
+    let mut terminal = Terminal::new(TestBackend::new(100, 32)).expect("test terminal");
+    terminal
+        .draw(|frame| draw(frame, &mut state, &locale))
+        .expect("draw banner");
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>()
+}
+
+#[test]
+fn a_locked_key_store_is_announced_with_the_recovery_command() {
+    // A locked daemon still serves, so the only signal the operator gets is the
+    // banner. Without it the state is invisible until an action fails.
+    let rendered = rendered_with(crate::rpc::StatusSnapshot {
+        security_locked: true,
+        ..crate::rpc::StatusSnapshot::default()
+    });
+    assert!(rendered.contains("Key store locked"));
+    assert!(rendered.contains("import-recovery-key"));
+}
+
+#[test]
+fn a_missing_recovery_key_is_announced_until_it_is_exported() {
+    let warned = rendered_with(crate::rpc::StatusSnapshot {
+        recovery_key_exported: false,
+        ..crate::rpc::StatusSnapshot::default()
+    });
+    assert!(warned.contains("No recovery key exported"));
+    assert!(warned.contains("export-recovery-key"));
+
+    let held = rendered_with(crate::rpc::StatusSnapshot::default());
+    assert!(!held.contains("No recovery key exported"));
+}
