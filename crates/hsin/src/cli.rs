@@ -50,7 +50,6 @@ pub enum Command {
         command: SecurityCommand,
     },
     /// Resolve a credential for Codex or Claude Code (internal).
-    #[command(hide = true)]
     Credential {
         #[arg(value_enum)]
         client: ClientArg,
