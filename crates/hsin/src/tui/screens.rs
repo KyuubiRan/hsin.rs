@@ -51,16 +51,18 @@ pub(super) fn draw(frame: &mut Frame<'_>, state: &mut State, i18n: &I18n) {
         return;
     }
 
-    // The search bar stays docked above the list while a filter is active so it never covers the
-    // providers behind it, and so a filter committed with enter remains visible.
-    let (search_area, content) = if state.active_query().is_empty() {
-        (None, rows[2])
-    } else {
+    // The search bar stays docked above the list while it has focus or a filter is active, so it
+    // never covers the providers behind it and a filter committed with enter remains visible.
+    let has_search =
+        matches!(state.input, InputMode::Search(_)) || !state.active_query().is_empty();
+    let (search_area, content) = if has_search {
         let parts = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(3), Constraint::Min(4)])
             .split(rows[2]);
         (Some(parts[0]), parts[1])
+    } else {
+        (None, rows[2])
     };
     if let Some(search_area) = search_area {
         draw_search(frame, search_area, state, i18n);

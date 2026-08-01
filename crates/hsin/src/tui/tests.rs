@@ -1781,6 +1781,16 @@ fn the_search_bar_stays_visible_while_a_filter_is_applied() {
     assert!(rendered.contains("esc clear search"));
 }
 
+#[test]
+fn the_search_bar_appears_as_soon_as_the_search_box_opens() {
+    // The footer switches to the search hints on `/`, so the bar has to appear with it rather than
+    // waiting for the first typed character.
+    let mut state = searchable_state();
+    state.reduce(key(KeyCode::Char('/')));
+    let rendered = render(&mut state, 100, 32);
+    assert!(rendered.contains("Search"));
+}
+
 fn claude_form(mapping: Option<ClaudeModelMapping>) -> ProviderForm {
     ProviderForm {
         id: None,
