@@ -27,9 +27,9 @@ Configuration writes are strict allowlists:
 
 - Codex `config.toml`: top-level `model_provider` and the complete `[model_providers.hsin]` subtree only.
 - Codex `auth.json`: top-level `auth_mode` and `OPENAI_API_KEY` only while a custom provider is active.
-- Claude Code: `env.ANTHROPIC_BASE_URL`, `env.ANTHROPIC_API_KEY`, `env.ANTHROPIC_AUTH_TOKEN`, and root `apiKeyHelper` only.
+- Claude Code: `env.ANTHROPIC_BASE_URL`, `env.ANTHROPIC_API_KEY`, `env.ANTHROPIC_AUTH_TOKEN`, root `apiKeyHelper`, and — only when the active provider enables model mapping — `env.ANTHROPIC_DEFAULT_FABLE_MODEL`, `env.ANTHROPIC_DEFAULT_OPUS_MODEL`, `env.ANTHROPIC_DEFAULT_SONNET_MODEL`, and `env.ANTHROPIC_DEFAULT_HAIKU_MODEL`.
 
-Never modify model selection, MCP servers, hooks, permissions, profiles, features, approval policy, or sandbox settings.
+Never modify MCP servers, hooks, permissions, profiles, features, approval policy, or sandbox settings. Claude Code model selection is owned only through the four `ANTHROPIC_DEFAULT_*_MODEL` keys above; `ANTHROPIC_MODEL` and every other selection knob stay untouched. The user's own values for the four owned keys are snapshotted before hsin first writes them and restored whenever a tier is unmapped.
 
 - Preserve non-owned fields, comments, ordering, line endings, and Unicode byte-for-byte.
 - Retain CAS checks, file locking, permission preservation, atomic replacement, and operation recovery.

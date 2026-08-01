@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, OpenOptions},
     io::Write,
     ops::Range,
@@ -15,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use toml_edit::{DocumentMut, ImDocument, Item, Table, value};
 use zeroize::{Zeroize, Zeroizing};
+
+use hsin_core::{CLAUDE_MODEL_ENV_KEYS, ModelSlot};
 
 use crate::{
     error::{DaemonError, Result},
@@ -46,6 +49,51 @@ pub struct ConfigTarget {
     pub disable_custom_auth: bool,
     #[serde(default)]
     pub codex_auth_before_hash: Option<String>,
+    /// Values the user had for the model-mapping env keys before hsin first took them over.
+    /// Restored whenever a tier is not mapped, so disabling the mapping is non-destructive.
+    #[serde(default)]
+    pub claude_model_env_before: Option<ClaudeModelEnvSnapshot>,
+}
+
+/// The user's own values for the env keys owned by [`ClaudeModelMapping`], captured once before
+/// hsin first writes them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClaudeModelEnvSnapshot {
+    #[serde(default)]
+    pub values: BTreeMap<String, String>,
+}
+
+impl ClaudeModelEnvSnapshot {
+    /// Read the current values of the mapped env keys out of a Claude `settings.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaemonError::Config`] when the text is not parseable JSONC.
+    pub fn capture(text: &str) -> Result<Self> {
+        let value = if text.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            jsonc_parser::parse_to_serde_value(text, &jsonc_parser::ParseOptions::default())
+                .map_err(|error| DaemonError::Config(error.to_string()))?
+                .unwrap_or_else(|| serde_json::json!({}))
+        };
+        let env = value.get("env");
+        let mut values = BTreeMap::new();
+        for key in CLAUDE_MODEL_ENV_KEYS {
+            if let Some(existing) = env
+                .and_then(|env| env.get(key))
+                .and_then(serde_json::Value::as_str)
+                .filter(|existing| !existing.trim().is_empty())
+            {
+                values.insert(key.to_owned(), existing.to_owned());
+            }
+        }
+        Ok(Self { values })
+    }
+
+    fn get(&self, key: &str) -> Option<&str> {
+        self.values.get(key).map(String::as_str)
+    }
 }
 
 fn default_proxy_host() -> String {
@@ -635,6 +683,46 @@ pub fn patch_claude(text: &str, target: &ConfigTarget) -> Result<String> {
 }
 
 pub fn patch_claude_with_credential(
+    text: &str,
+    target: &ConfigTarget,
+    credential: Option<&str>,
+) -> Result<String> {
+    let output = patch_claude_credentials(text, target, credential)?;
+    let output = patch_claude_model_mapping(&output, target)?;
+    validate_jsonc(&output)?;
+    Ok(output)
+}
+
+/// Write the per-provider model mapping into `env`.
+///
+/// Every key is written on every apply: a mapped tier gets the provider's model ID, an unmapped
+/// tier is restored to the value the user had before hsin took the key over (or removed when they
+/// had none). That keeps switching providers, and disabling the mapping, non-destructive.
+fn patch_claude_model_mapping(text: &str, target: &ConfigTarget) -> Result<String> {
+    let mapping = target
+        .provider
+        .claude_model_mapping
+        .as_ref()
+        .filter(|mapping| !target.provider.official && mapping.enabled);
+    let snapshot = target.claude_model_env_before.clone().unwrap_or_default();
+    let mut output = text.to_owned();
+    for key in CLAUDE_MODEL_ENV_KEYS {
+        let mapped = mapping
+            .and_then(|mapping| {
+                mapping
+                    .slots()
+                    .into_iter()
+                    .find_map(|(slot_key, slot)| (slot_key == key).then_some(slot).flatten())
+            })
+            .map(ModelSlot::resolved_model)
+            .filter(|model| !model.is_empty());
+        let value = mapped.as_deref().or_else(|| snapshot.get(key));
+        output = set_nested_string(&output, "env", key, value)?;
+    }
+    Ok(output)
+}
+
+fn patch_claude_credentials(
     text: &str,
     target: &ConfigTarget,
     credential: Option<&str>,
@@ -1339,12 +1427,14 @@ mod tests {
                 credential_preview: None,
                 model: None,
                 revision: 1,
+                claude_model_mapping: None,
             },
             credential_command: "/opt/hsin".into(),
             proxy_host: "127.0.0.1".into(),
             proxy_port: 9999,
             disable_custom_auth: false,
             codex_auth_before_hash: None,
+            claude_model_env_before: None,
         }
     }
 
@@ -1465,6 +1555,7 @@ mod tests {
             credential_preview: None,
             model: None,
             revision: 1,
+            claude_model_mapping: None,
         };
         let patched = patch_codex(
             "# keep\nmodel_provider = \"hsin\"\napproval_policy = \"never\"\n[model_providers.hsin]\nname = \"hsin\"\nbase_url = \"http://127.0.0.1:9999/codex/v1\"\n",
@@ -1490,6 +1581,7 @@ mod tests {
             credential_preview: None,
             model: None,
             revision: 1,
+            claude_model_mapping: None,
         };
         let patched = patch_claude(
             r#"{
@@ -1753,11 +1845,107 @@ mod tests {
             credential_preview: None,
             model: None,
             revision: 1,
+            claude_model_mapping: None,
         };
         assert_eq!(
             patch_claude_with_credential(&managed, &claude, None).unwrap(),
             "{\n  \"env\": {\n  }\n}\n"
         );
+    }
+
+    fn mapped(model: &str, context_1m: bool) -> ModelSlot {
+        ModelSlot {
+            model: model.into(),
+            context_1m,
+        }
+    }
+
+    #[test]
+    fn claude_model_mapping_writes_each_mapped_tier_with_the_1m_suffix() {
+        let mut claude = target(ClientKind::Claude);
+        claude.provider.claude_model_mapping = Some(hsin_core::ClaudeModelMapping {
+            enabled: true,
+            fable: Some(mapped("claude-fable-5", false)),
+            opus: Some(mapped("claude-opus-5", true)),
+            sonnet: None,
+            haiku: Some(mapped("claude-haiku-4-5", false)),
+        });
+        let output = patch_claude_with_credential("", &claude, None).unwrap();
+        assert!(output.contains("\"ANTHROPIC_DEFAULT_FABLE_MODEL\": \"claude-fable-5\""));
+        assert!(output.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL\": \"claude-opus-5[1m]\""));
+        assert!(output.contains("\"ANTHROPIC_DEFAULT_HAIKU_MODEL\": \"claude-haiku-4-5\""));
+        // An unmapped tier is not written at all rather than being blanked out.
+        assert!(!output.contains("ANTHROPIC_DEFAULT_SONNET_MODEL"));
+    }
+
+    #[test]
+    fn a_disabled_claude_model_mapping_restores_the_user_values_it_replaced() {
+        let original = "{\n  \"env\": {\n    \"ANTHROPIC_DEFAULT_OPUS_MODEL\": \"mine\"\n  }\n}\n";
+        let snapshot = ClaudeModelEnvSnapshot::capture(original).unwrap();
+        assert_eq!(snapshot.get("ANTHROPIC_DEFAULT_OPUS_MODEL"), Some("mine"));
+
+        let mut claude = target(ClientKind::Claude);
+        claude.claude_model_env_before = Some(snapshot);
+        claude.provider.claude_model_mapping = Some(hsin_core::ClaudeModelMapping {
+            enabled: true,
+            opus: Some(mapped("claude-opus-5", false)),
+            ..hsin_core::ClaudeModelMapping::default()
+        });
+        let managed = patch_claude_with_credential(original, &claude, None).unwrap();
+        assert!(managed.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL\": \"claude-opus-5\""));
+
+        // Turning the mapping off puts the user's own value back instead of deleting the key.
+        claude.provider.claude_model_mapping = Some(hsin_core::ClaudeModelMapping {
+            enabled: false,
+            opus: Some(mapped("claude-opus-5", false)),
+            ..hsin_core::ClaudeModelMapping::default()
+        });
+        let restored = patch_claude_with_credential(&managed, &claude, None).unwrap();
+        assert!(restored.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL\": \"mine\""));
+    }
+
+    #[test]
+    fn a_provider_without_a_mapping_removes_keys_the_user_never_set() {
+        let mut claude = target(ClientKind::Claude);
+        claude.provider.claude_model_mapping = Some(hsin_core::ClaudeModelMapping {
+            enabled: true,
+            opus: Some(mapped("claude-opus-5", false)),
+            ..hsin_core::ClaudeModelMapping::default()
+        });
+        let managed = patch_claude_with_credential("", &claude, None).unwrap();
+        assert!(managed.contains("ANTHROPIC_DEFAULT_OPUS_MODEL"));
+
+        // Switching to a provider with no mapping at all, with an empty snapshot, clears the key.
+        claude.provider.claude_model_mapping = None;
+        let cleared = patch_claude_with_credential(&managed, &claude, None).unwrap();
+        assert!(!cleared.contains("ANTHROPIC_DEFAULT_OPUS_MODEL"));
+    }
+
+    #[test]
+    fn the_claude_model_mapping_never_touches_anthropic_model() {
+        let original = "{\n  \"env\": {\n    \"ANTHROPIC_MODEL\": \"user-choice\"\n  }\n}\n";
+        let mut claude = target(ClientKind::Claude);
+        claude.provider.claude_model_mapping = Some(hsin_core::ClaudeModelMapping {
+            enabled: true,
+            opus: Some(mapped("claude-opus-5", false)),
+            ..hsin_core::ClaudeModelMapping::default()
+        });
+        let output = patch_claude_with_credential(original, &claude, None).unwrap();
+        assert!(output.contains("\"ANTHROPIC_MODEL\": \"user-choice\""));
+    }
+
+    #[test]
+    fn official_claude_providers_ignore_the_model_mapping() {
+        let mut claude = target(ClientKind::Claude);
+        claude.provider.official = true;
+        claude.provider.auth_scheme = AuthScheme::OAuth;
+        claude.provider.claude_model_mapping = Some(hsin_core::ClaudeModelMapping {
+            enabled: true,
+            opus: Some(mapped("claude-opus-5", false)),
+            ..hsin_core::ClaudeModelMapping::default()
+        });
+        let output = patch_claude_with_credential("", &claude, None).unwrap();
+        assert!(!output.contains("ANTHROPIC_DEFAULT_OPUS_MODEL"));
     }
 
     #[test]

@@ -11,11 +11,12 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hsin_core::{
-    AppError, AuthScheme, ClientAuthSettings, ClientKind, ClientSettings, ConnectionMode,
-    DaemonStatus, DoctorFinding, DoctorReport, DoctorSeverity, ErrorCode, ImportCurrentParams,
-    ImportCurrentResult, KeyStoreState, ModelDiscoverParams, ModelDiscovery, ModelUpdate, Provider,
-    ProviderAddParams, ProviderEditParams, ProviderListParams, ProviderRemoveParams,
-    ProviderSwitchParams, SecretInput, SecurityStatus, Settings, SettingsPatch,
+    AppError, AuthScheme, ClaudeModelMappingUpdate, ClientAuthSettings, ClientKind, ClientSettings,
+    ConnectionMode, DaemonStatus, DoctorFinding, DoctorReport, DoctorSeverity, ErrorCode,
+    ImportCurrentParams, ImportCurrentResult, KeyStoreState, ModelDiscoverParams, ModelDiscovery,
+    ModelUpdate, Provider, ProviderAddParams, ProviderEditParams, ProviderListParams,
+    ProviderRemoveParams, ProviderSwitchParams, SecretInput, SecurityStatus, Settings,
+    SettingsPatch,
 };
 use parking_lot::RwLock;
 use secrecy::{ExposeSecret, SecretString};
@@ -264,6 +265,7 @@ impl App {
             credential_configured: false,
             credential_preview: None,
             model: None,
+            claude_model_mapping: None,
             revision: 1,
         };
         self.db.insert_provider(&provider, None)?;
@@ -296,6 +298,7 @@ impl App {
             base_url: detected.base_url,
             auth_scheme: detected.auth_scheme,
             model: None,
+            claude_model_mapping: None,
         };
         let mut provider = Database::new_provider(&input)?;
         let encrypted = detected
@@ -402,6 +405,7 @@ impl App {
             base_url: params.provider.base_url,
             auth_scheme: params.provider.auth_scheme,
             model: params.provider.model,
+            claude_model_mapping: params.provider.claude_model_mapping,
         };
         let mut provider = Database::new_provider(&input)?;
         let encrypted = self.crypto.encrypt_for(&provider, &api_key)?;
@@ -424,6 +428,11 @@ impl App {
             ModelUpdate::Set(model) => Some(model),
             ModelUpdate::Clear => None,
         };
+        let claude_model_mapping = match params.patch.claude_model_mapping {
+            ClaudeModelMappingUpdate::Preserve => current.claude_model_mapping.clone(),
+            ClaudeModelMappingUpdate::Set(mapping) => Some(mapping),
+            ClaudeModelMappingUpdate::Clear => None,
+        };
         let name = params.patch.name.unwrap_or(current.name);
         let input = ProviderInput {
             client: current.client,
@@ -432,6 +441,7 @@ impl App {
             base_url: params.patch.base_url.unwrap_or(current.base_url),
             auth_scheme: params.patch.auth_scheme.unwrap_or(current.auth_scheme),
             model,
+            claude_model_mapping,
         };
         input.validate()?;
         let mut provider = Provider {
@@ -445,6 +455,7 @@ impl App {
             credential_configured: current.credential_configured,
             credential_preview: None,
             model: input.model.as_ref().map(|model| model.trim().to_owned()),
+            claude_model_mapping: input.claude_model_mapping.clone(),
             revision: current.revision.saturating_add(1),
         };
         let state = self.db.client_state(provider.client)?;
@@ -578,6 +589,7 @@ impl App {
             base_url: params.base_url.clone(),
             auth_scheme: params.auth_scheme,
             model: None,
+            claude_model_mapping: None,
         };
         input.validate()?;
         let secret = match params.secret {
@@ -905,6 +917,11 @@ impl App {
         } else {
             None
         };
+        let claude_model_env_before = if provider.client == ClientKind::Claude {
+            Some(self.claude_model_env_snapshot()?)
+        } else {
+            None
+        };
         Ok(ConfigTarget {
             client: provider.client,
             mode,
@@ -915,7 +932,28 @@ impl App {
             disable_custom_auth: disable_custom_auth
                 .unwrap_or(self.disable_custom_auth(provider.client)?),
             codex_auth_before_hash,
+            claude_model_env_before,
         })
+    }
+
+    /// The user's own values for the model-mapping env keys, captured the first time hsin builds a
+    /// Claude config target and reused from then on — after that first capture the file may hold
+    /// hsin's own values, which must never be mistaken for the user's.
+    fn claude_model_env_snapshot(&self) -> Result<config::ClaudeModelEnvSnapshot> {
+        const SETTING: &str = "claude_model_env_before";
+        if let Some(stored) = self.db.setting(SETTING)? {
+            return Ok(serde_json::from_str(&stored)?);
+        }
+        let path = self.config_path(ClientKind::Claude)?;
+        let text = if path.exists() {
+            fs::read_to_string(&path)?
+        } else {
+            String::new()
+        };
+        let snapshot = config::ClaudeModelEnvSnapshot::capture(&text)?;
+        self.db
+            .set_setting(SETTING, &serde_json::to_string(&snapshot)?)?;
+        Ok(snapshot)
     }
 
     fn config_credential(&self, target: &ConfigTarget) -> Result<Option<SecretString>> {
@@ -1126,6 +1164,12 @@ impl App {
         let persisted = self.db.get_provider(&target.provider.id)?;
         target.provider.official = persisted.official;
         target.provider.credential_configured = persisted.credential_configured;
+        // A journal row written before the model-mapping field existed deserializes it as `None`;
+        // adopt the persisted value so the comparison below is not a false conflict.
+        target
+            .provider
+            .claude_model_mapping
+            .clone_from(&persisted.claude_model_mapping);
         if persisted != target.provider {
             return Err(DaemonError::Conflict(
                 "official provider state diverged during import recovery".into(),
@@ -1147,6 +1191,12 @@ impl App {
         let persisted = self.db.get_provider(&target.provider.id)?;
         target.provider.official = persisted.official;
         target.provider.credential_configured = persisted.credential_configured;
+        // A journal row written before the model-mapping field existed deserializes it as `None`;
+        // adopt the persisted value so the comparison below is not a false conflict.
+        target
+            .provider
+            .claude_model_mapping
+            .clone_from(&persisted.claude_model_mapping);
         if persisted != target.provider {
             if persisted.id == target.provider.id && persisted.revision < target.provider.revision {
                 return Ok(RecoveryOutcome::Aborted);
@@ -1788,6 +1838,7 @@ mod tests {
                 base_url: "https://preview.example.test/v1".into(),
                 auth_scheme: AuthScheme::Bearer,
                 model: None,
+                claude_model_mapping: None,
             },
             secret: SecretInput::Replace(secret.into()),
         })
@@ -1884,6 +1935,7 @@ mod tests {
                     base_url: "https://codex.example.test/v1".into(),
                     auth_scheme: AuthScheme::Bearer,
                     model: None,
+                    claude_model_mapping: None,
                 },
                 secret: SecretInput::Replace("sk-client-auth-secret".into()),
             })
@@ -2060,6 +2112,7 @@ mod tests {
                     base_url: "https://recovery.example.test/v1".into(),
                     auth_scheme: AuthScheme::Bearer,
                     model: None,
+                    claude_model_mapping: None,
                 },
                 secret: SecretInput::Replace("recovery-secret".into()),
             })
@@ -2162,6 +2215,7 @@ mod tests {
                     base_url: "https://upgrade.example.test/v1".into(),
                     auth_scheme: AuthScheme::Bearer,
                     model: None,
+                    claude_model_mapping: None,
                 },
                 secret: SecretInput::Replace("upgrade-secret".into()),
             })
@@ -2228,6 +2282,7 @@ mod tests {
                     base_url: "https://helper.example.test/v1".into(),
                     auth_scheme: AuthScheme::Bearer,
                     model: None,
+                    claude_model_mapping: None,
                 },
                 secret: SecretInput::Replace("helper-secret".into()),
             })
@@ -2388,6 +2443,7 @@ mod tests {
                     base_url: "https://oauth-import.example.test/v1".into(),
                     auth_scheme: AuthScheme::Bearer,
                     model: None,
+                    claude_model_mapping: None,
                 },
                 secret: SecretInput::Replace("import-secret".into()),
             })
@@ -2459,6 +2515,7 @@ mod tests {
                     base_url: "https://oauth-recovery.example.test/v1".into(),
                     auth_scheme: AuthScheme::Bearer,
                     model: None,
+                    claude_model_mapping: None,
                 },
                 secret: SecretInput::Replace("recovery-secret".into()),
             })
@@ -2754,6 +2811,7 @@ mod tests {
                     base_url: "https://codex.example.test/v1".into(),
                     auth_scheme: AuthScheme::Bearer,
                     model: None,
+                    claude_model_mapping: None,
                 },
                 secret: SecretInput::Replace("codex-secret".into()),
             })
@@ -2768,6 +2826,7 @@ mod tests {
                     base_url: "https://claude.example.test".into(),
                     auth_scheme: AuthScheme::XApiKey,
                     model: None,
+                    claude_model_mapping: None,
                 },
                 secret: SecretInput::Replace("claude-secret".into()),
             })

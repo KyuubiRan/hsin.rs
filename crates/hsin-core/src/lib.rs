@@ -12,7 +12,7 @@ use url::Url;
 pub const PROTOCOL_VERSION: u32 = 1;
 /// Monotonic CLI/daemon compatibility code. Bump when either side requires
 /// RPC fields or behavior that an older binary cannot provide.
-pub const VERSION_CODE: u32 = 21;
+pub const VERSION_CODE: u32 = 22;
 
 #[must_use]
 pub fn provider_name_from_url(value: &str) -> Option<String> {
@@ -276,6 +276,111 @@ pub enum ConfigStatus {
     Unavailable,
 }
 
+/// One Claude Code model tier mapped onto an upstream model ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelSlot {
+    pub model: String,
+    /// Requests the 1M-context variant, written as a `[1m]` suffix on the model ID.
+    #[serde(default)]
+    pub context_1m: bool,
+}
+
+impl ModelSlot {
+    /// The value written to `settings.json`, including the `[1m]` suffix when requested.
+    #[must_use]
+    pub fn resolved_model(&self) -> String {
+        let model = self.model.trim();
+        if self.context_1m {
+            format!("{model}[1m]")
+        } else {
+            model.to_owned()
+        }
+    }
+}
+
+/// Per-provider mapping of Claude Code's model tiers onto upstream model IDs.
+///
+/// Only meaningful for [`ClientKind::Claude`]. Tiers left as `None` are not written, and the whole
+/// mapping is inert while `enabled` is false.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeModelMapping {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fable: Option<ModelSlot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opus: Option<ModelSlot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sonnet: Option<ModelSlot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub haiku: Option<ModelSlot>,
+}
+
+impl ClaudeModelMapping {
+    /// The tiers in display order, paired with the `settings.json` env key each one owns.
+    #[must_use]
+    pub fn slots(&self) -> [(&'static str, Option<&ModelSlot>); 4] {
+        [
+            (CLAUDE_FABLE_MODEL_ENV, self.fable.as_ref()),
+            (CLAUDE_OPUS_MODEL_ENV, self.opus.as_ref()),
+            (CLAUDE_SONNET_MODEL_ENV, self.sonnet.as_ref()),
+            (CLAUDE_HAIKU_MODEL_ENV, self.haiku.as_ref()),
+        ]
+    }
+
+    /// Whether this mapping writes anything at all.
+    #[must_use]
+    pub fn is_inert(&self) -> bool {
+        !self.enabled || self.slots().iter().all(|(_, slot)| slot.is_none())
+    }
+
+    /// Validate the mapping for a provider bound to `client`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] when the mapping is attached to a non-Claude provider, a mapped
+    /// model ID is empty or oversized, or 1M context is requested for the Haiku tier (which has no
+    /// 1M variant upstream).
+    pub fn validate(&self, client: ClientKind) -> Result<(), ValidationError> {
+        if client != ClientKind::Claude {
+            return Err(ValidationError::new(
+                "claude_model_mapping",
+                "unsupported_client",
+            ));
+        }
+        for (field, slot) in self.slots() {
+            let Some(slot) = slot else { continue };
+            if slot.model.trim().is_empty() {
+                return Err(ValidationError::new(field, "empty"));
+            }
+            if slot.model.chars().count() > 256 {
+                return Err(ValidationError::new(field, "too_long"));
+            }
+        }
+        if self.haiku.as_ref().is_some_and(|slot| slot.context_1m) {
+            return Err(ValidationError::new(
+                CLAUDE_HAIKU_MODEL_ENV,
+                "context_1m_unsupported",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// `settings.json` env keys owned by [`ClaudeModelMapping`].
+pub const CLAUDE_FABLE_MODEL_ENV: &str = "ANTHROPIC_DEFAULT_FABLE_MODEL";
+pub const CLAUDE_OPUS_MODEL_ENV: &str = "ANTHROPIC_DEFAULT_OPUS_MODEL";
+pub const CLAUDE_SONNET_MODEL_ENV: &str = "ANTHROPIC_DEFAULT_SONNET_MODEL";
+pub const CLAUDE_HAIKU_MODEL_ENV: &str = "ANTHROPIC_DEFAULT_HAIKU_MODEL";
+
+/// Every env key the Claude model mapping may write, in display order.
+pub const CLAUDE_MODEL_ENV_KEYS: [&str; 4] = [
+    CLAUDE_FABLE_MODEL_ENV,
+    CLAUDE_OPUS_MODEL_ENV,
+    CLAUDE_SONNET_MODEL_ENV,
+    CLAUDE_HAIKU_MODEL_ENV,
+];
+
 /// Public provider metadata. Credentials are deliberately stored separately.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provider {
@@ -294,6 +399,8 @@ pub struct Provider {
     pub credential_preview: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_model_mapping: Option<ClaudeModelMapping>,
     pub revision: u64,
 }
 
@@ -314,6 +421,7 @@ impl Provider {
             base_url: self.base_url.clone(),
             auth_scheme: self.auth_scheme,
             model: self.model.clone(),
+            claude_model_mapping: self.claude_model_mapping.clone(),
         }
         .validate()
     }
@@ -329,6 +437,8 @@ pub struct ProviderDraft {
     pub auth_scheme: AuthScheme,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_model_mapping: Option<ClaudeModelMapping>,
 }
 
 impl ProviderDraft {
@@ -356,6 +466,10 @@ impl ProviderDraft {
             if model.chars().count() > 256 {
                 return Err(ValidationError::new("model", "too_long"));
             }
+        }
+
+        if let Some(mapping) = &self.claude_model_mapping {
+            mapping.validate(self.client)?;
         }
 
         let url = Url::parse(self.base_url.trim())
@@ -391,6 +505,24 @@ pub struct ProviderPatch {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "ModelUpdate::is_preserve")]
     pub model: ModelUpdate,
+    #[serde(default, skip_serializing_if = "ClaudeModelMappingUpdate::is_preserve")]
+    pub claude_model_mapping: ClaudeModelMappingUpdate,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ClaudeModelMappingUpdate {
+    #[default]
+    Preserve,
+    Set(ClaudeModelMapping),
+    Clear,
+}
+
+impl ClaudeModelMappingUpdate {
+    #[must_use]
+    pub const fn is_preserve(&self) -> bool {
+        matches!(self, Self::Preserve)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -827,6 +959,7 @@ mod tests {
             base_url: "https://api.example.com/v1".into(),
             auth_scheme: AuthScheme::Bearer,
             model: None,
+            claude_model_mapping: None,
         };
         assert!(valid.validate().is_ok());
 
@@ -930,5 +1063,84 @@ mod tests {
                 "retryable": true
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod claude_model_mapping_tests {
+    use super::*;
+
+    fn slot(model: &str, context_1m: bool) -> ModelSlot {
+        ModelSlot {
+            model: model.into(),
+            context_1m,
+        }
+    }
+
+    #[test]
+    fn the_1m_option_is_written_as_a_model_suffix() {
+        assert_eq!(
+            ModelSlot {
+                model: "claude-opus-5".into(),
+                context_1m: true,
+            }
+            .resolved_model(),
+            "claude-opus-5[1m]"
+        );
+        assert_eq!(
+            ModelSlot {
+                model: " claude-opus-5 ".into(),
+                context_1m: false,
+            }
+            .resolved_model(),
+            "claude-opus-5"
+        );
+    }
+
+    #[test]
+    fn a_mapping_is_inert_unless_enabled_with_at_least_one_tier() {
+        let mut mapping = ClaudeModelMapping::default();
+        assert!(mapping.is_inert());
+        mapping.enabled = true;
+        assert!(mapping.is_inert(), "enabled but empty writes nothing");
+        mapping.opus = Some(slot("claude-opus-5", false));
+        assert!(!mapping.is_inert());
+        mapping.enabled = false;
+        assert!(mapping.is_inert(), "the master switch overrides the tiers");
+    }
+
+    #[test]
+    fn mapping_validation_rejects_non_claude_providers_and_bad_models() {
+        let mapping = ClaudeModelMapping {
+            enabled: true,
+            opus: Some(slot("claude-opus-5", true)),
+            ..ClaudeModelMapping::default()
+        };
+        assert!(mapping.validate(ClientKind::Claude).is_ok());
+        // The mapping writes Claude Code settings, so it is meaningless on a Codex provider.
+        assert!(mapping.validate(ClientKind::Codex).is_err());
+
+        let empty = ClaudeModelMapping {
+            enabled: true,
+            opus: Some(slot("   ", false)),
+            ..ClaudeModelMapping::default()
+        };
+        assert!(empty.validate(ClientKind::Claude).is_err());
+
+        // claude-haiku-4-5 has no 1M-context variant upstream.
+        let haiku_1m = ClaudeModelMapping {
+            enabled: true,
+            haiku: Some(slot("claude-haiku-4-5", true)),
+            ..ClaudeModelMapping::default()
+        };
+        assert!(haiku_1m.validate(ClientKind::Claude).is_err());
+    }
+
+    #[test]
+    fn a_provider_serialized_before_the_mapping_existed_still_deserializes() {
+        let legacy = r#"{"id":"p","client":"claude","name":"n","base_url":"https://a.test",
+            "auth_scheme":"x_api_key","revision":1}"#;
+        let provider: Provider = serde_json::from_str(legacy).expect("legacy provider");
+        assert_eq!(provider.claude_model_mapping, None);
     }
 }

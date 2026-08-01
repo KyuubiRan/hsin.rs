@@ -407,6 +407,7 @@ fn make_verifier(key: &[u8; KEY_BYTES], version: u32) -> Result<(Vec<u8>, Vec<u8
         credential_configured: false,
         credential_preview: None,
         model: None,
+        claude_model_mapping: None,
         revision: 0,
     };
     let encrypted = encrypt_secret(&provider, VERIFIER_TEXT, &material)?;
@@ -426,6 +427,7 @@ fn verify_key(key: &[u8; KEY_BYTES], version: u32, nonce: &[u8], verifier: &[u8]
         credential_configured: false,
         credential_preview: None,
         model: None,
+        claude_model_mapping: None,
         revision: 0,
     };
     let encrypted = EncryptedSecret {
@@ -529,6 +531,7 @@ mod tests {
                 base_url: "https://example.test".into(),
                 auth_scheme: AuthScheme::Bearer,
                 model: None,
+                claude_model_mapping: None,
             })
             .unwrap();
         let encrypted = crypto.encrypt_for(&provider, "secret").unwrap();

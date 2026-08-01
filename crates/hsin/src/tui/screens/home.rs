@@ -4,15 +4,15 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use crate::i18n::I18n;
 
 use super::super::{
-    state::State,
+    state::{InputMode, State},
     theme::{MUTED, RED, WHITE},
-    widgets::{centered_fixed, content_width, display_width, draw_input_field},
+    widgets::draw_input_field,
 };
 
 pub(super) fn draw_provider_list(
@@ -22,10 +22,13 @@ pub(super) fn draw_provider_list(
     i18n: &I18n,
 ) {
     let active = state.active_id().map(str::to_owned);
+    let searching = !state.active_query().is_empty();
     let providers = state.visible_providers();
     let items = if providers.is_empty() {
         vec![ListItem::new(if state.loading {
             i18n.text("loading")
+        } else if searching {
+            i18n.text("no_search_results")
         } else {
             i18n.text("no_providers")
         })]
@@ -145,9 +148,14 @@ fn detail_line<'a>(label: &'a str, value: &'a str) -> Line<'a> {
     ])
 }
 
-pub(super) fn draw_search(frame: &mut Frame<'_>, area: Rect, query: &str, i18n: &I18n) {
-    let width = content_width(area, display_width(query).saturating_add(6), 32, 72);
-    let popup = centered_fixed(area, width, 3);
-    frame.render_widget(Clear, popup);
-    draw_input_field(frame, popup, i18n.text("search"), query, None, true);
+pub(super) fn draw_search(frame: &mut Frame<'_>, area: Rect, state: &State, i18n: &I18n) {
+    let focused = matches!(state.input, InputMode::Search(_));
+    draw_input_field(
+        frame,
+        area,
+        i18n.text("search"),
+        state.active_query(),
+        None,
+        focused,
+    );
 }

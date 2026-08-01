@@ -92,6 +92,7 @@ pub(super) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
             ModelPickerMode::Search => i18n.text("model_search_help"),
             ModelPickerMode::Manual(_) => i18n.text("model_manual_help"),
         },
+        InputMode::ModelMapping(_) => i18n.text("model_mapping_help"),
         InputMode::DeleteConfirm { .. } => i18n.text("delete_help"),
         InputMode::Settings(screen) => match &screen.page {
             SettingsPage::Root => i18n.text("settings_root_help"),
@@ -113,6 +114,12 @@ pub(super) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
             }
         },
     };
+    // With a committed filter, esc clears it instead of quitting; advertise that.
+    let help = if matches!(state.input, InputMode::Normal) && !state.search.is_empty() {
+        format!("{help} · {}", i18n.text("search_clear_hint"))
+    } else {
+        help.to_owned()
+    };
     let transient = match &state.input {
         InputMode::Form(form) => form.error.map(|error| i18n.text(error).to_owned()),
         InputMode::Models(picker) => picker
@@ -129,7 +136,7 @@ pub(super) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
                 .to_owned()
         })
     });
-    let (line, color) = transient.map_or_else(|| (help.to_owned(), MUTED), |notice| (notice, RED));
+    let (line, color) = transient.map_or((help, MUTED), |notice| (notice, RED));
     frame.render_widget(
         Paragraph::new(line)
             .style(Style::default().fg(color))

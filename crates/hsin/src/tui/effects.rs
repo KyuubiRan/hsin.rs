@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use hsin_core::{
-    ClientAuthUpdate, ClientKind, ClientSettings, ConnectionMode, ImportCurrentParams,
-    ImportCurrentResult, ModeSetParams, ModelDiscoverParams, ModelUpdate, Provider,
-    ProviderAddParams, ProviderDraft, ProviderEditParams, ProviderPatch, ProviderRemoveParams,
-    ProviderSwitchParams, SecretInput, Settings, SettingsPatch,
+    ClaudeModelMappingUpdate, ClientAuthUpdate, ClientKind, ClientSettings, ConnectionMode,
+    ImportCurrentParams, ImportCurrentResult, ModeSetParams, ModelDiscoverParams, ModelUpdate,
+    Provider, ProviderAddParams, ProviderDraft, ProviderEditParams, ProviderPatch,
+    ProviderRemoveParams, ProviderSwitchParams, SecretInput, Settings, SettingsPatch,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -177,6 +177,7 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
                     base_url: form.base_url,
                     auth_scheme: form.auth_scheme,
                     model,
+                    claude_model_mapping: None,
                 },
                 secret: if form.secret.is_empty() {
                     SecretInput::Clear
@@ -201,6 +202,7 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
                     auth_scheme: Some(form.auth_scheme),
                     description: Some(form.description),
                     model: form.model,
+                    claude_model_mapping: ClaudeModelMappingUpdate::Preserve,
                 },
                 secret: if form.secret.is_empty() {
                     SecretInput::Preserve

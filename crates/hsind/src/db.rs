@@ -13,9 +13,9 @@ use crate::{
     model::{AuthScheme, ClientKind, ClientState, ConnectionMode, Provider, ProviderInput},
 };
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
-const PROVIDER_COLUMNS: &str = "p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,EXISTS(SELECT 1 FROM provider_secrets configured WHERE configured.provider_id=p.id)";
+const PROVIDER_COLUMNS: &str = "p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,EXISTS(SELECT 1 FROM provider_secrets configured WHERE configured.provider_id=p.id),p.claude_model_mapping";
 
 pub struct Database {
     connection: Mutex<Connection>,
@@ -114,6 +114,7 @@ impl Database {
             credential_configured: false,
             credential_preview: None,
             model: input.model.as_ref().map(|model| model.trim().to_owned()),
+            claude_model_mapping: input.claude_model_mapping.clone(),
             revision: 1,
         })
     }
@@ -127,8 +128,8 @@ impl Database {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = unix_time()?;
         transaction.execute(
-            "INSERT INTO providers(id,client,name,description,base_url,auth_scheme,model,revision,official,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10)",
-            params![provider.id, provider.client.to_string(), provider.name, provider.description, provider.base_url, provider.auth_scheme.to_string(), provider.model, provider.revision, provider.official, now],
+            "INSERT INTO providers(id,client,name,description,base_url,auth_scheme,model,revision,official,claude_model_mapping,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)",
+            params![provider.id, provider.client.to_string(), provider.name, provider.description, provider.base_url, provider.auth_scheme.to_string(), provider.model, provider.revision, provider.official, encode_model_mapping(provider)?, now],
         ).map_err(map_constraint)?;
         if let Some(secret) = secret {
             upsert_secret(&transaction, secret, now)?;
@@ -147,8 +148,8 @@ impl Database {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = unix_time()?;
         let changed = transaction.execute(
-            "UPDATE providers SET name=?1,description=?2,base_url=?3,auth_scheme=?4,model=?5,revision=revision+1,updated_at=?6 WHERE id=?7 AND client=?8 AND revision=?9",
-            params![provider.name, provider.description, provider.base_url, provider.auth_scheme.to_string(), provider.model, now, provider.id, provider.client.to_string(), expected_revision],
+            "UPDATE providers SET name=?1,description=?2,base_url=?3,auth_scheme=?4,model=?5,claude_model_mapping=?6,revision=revision+1,updated_at=?7 WHERE id=?8 AND client=?9 AND revision=?10",
+            params![provider.name, provider.description, provider.base_url, provider.auth_scheme.to_string(), provider.model, encode_model_mapping(provider)?, now, provider.id, provider.client.to_string(), expected_revision],
         ).map_err(map_constraint)?;
         if changed == 0 {
             return Err(DaemonError::Conflict(
@@ -262,7 +263,7 @@ impl Database {
         self.connection
             .lock()
             .query_row(
-                "SELECT p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,1,s.provider_id,s.key_version,s.nonce,s.ciphertext FROM providers p JOIN provider_secrets s ON s.provider_id=p.id WHERE p.id=?1 AND p.client=?2 AND p.revision=?3",
+                "SELECT p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,1,p.claude_model_mapping,s.provider_id,s.key_version,s.nonce,s.ciphertext FROM providers p JOIN provider_secrets s ON s.provider_id=p.id WHERE p.id=?1 AND p.client=?2 AND p.revision=?3",
                 params![provider_id, client.to_string(), revision],
                 provider_secret_from_row,
             )
@@ -274,7 +275,7 @@ impl Database {
         self.connection
             .lock()
             .query_row(
-                "SELECT p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,1,s.provider_id,s.key_version,s.nonce,s.ciphertext FROM client_state c JOIN providers p ON p.id=c.active_provider_id JOIN provider_secrets s ON s.provider_id=p.id WHERE c.client=?1 AND p.client=?1",
+                "SELECT p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,1,p.claude_model_mapping,s.provider_id,s.key_version,s.nonce,s.ciphertext FROM client_state c JOIN providers p ON p.id=c.active_provider_id JOIN provider_secrets s ON s.provider_id=p.id WHERE c.client=?1 AND p.client=?1",
                 [client.to_string()],
                 provider_secret_from_row,
             )
@@ -469,7 +470,7 @@ fn migrate(connection: &Connection) -> Result<()> {
     if version == 0 {
         connection.execute_batch(
             "BEGIN IMMEDIATE;
-         CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY,client TEXT NOT NULL CHECK(client IN ('codex','claude')),name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',base_url TEXT NOT NULL,auth_scheme TEXT NOT NULL CHECK(auth_scheme IN ('bearer','x_api_key','oauth')),model TEXT,revision INTEGER NOT NULL,official INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(client,name));
+         CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY,client TEXT NOT NULL CHECK(client IN ('codex','claude')),name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',base_url TEXT NOT NULL,auth_scheme TEXT NOT NULL CHECK(auth_scheme IN ('bearer','x_api_key','oauth')),model TEXT,revision INTEGER NOT NULL,official INTEGER NOT NULL DEFAULT 0,claude_model_mapping TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(client,name));
          CREATE TABLE IF NOT EXISTS provider_secrets(provider_id TEXT PRIMARY KEY REFERENCES providers(id) ON DELETE CASCADE,key_version INTEGER NOT NULL,nonce BLOB NOT NULL,ciphertext BLOB NOT NULL,updated_at INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS client_state(client TEXT PRIMARY KEY CHECK(client IN ('codex','claude')),active_provider_id TEXT REFERENCES providers(id),mode TEXT NOT NULL CHECK(mode IN ('direct','proxy')),config_status TEXT NOT NULL,updated_at INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL);
@@ -478,7 +479,7 @@ fn migrate(connection: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS protected_values(key TEXT PRIMARY KEY,key_version INTEGER NOT NULL,nonce BLOB NOT NULL,ciphertext BLOB NOT NULL,updated_at INTEGER NOT NULL);
          INSERT OR IGNORE INTO client_state(client,mode,config_status,updated_at) VALUES('codex','direct','unmanaged',0),('claude','direct','unmanaged',0);
          INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES('language','system',0),('proxy_host','127.0.0.1',0),('proxy_port','9999',0),('proxy_enabled','false',0);
-         PRAGMA user_version=4;
+         PRAGMA user_version=5;
          COMMIT;"
         )?;
     } else {
@@ -512,6 +513,15 @@ fn migrate(connection: &Connection) -> Result<()> {
                 "BEGIN IMMEDIATE;
                  CREATE TABLE protected_values(key TEXT PRIMARY KEY,key_version INTEGER NOT NULL,nonce BLOB NOT NULL,ciphertext BLOB NOT NULL,updated_at INTEGER NOT NULL);
                  PRAGMA user_version=4;
+                 COMMIT;",
+            )?;
+            version = 4;
+        }
+        if version == 4 {
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE providers ADD COLUMN claude_model_mapping TEXT;
+                 PRAGMA user_version=5;
                  COMMIT;",
             )?;
         }
@@ -573,6 +583,7 @@ fn prune_backups(directory: &Path) -> Result<()> {
 fn provider_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Provider> {
     let client: String = row.get(1)?;
     let auth: String = row.get(5)?;
+    let mapping: Option<String> = row.get(10)?;
     Ok(Provider {
         id: row.get(0)?,
         client: ClientKind::from_str(&client).map_err(parse_to_sql_error)?,
@@ -585,7 +596,30 @@ fn provider_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Provider> {
         official: row.get(8)?,
         credential_configured: row.get(9)?,
         credential_preview: None,
+        claude_model_mapping: mapping
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    10,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
     })
+}
+
+/// Serialize the Claude model mapping for the `claude_model_mapping` column.
+fn encode_model_mapping(provider: &Provider) -> Result<Option<String>> {
+    provider
+        .claude_model_mapping
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| {
+            DaemonError::Invalid(format!("claude model mapping is not encodable: {error}"))
+        })
 }
 
 fn provider_secret_from_row(
@@ -593,10 +627,10 @@ fn provider_secret_from_row(
 ) -> rusqlite::Result<(Provider, EncryptedSecret)> {
     let provider = provider_from_row(row)?;
     let secret = EncryptedSecret {
-        provider_id: row.get(10)?,
-        key_version: row.get(11)?,
-        nonce: row.get(12)?,
-        ciphertext: row.get(13)?,
+        provider_id: row.get(11)?,
+        key_version: row.get(12)?,
+        nonce: row.get(13)?,
+        ciphertext: row.get(14)?,
     };
     Ok((provider, secret))
 }
@@ -656,6 +690,7 @@ mod tests {
                 base_url: "https://example.test/v1".into(),
                 auth_scheme: AuthScheme::Bearer,
                 model: Some("gpt-test".into()),
+                claude_model_mapping: None,
             })
             .unwrap();
         assert_eq!(provider.revision, 1);
@@ -666,6 +701,7 @@ mod tests {
             base_url: "https://example.test".into(),
             auth_scheme: AuthScheme::XApiKey,
             model: None,
+            claude_model_mapping: None,
         })
         .unwrap();
         let encrypted = EncryptedSecret {
@@ -764,7 +800,7 @@ mod tests {
         assert_eq!(provider.model, None);
         assert!(!provider.official);
         assert!(!provider.credential_configured);
-        assert_eq!(database_version(&path).unwrap(), 4);
+        assert_eq!(database_version(&path).unwrap(), 5);
         assert_eq!(fs::read_dir(backups).unwrap().count(), 1);
         drop(db);
         fs::remove_dir_all(root).unwrap();
@@ -802,7 +838,7 @@ mod tests {
             db.setting("proxy_enabled").unwrap().as_deref(),
             Some("true")
         );
-        assert_eq!(database_version(&path).unwrap(), 4);
+        assert_eq!(database_version(&path).unwrap(), 5);
         drop(db);
         fs::remove_dir_all(root).unwrap();
     }
@@ -815,7 +851,8 @@ mod tests {
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(
-                "CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL);
+                "CREATE TABLE providers(id TEXT PRIMARY KEY,client TEXT NOT NULL,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',base_url TEXT NOT NULL,auth_scheme TEXT NOT NULL,model TEXT,revision INTEGER NOT NULL,official INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(client,name));
+                 CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL);
                  PRAGMA user_version=3;",
             )
             .unwrap();
@@ -829,8 +866,56 @@ mod tests {
             ciphertext: vec![1],
         })
         .unwrap();
-        assert_eq!(database_version(&path).unwrap(), 4);
+        assert_eq!(database_version(&path).unwrap(), 5);
         assert!(db.protected_value("backup").unwrap().is_some());
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn version_four_migration_adds_the_claude_model_mapping_column() {
+        let root = std::env::temp_dir().join(format!("hsind-v4-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("db.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE providers(id TEXT PRIMARY KEY,client TEXT NOT NULL,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',base_url TEXT NOT NULL,auth_scheme TEXT NOT NULL,model TEXT,revision INTEGER NOT NULL,official INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(client,name));
+                 CREATE TABLE provider_secrets(provider_id TEXT PRIMARY KEY REFERENCES providers(id) ON DELETE CASCADE,key_version INTEGER NOT NULL,nonce BLOB NOT NULL,ciphertext BLOB NOT NULL,updated_at INTEGER NOT NULL);
+                 CREATE TABLE client_state(client TEXT PRIMARY KEY,active_provider_id TEXT REFERENCES providers(id),mode TEXT NOT NULL,config_status TEXT NOT NULL,updated_at INTEGER NOT NULL);
+                 CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL);
+                 CREATE TABLE operations(id TEXT PRIMARY KEY,kind TEXT NOT NULL,client TEXT NOT NULL,state TEXT NOT NULL,before_hash TEXT,target_json TEXT NOT NULL,error TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+                 CREATE TABLE encryption_keys(version INTEGER PRIMARY KEY,verifier_nonce BLOB NOT NULL,verifier BLOB NOT NULL,created_at INTEGER NOT NULL,is_current INTEGER NOT NULL);
+                 CREATE TABLE protected_values(key TEXT PRIMARY KEY,key_version INTEGER NOT NULL,nonce BLOB NOT NULL,ciphertext BLOB NOT NULL,updated_at INTEGER NOT NULL);
+                 INSERT INTO providers VALUES('p','claude','Legacy','','https://example.test','x_api_key',NULL,1,0,0,0);
+                 PRAGMA user_version=4;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let db = Database::open(&path, &root.join("backups")).unwrap();
+        assert_eq!(database_version(&path).unwrap(), 5);
+        // Rows written before the column existed read back as "no mapping", not as an error.
+        let provider = db.get_provider("p").unwrap();
+        assert_eq!(provider.claude_model_mapping, None);
+
+        let mapping = crate::model::ClaudeModelMapping {
+            enabled: true,
+            opus: Some(hsin_core::ModelSlot {
+                model: "claude-opus-5".into(),
+                context_1m: true,
+            }),
+            ..crate::model::ClaudeModelMapping::default()
+        };
+        let updated = Provider {
+            claude_model_mapping: Some(mapping.clone()),
+            ..provider
+        };
+        db.update_provider(&updated, 1, None).unwrap();
+        assert_eq!(
+            db.get_provider("p").unwrap().claude_model_mapping,
+            Some(mapping)
+        );
         drop(db);
         fs::remove_dir_all(root).unwrap();
     }

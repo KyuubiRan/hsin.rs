@@ -2,9 +2,10 @@ use std::net::IpAddr;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hsin_core::{
-    AuthScheme, ClientAuthSettings, ClientKind, ClientSettings, ConnectionMode, LANGUAGE_EN_US,
-    LANGUAGE_SYSTEM, LANGUAGE_ZH_CN, ModelDiscovery, ModelUpdate, Provider, Settings,
-    convert_provider_base_url, normalize_generated_provider_name, provider_name_from_url,
+    AuthScheme, ClaudeModelMapping, ClaudeModelMappingUpdate, ClientAuthSettings, ClientKind,
+    ClientSettings, ConnectionMode, LANGUAGE_EN_US, LANGUAGE_SYSTEM, LANGUAGE_ZH_CN,
+    ModelDiscovery, ModelSlot, ModelUpdate, Provider, Settings, convert_provider_base_url,
+    normalize_generated_provider_name, provider_name_from_url,
 };
 use zeroize::Zeroizing;
 
@@ -54,6 +55,8 @@ pub(super) struct State {
     pub(super) notice: Option<String>,
     pub(super) input: InputMode,
     pub(super) pending_effect: Option<Effect>,
+    /// Filter committed with enter; survives leaving [`InputMode::Search`].
+    pub(super) search: String,
 }
 
 impl Default for State {
@@ -74,6 +77,7 @@ impl Default for State {
             notice: None,
             input: InputMode::Normal,
             pending_effect: None,
+            search: String::new(),
         }
     }
 }
@@ -85,6 +89,7 @@ pub(super) enum InputMode {
     Search(String),
     Form(ProviderForm),
     Models(ModelPicker),
+    ModelMapping(ModelMappingForm),
     DeleteConfirm {
         id: String,
         revision: u64,
@@ -140,6 +145,8 @@ pub(super) struct ProviderForm {
     pub(super) error: Option<&'static str>,
     pub(super) secret_visible: bool,
     pub(super) discovering_models: bool,
+    /// Carried through the form so the mapping dialog can prefill an existing provider's tiers.
+    pub(super) claude_model_mapping: Option<ClaudeModelMapping>,
 }
 
 pub(super) struct ProviderClipboard {
@@ -157,6 +164,105 @@ pub(super) struct FormSubmission {
     pub(super) auth_scheme: AuthScheme,
     pub(super) secret: Zeroizing<String>,
     pub(super) model: ModelUpdate,
+    pub(super) claude_model_mapping: ClaudeModelMappingUpdate,
+}
+
+/// The Claude model tiers, in display order. The default is the ghost text shown in an empty box
+/// and completed by tab; `context_1m` marks the tiers that actually have a 1M-context variant.
+pub(super) struct MappingTier {
+    pub(super) label: &'static str,
+    pub(super) default_model: &'static str,
+    pub(super) context_1m: bool,
+}
+
+pub(super) const MAPPING_TIERS: [MappingTier; 4] = [
+    MappingTier {
+        label: "Fable",
+        default_model: "claude-fable-5",
+        context_1m: true,
+    },
+    MappingTier {
+        label: "Opus",
+        default_model: "claude-opus-5",
+        context_1m: true,
+    },
+    MappingTier {
+        label: "Sonnet",
+        default_model: "claude-sonnet-5",
+        context_1m: true,
+    },
+    MappingTier {
+        // Haiku 4.5 has no 1M-context variant upstream, so it gets no checkbox.
+        label: "Haiku",
+        default_model: "claude-haiku-4-5",
+        context_1m: false,
+    },
+];
+
+#[derive(Default, Clone)]
+pub(super) struct MappingRow {
+    pub(super) model: String,
+    pub(super) context_1m: bool,
+}
+
+/// Second step of the Claude provider form: map Claude Code's model tiers onto upstream IDs.
+pub(super) struct ModelMappingForm {
+    pub(super) form: FormSubmission,
+    pub(super) enabled: bool,
+    pub(super) rows: [MappingRow; 4],
+    /// `0` is the master toggle; `1..=4` are the tier rows.
+    pub(super) field: usize,
+}
+
+impl ModelMappingForm {
+    fn from_existing(form: FormSubmission, existing: Option<&ClaudeModelMapping>) -> Self {
+        let slot = |slot: Option<&ModelSlot>| {
+            slot.map_or_else(MappingRow::default, |slot| MappingRow {
+                model: slot.model.clone(),
+                context_1m: slot.context_1m,
+            })
+        };
+        let (enabled, rows) = existing.map_or_else(
+            || (false, [(); 4].map(|()| MappingRow::default())),
+            |mapping| {
+                (
+                    mapping.enabled,
+                    [
+                        slot(mapping.fable.as_ref()),
+                        slot(mapping.opus.as_ref()),
+                        slot(mapping.sonnet.as_ref()),
+                        slot(mapping.haiku.as_ref()),
+                    ],
+                )
+            },
+        );
+        Self {
+            form,
+            enabled,
+            rows,
+            field: 0,
+        }
+    }
+
+    /// The mapping to persist, or `None` when nothing would be written.
+    fn mapping(&self) -> Option<ClaudeModelMapping> {
+        let slot = |index: usize| {
+            let row = &self.rows[index];
+            let model = row.model.trim();
+            (!model.is_empty()).then(|| ModelSlot {
+                model: model.to_owned(),
+                context_1m: row.context_1m && MAPPING_TIERS[index].context_1m,
+            })
+        };
+        let mapping = ClaudeModelMapping {
+            enabled: self.enabled,
+            fable: slot(0),
+            opus: slot(1),
+            sonnet: slot(2),
+            haiku: slot(3),
+        };
+        (!mapping.is_inert()).then_some(mapping)
+    }
 }
 
 pub(super) struct ModelPicker {
@@ -316,12 +422,25 @@ impl State {
         }
         match &mut self.input {
             InputMode::Search(query) => match key.code {
-                KeyCode::Esc | KeyCode::Enter => self.input = InputMode::Normal,
+                KeyCode::Enter => {
+                    let committed = std::mem::take(query);
+                    self.input = InputMode::Normal;
+                    self.search = committed;
+                    self.selected = 0;
+                }
+                KeyCode::Esc => {
+                    self.input = InputMode::Normal;
+                    self.selected = 0;
+                }
+                KeyCode::Char('u' | 'U') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    query.clear();
+                    self.selected = 0;
+                }
                 KeyCode::Backspace => {
                     query.pop();
                     self.selected = 0;
                 }
-                KeyCode::Char(character) => {
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     query.push(character);
                     self.selected = 0;
                 }
@@ -375,25 +494,93 @@ impl State {
                 },
                 KeyCode::Enter => match take_form_submission(form) {
                     Ok(submission) => {
-                        let discovering_models = submission.client == ClientKind::Codex;
-                        self.pending_effect = Some(if discovering_models {
-                            Effect::DiscoverModels(submission)
-                        } else if submission.id.is_some() {
-                            Effect::Edit(submission)
-                        } else {
-                            Effect::Add(submission)
-                        });
-                        self.loading = true;
-                        if discovering_models {
-                            form.discovering_models = true;
-                            self.notice = Some("@fetching_models".into());
-                        } else {
-                            self.notice = None;
-                            self.input = InputMode::Normal;
+                        // Codex resolves a model by discovery; Claude maps the model tiers by hand.
+                        match submission.client {
+                            ClientKind::Codex => {
+                                self.pending_effect = Some(Effect::DiscoverModels(submission));
+                                self.loading = true;
+                                form.discovering_models = true;
+                                self.notice = Some("@fetching_models".into());
+                            }
+                            ClientKind::Claude => {
+                                let existing = form.claude_model_mapping.clone();
+                                self.notice = None;
+                                self.input = InputMode::ModelMapping(
+                                    ModelMappingForm::from_existing(submission, existing.as_ref()),
+                                );
+                            }
                         }
                     }
                     Err(error) => form.error = Some(error),
                 },
+                _ => {}
+            },
+            InputMode::ModelMapping(mapping) => match key.code {
+                KeyCode::Esc => self.input = InputMode::Normal,
+                KeyCode::Up | KeyCode::BackTab => {
+                    mapping.field = mapping.field.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    let last = if mapping.enabled {
+                        MAPPING_TIERS.len()
+                    } else {
+                        0
+                    };
+                    mapping.field = (mapping.field + 1).min(last);
+                }
+                KeyCode::Char('u' | 'U') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(row) = mapping.field.checked_sub(1) {
+                        mapping.rows[row].model.clear();
+                    }
+                }
+                // Tab completes the ghost default instead of moving focus; the model rows are the
+                // only place in the TUI where a suggested value is worth one keystroke.
+                KeyCode::Tab => {
+                    if let Some(row) = mapping.field.checked_sub(1)
+                        && mapping.rows[row].model.trim().is_empty()
+                    {
+                        MAPPING_TIERS[row]
+                            .default_model
+                            .clone_into(&mut mapping.rows[row].model);
+                    }
+                }
+                // ←/→ only reaches the master switch: on a tier row those keys sit next to the
+                // model text being typed, so flipping 1M with them was too easy to do by accident.
+                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if mapping.field == 0 => {
+                    mapping.enabled = !mapping.enabled;
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(row) = mapping.field.checked_sub(1)
+                        && MAPPING_TIERS[row].context_1m
+                    {
+                        mapping.rows[row].context_1m = !mapping.rows[row].context_1m;
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(row) = mapping.field.checked_sub(1) {
+                        mapping.rows[row].model.pop();
+                    }
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(row) = mapping.field.checked_sub(1) {
+                        mapping.rows[row].model.push(character);
+                    }
+                }
+                KeyCode::Enter => {
+                    let update = mapping.mapping().map_or(
+                        ClaudeModelMappingUpdate::Clear,
+                        ClaudeModelMappingUpdate::Set,
+                    );
+                    mapping.form.claude_model_mapping = update;
+                    let submission = take_submission(&mut mapping.form);
+                    self.pending_effect = Some(if submission.id.is_some() {
+                        Effect::Edit(submission)
+                    } else {
+                        Effect::Add(submission)
+                    });
+                    self.loading = true;
+                    self.input = InputMode::Normal;
+                }
                 _ => {}
             },
             InputMode::Models(picker) => match &mut picker.mode {
@@ -760,7 +947,14 @@ impl State {
                 }
             },
             InputMode::Normal => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => return Transition::Quit,
+                KeyCode::Char('q') => return Transition::Quit,
+                KeyCode::Esc => {
+                    if self.search.is_empty() {
+                        return Transition::Quit;
+                    }
+                    self.search.clear();
+                    self.selected = 0;
+                }
                 KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     self.client = self.previous_visible_client();
                     self.selected = 0;
@@ -801,7 +995,7 @@ impl State {
                         page: SettingsPage::Root,
                     });
                 }
-                KeyCode::Char('/') => self.input = InputMode::Search(String::new()),
+                KeyCode::Char('/') => self.input = InputMode::Search(self.search.clone()),
                 KeyCode::Char('a') => {
                     self.input = InputMode::Form(ProviderForm {
                         id: None,
@@ -820,6 +1014,7 @@ impl State {
                         error: None,
                         secret_visible: false,
                         discovering_models: false,
+                        claude_model_mapping: None,
                     });
                 }
                 KeyCode::Char('e') => {
@@ -844,6 +1039,7 @@ impl State {
                             error: None,
                             secret_visible: false,
                             discovering_models: false,
+                            claude_model_mapping: provider.claude_model_mapping,
                         });
                     }
                 }
@@ -891,6 +1087,10 @@ impl State {
                         error: None,
                         secret_visible: false,
                         discovering_models: false,
+                        // A mapping only makes sense for the client it was written for.
+                        claude_model_mapping: (source.client == self.client)
+                            .then(|| source.claude_model_mapping.clone())
+                            .flatten(),
                     });
                 }
                 KeyCode::Char('d') => {
@@ -929,10 +1129,19 @@ impl State {
         self.pending_effect.take()
     }
 
+    /// The filter currently shaping the provider list: the in-progress draft while the search bar
+    /// has focus, otherwise the query committed with enter.
+    pub(super) fn active_query(&self) -> &str {
+        match &self.input {
+            InputMode::Search(query) => query,
+            _ => &self.search,
+        }
+    }
+
     pub(super) fn visible_providers(&self) -> Vec<&Provider> {
-        let query = match &self.input {
-            InputMode::Search(query) if !query.is_empty() => Some(query.to_ascii_lowercase()),
-            _ => None,
+        let query = match self.active_query() {
+            "" => None,
+            query => Some(query.to_ascii_lowercase()),
         };
         self.providers
             .iter()
@@ -1055,6 +1264,7 @@ pub(super) fn take_form_submission(
         auth_scheme: form.auth_scheme,
         secret,
         model: ModelUpdate::Preserve,
+        claude_model_mapping: ClaudeModelMappingUpdate::Preserve,
     })
 }
 
@@ -1083,6 +1293,7 @@ fn take_submission(form: &mut FormSubmission) -> FormSubmission {
         auth_scheme: form.auth_scheme,
         secret: std::mem::take(&mut form.secret),
         model: std::mem::take(&mut form.model),
+        claude_model_mapping: std::mem::take(&mut form.claude_model_mapping),
     }
 }
 

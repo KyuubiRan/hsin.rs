@@ -1,8 +1,8 @@
 use super::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hsin_core::{
-    AuthScheme, ClientKind, ClientSettings, LANGUAGE_EN_US, LANGUAGE_SYSTEM, LANGUAGE_ZH_CN,
-    ModelUpdate, Provider, Settings,
+    AuthScheme, ClaudeModelMapping, ClaudeModelMappingUpdate, ClientKind, ClientSettings,
+    LANGUAGE_EN_US, LANGUAGE_SYSTEM, LANGUAGE_ZH_CN, ModelSlot, ModelUpdate, Provider, Settings,
 };
 use ratatui::{
     backend::TestBackend,
@@ -40,6 +40,7 @@ fn submission() -> FormSubmission {
         auth_scheme: AuthScheme::Bearer,
         secret: Zeroizing::new("secret".into()),
         model: ModelUpdate::Preserve,
+        claude_model_mapping: ClaudeModelMappingUpdate::Preserve,
     }
 }
 
@@ -55,6 +56,7 @@ fn example_provider() -> Provider {
         credential_configured: true,
         credential_preview: Some(String::from("sk-abc***de")),
         model: Some(String::from("gpt-5")),
+        claude_model_mapping: None,
         revision: 1,
     }
 }
@@ -599,6 +601,7 @@ fn add_form_defaults_empty_name_to_base_url_host() {
         error: None,
         secret_visible: false,
         discovering_models: false,
+        claude_model_mapping: None,
     };
     let submission = take_form_submission(&mut form).unwrap();
     assert_eq!(submission.name, "example");
@@ -1628,4 +1631,378 @@ fn a_missing_recovery_key_is_announced_until_it_is_exported() {
 
     let held = rendered_with(crate::rpc::StatusSnapshot::default());
     assert!(!held.contains("No recovery key exported"));
+}
+
+fn named_provider(id: &str, name: &str, base_url: &str) -> Provider {
+    Provider {
+        id: id.into(),
+        name: name.into(),
+        base_url: base_url.into(),
+        ..example_provider()
+    }
+}
+
+fn searchable_state() -> State {
+    let mut state = State {
+        loading: false,
+        ..State::default()
+    };
+    state.providers = vec![
+        named_provider("a", "Alpha", "https://alpha.test/v1"),
+        named_provider("b", "Beta", "https://beta.test/v1"),
+    ];
+    state
+}
+
+fn type_query(state: &mut State, query: &str) {
+    for character in query.chars() {
+        state.reduce(key(KeyCode::Char(character)));
+    }
+}
+
+fn render(state: &mut State, width: u16, height: u16) -> String {
+    let locale = I18n::new(Some(LANGUAGE_EN_US));
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+    terminal
+        .draw(|frame| draw(frame, state, &locale))
+        .expect("draw");
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>()
+}
+
+#[test]
+fn enter_applies_the_search_instead_of_discarding_it() {
+    // The footer advertises "enter apply"; before this the query lived inside the input mode and
+    // was dropped the moment enter returned to the normal screen.
+    let mut state = searchable_state();
+    state.reduce(key(KeyCode::Char('/')));
+    type_query(&mut state, "alpha");
+    state.reduce(key(KeyCode::Enter));
+
+    assert!(matches!(state.input, InputMode::Normal));
+    assert_eq!(state.search, "alpha");
+    let visible = state.visible_providers();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].name, "Alpha");
+}
+
+#[test]
+fn escape_in_the_search_box_keeps_the_previously_applied_filter() {
+    let mut state = searchable_state();
+    state.reduce(key(KeyCode::Char('/')));
+    type_query(&mut state, "alpha");
+    state.reduce(key(KeyCode::Enter));
+
+    // Reopening prefills the committed query, and abandoning the edit must not drop it.
+    state.reduce(key(KeyCode::Char('/')));
+    assert!(matches!(&state.input, InputMode::Search(query) if query == "alpha"));
+    type_query(&mut state, "zzz");
+    state.reduce(key(KeyCode::Esc));
+
+    assert_eq!(state.search, "alpha");
+    assert_eq!(state.visible_providers().len(), 1);
+}
+
+#[test]
+fn control_u_clears_the_search_query_instead_of_typing_u() {
+    let mut state = searchable_state();
+    state.reduce(key(KeyCode::Char('/')));
+    type_query(&mut state, "alpha");
+    state.reduce(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+
+    assert!(matches!(&state.input, InputMode::Search(query) if query.is_empty()));
+    assert_eq!(state.visible_providers().len(), 2);
+}
+
+#[test]
+fn escape_clears_an_active_filter_before_it_quits() {
+    // Quitting is the only way out of the normal screen, so esc has to do double duty: an applied
+    // filter would otherwise be unclearable without reopening the search box.
+    let mut state = searchable_state();
+    state.reduce(key(KeyCode::Char('/')));
+    type_query(&mut state, "alpha");
+    state.reduce(key(KeyCode::Enter));
+
+    assert_eq!(state.reduce(key(KeyCode::Esc)), Transition::Continue);
+    assert!(state.search.is_empty());
+    assert_eq!(state.visible_providers().len(), 2);
+    assert_eq!(state.reduce(key(KeyCode::Esc)), Transition::Quit);
+}
+
+#[test]
+fn q_still_quits_with_an_active_filter() {
+    let mut state = searchable_state();
+    state.search = "alpha".into();
+    assert_eq!(state.reduce(key(KeyCode::Char('q'))), Transition::Quit);
+}
+
+#[test]
+fn an_empty_search_result_is_distinct_from_an_unconfigured_provider_list() {
+    // Both render an empty list, but "no providers configured" sends the operator off to add one
+    // when the real problem is the filter.
+    let mut state = searchable_state();
+    state.search = "nothing-matches".into();
+    let filtered = render(&mut state, 100, 32);
+    assert!(filtered.contains("No providers match the search"));
+    assert!(!filtered.contains("No providers configured"));
+
+    let mut empty = State {
+        loading: false,
+        ..State::default()
+    };
+    let rendered = render(&mut empty, 100, 32);
+    assert!(rendered.contains("No providers configured"));
+}
+
+#[test]
+fn the_search_bar_docks_above_the_list_rather_than_covering_it() {
+    let mut state = searchable_state();
+    state.reduce(key(KeyCode::Char('/')));
+    type_query(&mut state, "a");
+    let rendered = render(&mut state, 100, 32);
+    // The bar is visible and both matches are still readable behind it.
+    assert!(rendered.contains("Search"));
+    assert!(rendered.contains("Alpha"));
+    assert!(rendered.contains("Beta"));
+}
+
+#[test]
+fn the_search_bar_stays_visible_while_a_filter_is_applied() {
+    // Without it the list is silently short with nothing on screen explaining why.
+    let mut state = searchable_state();
+    state.search = "alpha".into();
+    let rendered = render(&mut state, 100, 32);
+    assert!(rendered.contains("Search"));
+    assert!(rendered.contains("esc clear search"));
+}
+
+fn claude_form(mapping: Option<ClaudeModelMapping>) -> ProviderForm {
+    ProviderForm {
+        id: None,
+        revision: None,
+        client: ClientKind::Claude,
+        name: "Claude".into(),
+        description: String::new(),
+        base_url: "https://api.example.test".into(),
+        auth_scheme: AuthScheme::XApiKey,
+        secret: Zeroizing::new("secret".into()),
+        copied_secret: None,
+        field: 0,
+        error: None,
+        secret_visible: false,
+        discovering_models: false,
+        claude_model_mapping: mapping,
+    }
+}
+
+fn mapping_state(mapping: Option<ClaudeModelMapping>) -> State {
+    let mut state = State {
+        client: ClientKind::Claude,
+        loading: false,
+        input: InputMode::Form(claude_form(mapping)),
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Enter));
+    state
+}
+
+fn submitted_mapping(state: &mut State) -> ClaudeModelMappingUpdate {
+    match state.take_effect() {
+        Some(Effect::Add(submission) | Effect::Edit(submission)) => submission.claude_model_mapping,
+        other => panic!("expected an add/edit effect, got {}", other.is_some()),
+    }
+}
+
+#[test]
+fn a_claude_form_opens_the_mapping_dialog_instead_of_saving_immediately() {
+    // Codex resolves its model by discovery; Claude has no discovery endpoint, so the mapping
+    // dialog is where the tiers get chosen.
+    let mut state = mapping_state(None);
+    assert!(matches!(state.input, InputMode::ModelMapping(_)));
+    assert!(state.take_effect().is_none());
+}
+
+#[test]
+fn arrow_keys_do_not_flip_a_tier_1m_box() {
+    // ←/→ belong to the model text a tier row is focused on; only space touches its 1M box, so a
+    // stray arrow while typing cannot silently change what gets requested upstream.
+    let mut state = mapping_state(None);
+    state.reduce(key(KeyCode::Char(' '))); // enable the mapping
+    state.reduce(key(KeyCode::Down)); // Fable
+    state.reduce(key(KeyCode::Tab));
+    state.reduce(key(KeyCode::Right));
+    state.reduce(key(KeyCode::Left));
+
+    let InputMode::ModelMapping(mapping) = &state.input else {
+        panic!("expected the mapping dialog");
+    };
+    assert!(mapping.enabled);
+    assert!(!mapping.rows[0].context_1m);
+
+    state.reduce(key(KeyCode::Char(' ')));
+    let InputMode::ModelMapping(mapping) = &state.input else {
+        panic!("expected the mapping dialog");
+    };
+    assert!(mapping.rows[0].context_1m);
+}
+
+#[test]
+fn tab_completes_the_default_model_for_the_focused_tier() {
+    let mut state = mapping_state(None);
+    state.reduce(key(KeyCode::Char(' '))); // enable the mapping
+    state.reduce(key(KeyCode::Down)); // Fable
+    state.reduce(key(KeyCode::Tab));
+    state.reduce(key(KeyCode::Down)); // Opus
+    state.reduce(key(KeyCode::Tab));
+    state.reduce(key(KeyCode::Char(' '))); // 1M on Opus
+
+    state.reduce(key(KeyCode::Enter));
+    let ClaudeModelMappingUpdate::Set(mapping) = submitted_mapping(&mut state) else {
+        panic!("expected a mapping");
+    };
+    assert!(mapping.enabled);
+    assert_eq!(
+        mapping.fable,
+        Some(ModelSlot {
+            model: "claude-fable-5".into(),
+            context_1m: false,
+        })
+    );
+    assert_eq!(
+        mapping.opus,
+        Some(ModelSlot {
+            model: "claude-opus-5".into(),
+            context_1m: true,
+        })
+    );
+    assert_eq!(mapping.sonnet, None);
+}
+
+#[test]
+fn tab_does_not_overwrite_a_model_the_operator_typed() {
+    let mut state = mapping_state(None);
+    state.reduce(key(KeyCode::Char(' ')));
+    state.reduce(key(KeyCode::Down));
+    type_query(&mut state, "custom");
+    state.reduce(key(KeyCode::Tab));
+
+    state.reduce(key(KeyCode::Enter));
+    let ClaudeModelMappingUpdate::Set(mapping) = submitted_mapping(&mut state) else {
+        panic!("expected a mapping");
+    };
+    assert_eq!(mapping.fable.expect("fable tier").model, "custom");
+}
+
+#[test]
+fn control_u_clears_the_focused_mapping_row() {
+    let mut state = mapping_state(None);
+    state.reduce(key(KeyCode::Char(' ')));
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Tab));
+    state.reduce(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+
+    state.reduce(key(KeyCode::Enter));
+    assert!(matches!(
+        submitted_mapping(&mut state),
+        ClaudeModelMappingUpdate::Clear
+    ));
+}
+
+#[test]
+fn the_haiku_tier_cannot_request_1m_context() {
+    // claude-haiku-4-5 has no 1M variant upstream, so the row renders no checkbox and the toggle
+    // key is inert there.
+    let mut state = mapping_state(None);
+    state.reduce(key(KeyCode::Char(' ')));
+    for _ in 0..4 {
+        state.reduce(key(KeyCode::Down));
+    }
+    state.reduce(key(KeyCode::Tab));
+    state.reduce(key(KeyCode::Char(' ')));
+
+    state.reduce(key(KeyCode::Enter));
+    let ClaudeModelMappingUpdate::Set(mapping) = submitted_mapping(&mut state) else {
+        panic!("expected a mapping");
+    };
+    assert_eq!(
+        mapping.haiku,
+        Some(ModelSlot {
+            model: "claude-haiku-4-5".into(),
+            context_1m: false,
+        })
+    );
+}
+
+#[test]
+fn a_disabled_master_toggle_writes_no_mapping_at_all() {
+    let mut state = mapping_state(Some(ClaudeModelMapping {
+        enabled: true,
+        opus: Some(ModelSlot {
+            model: "claude-opus-5".into(),
+            context_1m: true,
+        }),
+        ..ClaudeModelMapping::default()
+    }));
+    // The dialog prefills from the provider, so turning the master switch off is the whole gesture.
+    state.reduce(key(KeyCode::Char(' ')));
+    state.reduce(key(KeyCode::Enter));
+    assert!(matches!(
+        submitted_mapping(&mut state),
+        ClaudeModelMappingUpdate::Clear
+    ));
+}
+
+#[test]
+fn editing_a_claude_provider_prefills_the_existing_mapping() {
+    let mut state = mapping_state(Some(ClaudeModelMapping {
+        enabled: true,
+        sonnet: Some(ModelSlot {
+            model: "my-sonnet".into(),
+            context_1m: true,
+        }),
+        ..ClaudeModelMapping::default()
+    }));
+    let InputMode::ModelMapping(mapping) = &state.input else {
+        panic!("expected the mapping dialog");
+    };
+    assert!(mapping.enabled);
+    assert_eq!(mapping.rows[2].model, "my-sonnet");
+    assert!(mapping.rows[2].context_1m);
+
+    let rendered = render(&mut state, 100, 32);
+    assert!(rendered.contains("my-sonnet"));
+    assert!(rendered.contains("Model mapping"));
+}
+
+#[test]
+fn the_mapping_dialog_sits_where_the_provider_form_did() {
+    // The mapping dialog opens straight out of the form on enter; centring them over different
+    // regions made the popup jump down the screen at that moment.
+    let mut form = State {
+        client: ClientKind::Claude,
+        loading: false,
+        input: InputMode::Form(claude_form(None)),
+        ..State::default()
+    };
+    let form_row = popup_row(&render(&mut form, 100, 32), "Add provider");
+
+    let mut mapping = mapping_state(None);
+    let mapping_row = popup_row(&render(&mut mapping, 100, 32), "Model mapping");
+
+    assert_eq!(form_row, mapping_row);
+}
+
+/// The 0-based screen row carrying `title`, from a `render` dump of a 100-column terminal.
+fn popup_row(rendered: &str, title: &str) -> usize {
+    rendered
+        .chars()
+        .collect::<Vec<char>>()
+        .chunks(100)
+        .position(|row| row.iter().collect::<String>().contains(title))
+        .unwrap_or_else(|| panic!("{title} is not on screen"))
 }

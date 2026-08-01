@@ -2,9 +2,9 @@ use std::io::{self, Read, Write};
 
 use anyhow::{Context, Result, bail};
 use hsin_core::{
-    ClientKind, ImportCurrentParams, ModeSetParams, ModelUpdate, Provider, ProviderAddParams,
-    ProviderDraft, ProviderEditParams, ProviderPatch, ProviderRemoveParams, ProviderSwitchParams,
-    SecretInput,
+    ClaudeModelMappingUpdate, ClientKind, ImportCurrentParams, ModeSetParams, ModelUpdate,
+    Provider, ProviderAddParams, ProviderDraft, ProviderEditParams, ProviderPatch,
+    ProviderRemoveParams, ProviderSwitchParams, SecretInput,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -113,6 +113,7 @@ async fn run_provider(command: ProviderCommand, client: &DaemonClient, json: boo
                     base_url: args.base_url,
                     auth_scheme,
                     model: args.model,
+                    claude_model_mapping: None,
                 },
                 secret: secret.map_or(SecretInput::Clear, SecretInput::Replace),
             };
@@ -131,6 +132,7 @@ async fn run_provider(command: ProviderCommand, client: &DaemonClient, json: boo
                     auth_scheme: args.auth_scheme.map(Into::into),
                     description: args.description,
                     model: args.model.map_or(ModelUpdate::Preserve, ModelUpdate::Set),
+                    claude_model_mapping: ClaudeModelMappingUpdate::Preserve,
                 },
                 secret: secret.map_or(SecretInput::Preserve, SecretInput::Replace),
             };
