@@ -29,6 +29,23 @@ fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> Action {
     Action::Key(KeyEvent::new(code, modifiers))
 }
 
+#[test]
+fn a_held_key_keeps_deleting_instead_of_stalling_after_one_character() {
+    // Terminals speaking the kitty protocol report auto-repeat as its own event kind, so a held
+    // backspace only reaches the reducer if repeats are accepted alongside presses.
+    let repeat = Event::Key(KeyEvent {
+        kind: crossterm::event::KeyEventKind::Repeat,
+        ..KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
+    });
+    assert!(super::key_action(&repeat).is_some());
+
+    let release = Event::Key(KeyEvent {
+        kind: crossterm::event::KeyEventKind::Release,
+        ..KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
+    });
+    assert!(super::key_action(&release).is_none());
+}
+
 fn submission() -> FormSubmission {
     FormSubmission {
         id: None,

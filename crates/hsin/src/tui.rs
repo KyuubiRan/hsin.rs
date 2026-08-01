@@ -42,17 +42,18 @@ pub async fn run(client: DaemonClient, i18n: &mut I18n, follow_saved_language: b
         tokio::select! {
             event = events.next() => {
                 match event {
-                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                        if matches!(reduce_action(&mut state, i18n, follow_saved_language, Action::Key(key)), Transition::Quit) {
-                            break;
-                        }
-                        if let Some(effect) = state.take_effect() {
-                            effect_tx.send(effect).await?;
+                    Some(Ok(event)) => {
+                        if let Some(action) = key_action(&event) {
+                            if matches!(reduce_action(&mut state, i18n, follow_saved_language, action), Transition::Quit) {
+                                break;
+                            }
+                            if let Some(effect) = state.take_effect() {
+                                effect_tx.send(effect).await?;
+                            }
                         }
                     }
                     Some(Err(error)) => return Err(error).context("read terminal event"),
                     None => break,
-                    _ => {}
                 }
             }
             action = action_rx.recv() => {
@@ -63,6 +64,18 @@ pub async fn run(client: DaemonClient, i18n: &mut I18n, follow_saved_language: b
         }
     }
     Ok(())
+}
+
+/// Held-down keys. `REPORT_EVENT_TYPES` makes terminals that speak the kitty keyboard protocol
+/// split auto-repeat out as its own kind, so ignoring it froze backspace and the arrow keys under
+/// a long press while letters — which still arrive as plain text presses — kept repeating.
+fn key_action(event: &Event) -> Option<Action> {
+    match event {
+        Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+            Some(Action::Key(*key))
+        }
+        _ => None,
+    }
 }
 
 fn reduce_action(
