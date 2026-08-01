@@ -92,6 +92,49 @@ fn reducer_switches_client_and_moves_selection() {
 }
 
 #[test]
+fn a_client_opens_on_its_active_provider_and_resumes_where_it_was_left() {
+    // Row 0 is the official provider, which is rarely the one actually in use, so both the first
+    // load and a first visit to a client aim at whatever that client has active.
+    let mut codex_official = example_provider();
+    codex_official.id = "official-codex".into();
+    codex_official.official = true;
+    let mut claude_official = example_provider();
+    claude_official.id = "official-claude".into();
+    claude_official.client = ClientKind::Claude;
+    claude_official.official = true;
+    let mut claude_custom = example_provider();
+    claude_custom.id = "provider-2".into();
+    claude_custom.client = ClientKind::Claude;
+
+    let mut state = State::default();
+    state.reduce(Action::Loaded {
+        providers: vec![
+            codex_official,
+            example_provider(),
+            claude_official,
+            claude_custom,
+        ],
+        status: crate::rpc::StatusSnapshot {
+            codex_active_provider: Some("provider-1".into()),
+            claude_active_provider: Some("provider-2".into()),
+            ..crate::rpc::StatusSnapshot::default()
+        },
+        settings: Settings::default(),
+    });
+    assert_eq!(state.selected, 1);
+
+    state.reduce(key(KeyCode::Up));
+    assert_eq!(state.selected, 0);
+    state.reduce(key(KeyCode::Tab));
+    assert_eq!(state.client, ClientKind::Claude);
+    assert_eq!(state.selected, 1);
+
+    state.reduce(key(KeyCode::Tab));
+    assert_eq!(state.client, ClientKind::Codex);
+    assert_eq!(state.selected, 0);
+}
+
+#[test]
 fn client_switching_follows_visibility_and_configured_order() {
     let mut state = State {
         client: ClientKind::Claude,

@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::{collections::HashMap, net::IpAddr};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hsin_core::{
@@ -57,6 +57,9 @@ pub(super) struct State {
     pub(super) pending_effect: Option<Effect>,
     /// Filter committed with enter; survives leaving [`InputMode::Search`].
     pub(super) search: String,
+    /// Where the cursor sat in each client left behind, so returning to one resumes there instead
+    /// of dropping back onto the official provider at the top.
+    pub(super) parked: HashMap<ClientKind, usize>,
 }
 
 impl Default for State {
@@ -78,6 +81,7 @@ impl Default for State {
             input: InputMode::Normal,
             pending_effect: None,
             search: String::new(),
+            parked: HashMap::new(),
         }
     }
 }
@@ -388,12 +392,7 @@ impl State {
         }
         self.loading = false;
         self.clamp_selection();
-        if let Some(active) = self.active_id()
-            && let Some(index) = self
-                .visible_providers()
-                .iter()
-                .position(|provider| provider.id == active)
-        {
+        if let Some(index) = self.active_index() {
             self.selected = index;
         }
     }
@@ -956,16 +955,13 @@ impl State {
                     self.selected = 0;
                 }
                 KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    self.client = self.previous_visible_client();
-                    self.selected = 0;
+                    self.switch_client(self.previous_visible_client());
                 }
                 KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
-                    self.client = self.next_visible_client();
-                    self.selected = 0;
+                    self.switch_client(self.next_visible_client());
                 }
                 KeyCode::BackTab | KeyCode::Left | KeyCode::Char('j') => {
-                    self.client = self.previous_visible_client();
-                    self.selected = 0;
+                    self.switch_client(self.previous_visible_client());
                 }
                 KeyCode::Down | KeyCode::Char('k') => {
                     let len = self.visible_providers().len();
@@ -1197,6 +1193,28 @@ impl State {
         self.selected = self
             .selected
             .min(self.visible_providers().len().saturating_sub(1));
+    }
+
+    /// Move to `client`, resuming the cursor where it was left there. A client not visited yet
+    /// starts on its active provider, which is more useful than the top of the list.
+    fn switch_client(&mut self, client: ClientKind) {
+        if client == self.client {
+            return;
+        }
+        self.parked.insert(self.client, self.selected);
+        self.client = client;
+        let resumed = self.parked.get(&client).copied();
+        let selected = resumed.or_else(|| self.active_index()).unwrap_or(0);
+        self.selected = selected;
+        self.clamp_selection();
+    }
+
+    /// Where the current client's active provider sits in the visible list.
+    fn active_index(&self) -> Option<usize> {
+        let active = self.active_id()?;
+        self.visible_providers()
+            .iter()
+            .position(|provider| provider.id == active)
     }
 
     pub(super) fn mode(&self) -> ConnectionMode {
