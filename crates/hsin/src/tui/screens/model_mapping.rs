@@ -93,6 +93,7 @@ pub(super) fn draw_model_mapping(
             &value.model,
             Some(tier.default_model),
             selected,
+            mapping.enabled,
         );
         if let Some(checkbox_area) = checkbox_area {
             draw_checkbox(

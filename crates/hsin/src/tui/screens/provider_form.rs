@@ -10,7 +10,7 @@ use crate::i18n::I18n;
 
 use super::super::{
     state::ProviderForm,
-    theme::{INPUT_BG, MUTED, RED, WHITE},
+    theme::{INPUT_BG, RED, WHITE},
     widgets::{centered_fixed, content_width, display_width, draw_input_field},
 };
 
@@ -71,6 +71,7 @@ pub(super) fn draw_form(frame: &mut Frame<'_>, area: Rect, form: &ProviderForm, 
                     ClientKind::Claude => "https://api.anthropic.com",
                 }),
                 form.field == index,
+                true,
             ),
             1 => draw_input_field(
                 frame,
@@ -79,6 +80,7 @@ pub(super) fn draw_form(frame: &mut Frame<'_>, area: Rect, form: &ProviderForm, 
                 secret,
                 Some(secret_placeholder),
                 form.field == index,
+                true,
             ),
             2 => draw_input_field(
                 frame,
@@ -87,6 +89,7 @@ pub(super) fn draw_form(frame: &mut Frame<'_>, area: Rect, form: &ProviderForm, 
                 &form.name,
                 Some(i18n.text("name_domain_hint")),
                 form.field == index,
+                true,
             ),
             3 => draw_input_field(
                 frame,
@@ -95,21 +98,20 @@ pub(super) fn draw_form(frame: &mut Frame<'_>, area: Rect, form: &ProviderForm, 
                 &form.description,
                 Some(i18n.text("description_hint")),
                 form.field == index,
+                true,
             ),
             _ => {
                 let selected = form.field == index;
-                let auth_style = if selected {
-                    Style::default().fg(RED).bg(INPUT_BG)
-                } else {
-                    Style::default().fg(WHITE).bg(INPUT_BG)
-                };
+                let foreground = if selected { RED } else { WHITE };
                 frame.render_widget(
-                    Paragraph::new(auth).style(auth_style).block(
-                        Block::default()
-                            .title(i18n.text("auth"))
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(if selected { RED } else { MUTED })),
-                    ),
+                    Paragraph::new(auth)
+                        .style(Style::default().fg(foreground).bg(INPUT_BG))
+                        .block(
+                            Block::default()
+                                .title(i18n.text("auth"))
+                                .borders(Borders::ALL)
+                                .border_style(Style::default().fg(foreground)),
+                        ),
                     field,
                 );
             }

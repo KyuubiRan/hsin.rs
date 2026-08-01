@@ -14,6 +14,8 @@ use super::{
     theme::{INPUT_BG, MUTED, RED, WHITE},
 };
 
+/// `selected` is the focused field, `enabled` whether it can be focused at all — a dimmed border
+/// means the field is inert, not merely unfocused.
 pub(super) fn draw_input_field(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -21,6 +23,7 @@ pub(super) fn draw_input_field(
     value: &str,
     placeholder: Option<&str>,
     selected: bool,
+    enabled: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -33,7 +36,17 @@ pub(super) fn draw_input_field(
             Style::default().fg(MUTED),
         ))
     } else {
-        Line::from(Span::styled(&visible, Style::default().fg(WHITE)))
+        Line::from(Span::styled(
+            &visible,
+            Style::default().fg(if enabled { WHITE } else { MUTED }),
+        ))
+    };
+    let border = if selected {
+        RED
+    } else if enabled {
+        WHITE
+    } else {
+        MUTED
     };
     frame.render_widget(
         Paragraph::new(line)
@@ -42,7 +55,7 @@ pub(super) fn draw_input_field(
                 Block::default()
                     .title(label)
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(if selected { RED } else { MUTED })),
+                    .border_style(Style::default().fg(border)),
             ),
         area,
     );

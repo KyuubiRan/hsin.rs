@@ -157,5 +157,6 @@ pub(super) fn draw_search(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
         state.active_query(),
         None,
         focused,
+        true,
     );
 }
