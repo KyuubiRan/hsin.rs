@@ -146,7 +146,11 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
             let _: Value = client
                 .call("mode.set", &ModeSetParams { client: kind, mode })
                 .await?;
-            Ok(Some("mode_changed"))
+            Ok(Some(if mode == ConnectionMode::Proxy {
+                "mode_proxy_enabled"
+            } else {
+                "mode_proxy_disabled"
+            }))
         }
         Effect::SetProxyEnabled(enabled) => update_proxy_enabled(client, enabled).await,
         Effect::SetProxyHost(host) => update_proxy_host(client, host).await,
