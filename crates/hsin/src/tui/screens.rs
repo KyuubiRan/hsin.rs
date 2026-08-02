@@ -26,7 +26,7 @@ use model_picker::draw_models;
 use provider_form::draw_form;
 #[cfg(test)]
 pub(super) use provider_form::form_field_areas;
-use settings::{draw_confirm, draw_settings_screen};
+use settings::draw_settings_screen;
 
 pub(super) fn draw(frame: &mut Frame<'_>, state: &mut State, i18n: &I18n) {
     let area = frame.area();
@@ -90,11 +90,12 @@ pub(super) fn draw(frame: &mut Frame<'_>, state: &mut State, i18n: &I18n) {
     }
 
     match &state.input {
-        InputMode::Search(_) | InputMode::Normal => {}
+        // The delete confirmation is only a footer prompt, so the provider list stays readable
+        // while it is armed and nothing has to be redrawn here.
+        InputMode::Search(_) | InputMode::Normal | InputMode::DeleteConfirm { .. } => {}
         InputMode::Form(_) => unreachable!("provider form is drawn over the footer"),
         InputMode::Models(picker) => draw_models(frame, rows[2], picker, i18n),
         InputMode::ModelMapping(mapping) => draw_model_mapping(frame, overlay, mapping, i18n),
-        InputMode::DeleteConfirm { .. } => draw_confirm(frame, rows[2], i18n),
         InputMode::Settings(_) => unreachable!("settings screen is drawn before the home page"),
     }
 

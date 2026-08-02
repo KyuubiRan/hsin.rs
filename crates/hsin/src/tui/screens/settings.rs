@@ -1,12 +1,10 @@
 use hsin_core::{ClientKind, LANGUAGE_EN_US, LANGUAGE_ZH_CN};
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
-    },
+    widgets::{Block, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use crate::i18n::I18n;
@@ -14,25 +12,8 @@ use crate::i18n::I18n;
 use super::super::{
     state::{SettingsPage, SettingsScreen, State},
     theme::{MUTED, RED, WHITE},
-    widgets::{centered_fixed, content_width, display_width},
+    widgets::display_width,
 };
-
-pub(super) fn draw_confirm(frame: &mut Frame<'_>, area: Rect, i18n: &I18n) {
-    let width = content_width(area, display_width(i18n.text("confirm_delete")) + 4, 30, 72);
-    let popup = centered_fixed(area, width, 5);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Paragraph::new(i18n.text("confirm_delete"))
-            .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .title(i18n.text("confirm"))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(RED)),
-            ),
-        popup,
-    );
-}
 
 #[allow(clippy::too_many_lines)]
 pub(super) fn draw_settings_screen(

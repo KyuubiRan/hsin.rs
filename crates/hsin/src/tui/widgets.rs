@@ -149,7 +149,19 @@ pub(super) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
                 .to_owned()
         })
     });
-    let (line, color) = transient.map_or((help, MUTED), |notice| (notice, RED));
+    let (line, color) = match transient {
+        Some(notice) => (notice, RED),
+        // The armed delete prompt is the one help line that is about to do something destructive,
+        // and it replaced a red dialog, so it keeps the warning colour rather than fading out.
+        None => (
+            help,
+            if matches!(state.input, InputMode::DeleteConfirm { .. }) {
+                RED
+            } else {
+                MUTED
+            },
+        ),
+    };
     frame.render_widget(
         Paragraph::new(line)
             .style(Style::default().fg(color))

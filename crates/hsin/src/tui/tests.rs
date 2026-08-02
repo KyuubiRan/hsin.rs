@@ -14,8 +14,8 @@ use zeroize::Zeroizing;
 use super::{
     screens::{TITLE, VERSION_LABEL, form_field_areas},
     state::{
-        FormSubmission, InputMode, ModelPicker, ModelPickerMode, ProviderClipboard, ProviderForm,
-        SettingsPage, SettingsScreen, take_form_submission,
+        DELETE_CONFIRM_WINDOW, FormSubmission, InputMode, ModelPicker, ModelPickerMode,
+        ProviderClipboard, ProviderForm, SettingsPage, SettingsScreen, take_form_submission,
     },
     theme::{INPUT_BG, RED, WHITE},
     widgets::centered_fixed,
@@ -132,6 +132,90 @@ fn a_client_opens_on_its_active_provider_and_resumes_where_it_was_left() {
     state.reduce(key(KeyCode::Tab));
     assert_eq!(state.client, ClientKind::Codex);
     assert_eq!(state.selected, 0);
+}
+
+#[test]
+fn a_second_d_only_deletes_while_the_confirmation_is_still_armed() {
+    // The confirmation is a footer prompt rather than a dialog, so nothing on screen blocks the
+    // rest of the UI while it is armed. It has to expire on its own, otherwise a `d` typed minutes
+    // later — meaning to arm a fresh confirmation — would silently delete whatever is selected.
+    let mut state = State {
+        providers: vec![example_provider()],
+        ..State::default()
+    };
+
+    state.reduce(key(KeyCode::Char('d')));
+    assert!(matches!(state.input, InputMode::DeleteConfirm { .. }));
+    assert!(state.take_effect().is_none());
+
+    let locale = I18n::new(Some("en-US"));
+    let mut terminal = Terminal::new(TestBackend::new(100, 32)).expect("test terminal");
+    terminal
+        .draw(|frame| draw(frame, &mut state, &locale))
+        .expect("draw the armed confirmation");
+    let buffer = terminal.backend().buffer();
+    let symbols = buffer
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<Vec<_>>();
+    assert!(
+        symbols.concat().contains("api.example.test"),
+        "the prompt must not cover the provider it is about"
+    );
+    let prompt = "Press again to delete this provider"
+        .chars()
+        .map(String::from)
+        .collect::<Vec<_>>();
+    let start = symbols
+        .windows(prompt.len())
+        .position(|window| {
+            window
+                .iter()
+                .zip(&prompt)
+                .all(|(cell, want)| *cell == want.as_str())
+        })
+        .expect("the prompt should be on screen");
+    // It replaced a red dialog, so the footer line carries the same warning colour instead of
+    // reading as one more muted shortcut hint.
+    assert!(
+        buffer.content()[start..start + prompt.len()]
+            .iter()
+            .all(|cell| cell.fg == RED)
+    );
+
+    state.reduce(Action::Tick);
+    assert!(
+        matches!(state.input, InputMode::DeleteConfirm { .. }),
+        "a tick inside the window must leave the confirmation armed"
+    );
+    state.reduce(key(KeyCode::Char('d')));
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::Remove { id, .. }) if id == "provider-1"
+    ));
+
+    // Any other key drops it immediately, the way ctrl+c does in Claude Code.
+    state.reduce(key(KeyCode::Char('d')));
+    state.reduce(key(KeyCode::Char('r')));
+    assert!(matches!(state.input, InputMode::Normal));
+
+    for lapsed in [true, false] {
+        state.reduce(key(KeyCode::Char('d')));
+        let InputMode::DeleteConfirm { expires_at, .. } = &mut state.input else {
+            panic!("d should arm the confirmation");
+        };
+        *expires_at -= DELETE_CONFIRM_WINDOW * 2;
+        if lapsed {
+            state.reduce(Action::Tick);
+            assert!(matches!(state.input, InputMode::Normal));
+        } else {
+            // A `d` can still land before the tick that retires the prompt, so the key path has to
+            // enforce the deadline too.
+            state.reduce(key(KeyCode::Char('d')));
+        }
+        assert!(state.take_effect().is_none());
+    }
 }
 
 #[test]

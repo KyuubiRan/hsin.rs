@@ -1,4 +1,8 @@
-use std::{collections::HashMap, net::IpAddr};
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    time::{Duration, Instant},
+};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hsin_core::{
@@ -31,7 +35,13 @@ pub(super) enum Action {
         message: String,
     },
     ProviderCopied(ProviderClipboard),
+    /// Drives the timers the UI owns; today only the delete confirmation, which lapses on its own.
+    Tick,
 }
+
+/// How long a `d` press stays armed before the confirmation lapses, so a stray second `d` typed
+/// much later cannot delete a provider.
+pub(super) const DELETE_CONFIRM_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Transition {
@@ -97,6 +107,7 @@ pub(super) enum InputMode {
     DeleteConfirm {
         id: String,
         revision: u64,
+        expires_at: Instant,
     },
     Settings(SettingsScreen),
 }
@@ -297,6 +308,13 @@ impl State {
             Action::Notice(key) => {
                 self.notice = Some(format!("@{key}"));
                 self.loading = false;
+            }
+            Action::Tick => {
+                if let InputMode::DeleteConfirm { expires_at, .. } = &self.input
+                    && Instant::now() >= *expires_at
+                {
+                    self.input = InputMode::Normal;
+                }
             }
             Action::Failed(message) => {
                 self.notice = Some(message);
@@ -646,8 +664,14 @@ impl State {
                     _ => {}
                 },
             },
-            InputMode::DeleteConfirm { id, revision } => {
-                if key.code == KeyCode::Char('d') {
+            InputMode::DeleteConfirm {
+                id,
+                revision,
+                expires_at,
+            } => {
+                // The tick that retires a lapsed confirmation can be up to one frame away, so the
+                // deadline is rechecked here rather than trusting the mode to still be armed.
+                if key.code == KeyCode::Char('d') && Instant::now() < *expires_at {
                     self.pending_effect = Some(Effect::Remove {
                         id: id.clone(),
                         expected_revision: *revision,
@@ -1095,10 +1119,15 @@ impl State {
                             self.notice = Some("@official_read_only".into());
                             return Transition::Continue;
                         }
-                        self.input = InputMode::DeleteConfirm {
+                        // The prompt lives in the footer now, so a leftover notice sitting in that
+                        // same slot would hide it.
+                        let armed = InputMode::DeleteConfirm {
                             id: provider.id.clone(),
                             revision: provider.revision,
+                            expires_at: Instant::now() + DELETE_CONFIRM_WINDOW,
                         };
+                        self.notice = None;
+                        self.input = armed;
                     }
                 }
                 KeyCode::Enter => {

@@ -60,7 +60,9 @@ pub async fn run(client: DaemonClient, i18n: &mut I18n, follow_saved_language: b
                 let Some(action) = action else { break };
                 reduce_action(&mut state, i18n, follow_saved_language, action);
             }
-            _ = tick.tick() => {}
+            _ = tick.tick() => {
+                reduce_action(&mut state, i18n, follow_saved_language, Action::Tick);
+            }
         }
     }
     Ok(())
