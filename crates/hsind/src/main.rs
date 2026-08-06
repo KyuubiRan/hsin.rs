@@ -143,15 +143,25 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-/// Startup reconciliation needs the master key. A locked key store must not
-/// take the daemon down: the CLI has to stay reachable so a recovery key can be
-/// imported.
+/// Startup reconciliation needs the master key and reads state the daemon does
+/// not control: a managed client config can name an invalid URL, a stored proxy
+/// port can be taken. Neither may take the daemon down, because the CLI is the
+/// only way to fix any of it and the CLI needs the IPC socket. Failures that are
+/// not about bad external input still stop the daemon.
 fn tolerate_locked(step: &'static str, result: Result<()>) -> Result<()> {
     match result {
         Err(error::DaemonError::Locked) => {
             tracing::warn!(
                 step,
                 "skipped startup reconciliation; the key store is locked"
+            );
+            Ok(())
+        }
+        Err(error::DaemonError::Invalid(reason)) => {
+            tracing::warn!(
+                step,
+                %reason,
+                "skipped startup reconciliation; fix the reported configuration and restart"
             );
             Ok(())
         }
@@ -184,6 +194,20 @@ mod tests {
         // Aborting here would crash-loop the service and leave no IPC socket,
         // so `hsin security import-recovery-key` could never reach the daemon.
         assert!(tolerate_locked("step", Err(error::DaemonError::Locked)).is_ok());
+    }
+
+    #[test]
+    fn invalid_managed_configuration_never_aborts_startup() {
+        // A client config naming a non-HTTPS provider URL is rejected during
+        // reconciliation. Aborting would crash-loop the daemon and leave the
+        // user no way in to correct the very config that caused it.
+        assert!(
+            tolerate_locked(
+                "step",
+                Err(error::DaemonError::Invalid("bad provider URL".into()))
+            )
+            .is_ok()
+        );
     }
 
     #[test]
