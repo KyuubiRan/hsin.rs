@@ -85,4 +85,5 @@ Configuration, IPC, crypto, proxy, service, or database changes require focused 
 - Preserve unrelated user changes in a dirty worktree.
 - Do not use destructive reset or checkout commands.
 - Use English Conventional Commit messages.
+- Append `[skip ci]` to a commit that changes nothing CI can verify, such as a version bump whose code already passed on the preceding commit. GitHub skips `push` and `pull_request` workflows for it; `workflow_dispatch` releases still run.
 - Do not invent a license, repository URL, release tag, or public package metadata without explicit approval.
