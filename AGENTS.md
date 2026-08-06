@@ -87,3 +87,11 @@ Configuration, IPC, crypto, proxy, service, or database changes require focused 
 - Use English Conventional Commit messages.
 - Append `[skip ci]` to a commit that changes nothing CI can verify, such as a version bump whose code already passed on the preceding commit. GitHub skips `push` and `pull_request` workflows for it; `workflow_dispatch` releases still run.
 - Do not invent a license, repository URL, release tag, or public package metadata without explicit approval.
+
+## Releasing
+
+- Bump `version` in the workspace `Cargo.toml`, refresh `Cargo.lock`, and commit it alone as `chore: release X.Y.Z [skip ci]`.
+- Wait for CI to pass on the commit *before* the version bump. The bump itself carries no code, so it is not covered by CI.
+- Run the `Release` workflow with `tag=vX.Y.Z`. It refuses to publish when the tag does not match the workspace version, creates the tag on the dispatched commit when it does not exist yet, and reuses the tag when re-running after a partial failure.
+- Do not create the tag by hand. A tag pushed from a workstation runs CI a second time on the same commit and can point at the wrong one.
+- Releases are pre-releases by default; clear the `prerelease` input deliberately.

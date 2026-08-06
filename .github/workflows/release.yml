@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to create or reuse (for example v0.1.0)"
+        description: "Release tag, created from the dispatched commit when absent (for example v0.1.0). Must match the workspace version."
         required: true
       prerelease:
         description: "Mark the release as a pre-release"
@@ -19,7 +19,20 @@ permissions:
   contents: read
 
 jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check the tag names the version being shipped
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          if [ "${{ inputs.tag }}" != "v$version" ]; then
+            echo "::error::tag ${{ inputs.tag }} does not match workspace version $version"
+            exit 1
+          fi
+
   build:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
@@ -94,7 +107,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
         run: |
-          flags="--verify-tag"
+          flags=""
           if [ "${{ inputs.prerelease }}" = "true" ]; then
             flags="$flags --prerelease"
           fi
@@ -106,6 +119,7 @@ jobs:
           else
             gh release create "$TAG" artifacts/* \
               --title "$TAG" \
+              --target "$GITHUB_SHA" \
               --generate-notes \
               $flags
           fi
