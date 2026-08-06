@@ -11,7 +11,9 @@ use serde_json::{Value, json};
 
 use crate::{
     bootstrap,
-    cli::{Cli, Command, DaemonCommand, ModeCommand, ProviderCommand, SecurityCommand},
+    cli::{
+        Cli, Command, DaemonCommand, ModeCommand, ProviderCommand, SecurityCommand, SettingsCommand,
+    },
     i18n::I18n,
     rpc::DaemonClient,
     tui,
@@ -43,6 +45,7 @@ pub async fn run(cli: Cli, i18n: &mut I18n) -> Result<()> {
             print_value(&value, cli.json)
         }
         Command::Security { command } => run_security(command, &client, cli.json).await,
+        Command::Settings { command } => run_settings(command, &client, cli.json).await,
         Command::Credential {
             client: kind,
             provider_id,
@@ -203,6 +206,34 @@ async fn find_provider(client: &DaemonClient, id: &str) -> Result<Provider> {
         .into_iter()
         .find(|provider| provider.id == id)
         .with_context(|| format!("provider {id:?} was not found"))
+}
+
+async fn run_settings(command: SettingsCommand, client: &DaemonClient, json: bool) -> Result<()> {
+    let (method, params) = match command {
+        SettingsCommand::Get => ("settings.get", json!({})),
+        SettingsCommand::Set {
+            proxy_host,
+            proxy_port,
+            proxy_enabled,
+        } => {
+            if proxy_host.is_none() && proxy_port.is_none() && proxy_enabled.is_none() {
+                bail!("specify at least one setting to change");
+            }
+            let mut patch = serde_json::Map::new();
+            if let Some(host) = proxy_host {
+                patch.insert("proxy_host".into(), Value::String(host));
+            }
+            if let Some(port) = proxy_port {
+                patch.insert("proxy_port".into(), Value::from(port));
+            }
+            if let Some(enabled) = proxy_enabled {
+                patch.insert("proxy_enabled".into(), Value::Bool(enabled));
+            }
+            ("settings.set", Value::Object(patch))
+        }
+    };
+    let value: Value = client.call(method, &params).await?;
+    print_value(&value, json)
 }
 
 async fn run_security(command: SecurityCommand, client: &DaemonClient, json: bool) -> Result<()> {

@@ -49,6 +49,11 @@ pub enum Command {
         #[command(subcommand)]
         command: SecurityCommand,
     },
+    /// Inspect or change daemon settings.
+    Settings {
+        #[command(subcommand)]
+        command: SettingsCommand,
+    },
     /// Resolve a credential for Codex or Claude Code (internal).
     Credential {
         #[arg(value_enum)]
@@ -194,6 +199,24 @@ pub enum DaemonCommand {
     },
     /// Reinstall the service using the hsind binary next to this CLI.
     Update,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SettingsCommand {
+    /// Show daemon settings.
+    Get,
+    /// Change daemon settings.
+    Set {
+        /// Address the local proxy listens on.
+        #[arg(long, value_name = "HOST")]
+        proxy_host: Option<String>,
+        /// Port the local proxy listens on.
+        #[arg(long, value_name = "PORT")]
+        proxy_port: Option<u16>,
+        /// Whether the local proxy listener runs.
+        #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
+        proxy_enabled: Option<bool>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -382,6 +405,53 @@ mod tests {
                 command: ProviderCommand::Switch(_)
             })
         ));
+    }
+
+    #[test]
+    fn parses_settings_set_for_a_remote_listener() {
+        // Reaching the proxy from another host needs a wildcard bind and a free
+        // port. Neither was reachable from the CLI before, only from the TUI.
+        let cli = Cli::try_parse_from([
+            "hsin",
+            "settings",
+            "set",
+            "--proxy-host",
+            "0.0.0.0",
+            "--proxy-port",
+            "9998",
+            "--proxy-enabled",
+            "true",
+        ])
+        .expect("valid command");
+        let Some(Command::Settings {
+            command:
+                SettingsCommand::Set {
+                    proxy_host,
+                    proxy_port,
+                    proxy_enabled,
+                },
+        }) = cli.command
+        else {
+            panic!("expected a settings set command");
+        };
+        assert_eq!(proxy_host.as_deref(), Some("0.0.0.0"));
+        assert_eq!(proxy_port, Some(9998));
+        assert_eq!(proxy_enabled, Some(true));
+    }
+
+    #[test]
+    fn settings_help_is_localized() {
+        // A missing locale key silently falls back to the English doc comment,
+        // which is only visible by reading the translated help.
+        let error = localized_command(&I18n::new(Some("zh-CN")))
+            .try_get_matches_from(["hsin", "settings", "set", "--help"])
+            .expect_err("help should stop argument parsing");
+        let help = error.to_string();
+        for expected in ["修改 daemon 设置", "本地代理监听地址", "本地代理监听端口"]
+        {
+            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
+        }
+        assert!(!help.contains("Port the local proxy"));
     }
 
     #[test]
