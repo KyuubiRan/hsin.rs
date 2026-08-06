@@ -62,6 +62,7 @@ pub struct App {
     credential_command: PathBuf,
     proxy_listening: AtomicBool,
     proxy_active_address: RwLock<Option<SocketAddr>>,
+    proxy_failure: RwLock<Option<String>>,
     proxy_runtime: watch::Sender<ProxyRuntimeConfig>,
     shutdown_requested: AtomicBool,
     shutdown: tokio::sync::Notify,
@@ -138,6 +139,7 @@ impl App {
             credential_command,
             proxy_listening: AtomicBool::new(false),
             proxy_active_address: RwLock::new(None),
+            proxy_failure: RwLock::new(None),
             proxy_runtime,
             shutdown_requested: AtomicBool::new(false),
             shutdown: tokio::sync::Notify::new(),
@@ -171,6 +173,15 @@ impl App {
         *self.proxy_active_address.write() = address;
         self.proxy_listening
             .store(address.is_some(), Ordering::Release);
+        if address.is_some() {
+            *self.proxy_failure.write() = None;
+        }
+    }
+    /// Record why the listener could not come up. The readiness wait only sees
+    /// a timeout, and the real cause -- almost always a taken port -- would
+    /// otherwise be visible in the service log only.
+    pub fn mark_proxy_failure(&self, reason: &str) {
+        *self.proxy_failure.write() = Some(reason.to_owned());
     }
     pub fn proxy_enabled(&self) -> bool {
         self.proxy_runtime.borrow().enabled
@@ -1427,7 +1438,11 @@ impl App {
         if enabled {
             self.db.set_setting("proxy_enabled", "false")?;
             self.replace_proxy_runtime(false, address);
-            return Err(DaemonError::Config("proxy did not become ready".into()));
+            let reason = self.proxy_failure.read().clone().map_or_else(
+                || "proxy did not become ready".to_string(),
+                |reason| format!("proxy could not listen on {address}: {reason}"),
+            );
+            return Err(DaemonError::Config(reason));
         }
         Err(DaemonError::Config("proxy did not stop in time".into()))
     }
@@ -1768,6 +1783,32 @@ mod tests {
             "sk-abc***yz"
         );
         assert_eq!(credential_preview("short-key"), "••••••••");
+    }
+
+    #[tokio::test]
+    async fn a_recovered_proxy_clears_the_recorded_failure() {
+        // A stale "address already in use" would be attached to the next
+        // unrelated timeout and send operators after the wrong port.
+        let root = std::env::temp_dir().join(format!("hsind-proxyfail-{}", uuid::Uuid::new_v4()));
+        let paths = Paths {
+            database: root.join("hsin.sqlite3"),
+            lock: root.join("hsind.lock"),
+            logs: root.join("logs"),
+            backups: root.join("backups"),
+            home: root.clone(),
+        };
+        let app = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
+
+        app.mark_proxy_failure("I/O error: Address already in use (os error 98)");
+        assert!(app.proxy_failure.read().is_some());
+
+        app.mark_proxy_active(Some(([127, 0, 0, 1], 9999).into()));
+        assert!(
+            app.proxy_failure.read().is_none(),
+            "a listener that came up invalidates the previous failure"
+        );
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]

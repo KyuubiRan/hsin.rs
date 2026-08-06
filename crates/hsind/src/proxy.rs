@@ -42,6 +42,7 @@ pub async fn serve(app: Arc<App>) -> Result<()> {
         let desired = *runtime.borrow();
         if let Err(error) = serve_enabled(app.clone(), &mut runtime, desired).await {
             app.mark_proxy_active(None);
+            app.mark_proxy_failure(&error.to_string());
             tracing::warn!(%error, "proxy failed; retrying while enabled");
             tokio::select! {
                 () = app.wait_shutdown() => return Ok(()),
