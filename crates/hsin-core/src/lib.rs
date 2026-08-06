@@ -21,6 +21,15 @@ pub fn provider_name_from_url(value: &str) -> Option<String> {
     if host.is_empty() {
         return None;
     }
+    // `host_str` keeps the URL bracket syntax around an IPv6 literal. The
+    // brackets belong to the URL, not to the address, and nothing rebuilds a
+    // URL from this name: the base URL is stored separately. Stripping them
+    // first also lets the IP check below actually recognize IPv6, instead of
+    // relying on such a host happening to contain no dot.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
     if host.parse::<IpAddr>().is_ok() || !host.contains('.') {
         return Some(host.to_owned());
     }
@@ -1004,6 +1013,41 @@ mod tests {
         assert_eq!(
             normalize_generated_provider_name("My Router", "https://ai.router.team/v1"),
             "My Router"
+        );
+    }
+
+    /// An address is a whole label. Splitting one on dots the way a domain is
+    /// split would name the provider after a single octet, and the URL brackets
+    /// around an IPv6 literal are syntax rather than part of the address.
+    #[test]
+    fn provider_names_keep_ip_literals_intact() {
+        for (url, expected) in [
+            ("https://192.168.1.10/v1", "192.168.1.10"),
+            ("http://[::1]:8080/v1", "::1"),
+            ("http://[2001:db8::1]/v1", "2001:db8::1"),
+            // `url` normalizes an IPv4-mapped literal to hexadecimal, but the
+            // name must survive even if it ever stops doing that.
+            ("http://[::ffff:192.168.1.1]/v1", "::ffff:c0a8:101"),
+        ] {
+            assert_eq!(
+                provider_name_from_url(url).as_deref(),
+                Some(expected),
+                "unexpected name for {url}"
+            );
+        }
+    }
+
+    /// A name generated before brackets were stripped still equals the bracketed
+    /// host, so editing such a provider migrates it to the bare address.
+    #[test]
+    fn a_bracketed_ipv6_name_normalizes_to_the_bare_address() {
+        assert_eq!(
+            normalize_generated_provider_name("[::1]", "http://[::1]:8080/v1"),
+            "::1"
+        );
+        assert_eq!(
+            normalize_generated_provider_name("Home Box", "http://[::1]:8080/v1"),
+            "Home Box"
         );
     }
 
