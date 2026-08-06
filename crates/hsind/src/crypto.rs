@@ -1,4 +1,7 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chacha20poly1305::{
@@ -81,6 +84,79 @@ impl KeyStore for SystemKeyStore {
     }
 }
 
+/// Master keys handed to the daemon by systemd through `LoadCredentialEncrypted=`.
+///
+/// A system unit has no session bus, so the Secret Service that backs
+/// [`SystemKeyStore`] is unreachable there. systemd decrypts the sealed key into
+/// `$CREDENTIALS_DIRECTORY`, a read-only tmpfs private to the service, which is
+/// why every write here fails loudly instead of silently landing somewhere the
+/// next start would not read back.
+pub struct CredentialKeyStore {
+    directory: PathBuf,
+}
+
+impl CredentialKeyStore {
+    /// systemd exports this only for units that declare credentials, so its
+    /// presence is what selects this store over the Secret Service one.
+    pub fn from_environment() -> Option<Self> {
+        std::env::var_os("CREDENTIALS_DIRECTORY").map(|directory| Self {
+            directory: PathBuf::from(directory),
+        })
+    }
+
+    #[must_use]
+    pub fn credential_name(version: u32) -> String {
+        format!("hsin-master-key-v{version}")
+    }
+
+    fn read_only(version: u32) -> DaemonError {
+        DaemonError::Keyring(format!(
+            "systemd credential {} is read-only; re-provision it with `sudo hsind service install --system`",
+            Self::credential_name(version)
+        ))
+    }
+}
+
+impl KeyStore for CredentialKeyStore {
+    fn load(&self, version: u32) -> Result<Option<String>> {
+        let path = self.directory.join(Self::credential_name(version));
+        match std::fs::read_to_string(&path) {
+            Ok(value) => {
+                let value = value.trim();
+                Ok((!value.is_empty()).then(|| value.to_owned()))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(DaemonError::Keyring(error.to_string())),
+        }
+    }
+
+    /// Provisioning happens out of band, so the only accepted write is the
+    /// no-op one: re-storing the key systemd already supplied. Importing a
+    /// recovery key that matches the sealed credential must succeed.
+    fn store(&self, version: u32, value: &str) -> Result<()> {
+        if self.load(version)?.as_deref() == Some(value) {
+            return Ok(());
+        }
+        Err(Self::read_only(version))
+    }
+
+    fn delete(&self, version: u32) -> Result<()> {
+        if self.load(version)?.is_none() {
+            return Ok(());
+        }
+        Err(Self::read_only(version))
+    }
+}
+
+/// Pick the key store for the current process: systemd credentials when the
+/// daemon runs as a system unit, the OS keyring otherwise.
+pub fn default_key_store(home: &Path) -> Arc<dyn KeyStore> {
+    CredentialKeyStore::from_environment().map_or_else(
+        || Arc::new(SystemKeyStore::for_home(home)) as Arc<dyn KeyStore>,
+        |store| Arc::new(store) as Arc<dyn KeyStore>,
+    )
+}
+
 pub struct CryptoManager {
     db: Arc<Database>,
     store: Arc<dyn KeyStore>,
@@ -119,14 +195,36 @@ impl CryptoManager {
                 }
             }
         } else {
-            let key = random_key();
             let version = 1;
-            let encoded = URL_SAFE_NO_PAD.encode(key);
-            if let Err(error) = manager.store.store(version, &encoded) {
-                tracing::warn!(%error,"system keyring unavailable; daemon is locked");
-                *manager.lock_reason.write() = Some(error.to_string());
-                return Ok(manager);
-            }
+            // A provisioned store already holds the key for an empty database:
+            // `hsind service install --system` seals it before the daemon first
+            // runs. Generating a second key here would strand that credential.
+            let key = match manager.store.load(version) {
+                Ok(Some(encoded)) => match decode_key(&encoded) {
+                    Ok(key) => key,
+                    Err(error) => {
+                        let reason = format!("provisioned master key is unusable: {error}");
+                        tracing::error!(%reason, "daemon is locked");
+                        *manager.lock_reason.write() = Some(reason);
+                        return Ok(manager);
+                    }
+                },
+                Ok(None) => {
+                    let key = random_key();
+                    let encoded = URL_SAFE_NO_PAD.encode(key);
+                    if let Err(error) = manager.store.store(version, &encoded) {
+                        tracing::warn!(%error,"system keyring unavailable; daemon is locked");
+                        *manager.lock_reason.write() = Some(error.to_string());
+                        return Ok(manager);
+                    }
+                    key
+                }
+                Err(error) => {
+                    tracing::warn!(%error,"system keyring unavailable; daemon is locked");
+                    *manager.lock_reason.write() = Some(error.to_string());
+                    return Ok(manager);
+                }
+            };
             let (nonce, verifier) = make_verifier(&key, version)?;
             manager
                 .db
@@ -462,6 +560,16 @@ fn decode_key(encoded: &str) -> Result<[u8; KEY_BYTES]> {
     decoded.zeroize();
     Ok(key)
 }
+/// Decode a recovery key into the key-store encoding, so provisioning can seal
+/// an existing master key without the database or a running daemon.
+#[cfg(target_os = "linux")]
+pub fn recovery_key_material(recovery: &str) -> Result<(u32, Zeroizing<String>)> {
+    let (version, mut key) = parse_recovery(recovery)?;
+    let encoded = Zeroizing::new(URL_SAFE_NO_PAD.encode(key));
+    key.zeroize();
+    Ok((version, encoded))
+}
+
 fn parse_recovery(value: &str) -> Result<(u32, [u8; KEY_BYTES])> {
     let mut parts = value.trim().split(':');
     if parts.next() != Some("hsin-recovery-v1") {
@@ -514,6 +622,60 @@ mod tests {
         let second = SystemKeyStore::for_home(Path::new("/tmp/hsin-two"));
         assert_eq!(first.account_scope, same.account_scope);
         assert_ne!(first.account_scope, second.account_scope);
+    }
+
+    /// `$CREDENTIALS_DIRECTORY` is a read-only tmpfs. A write that silently
+    /// succeeded would vanish on restart and leave the database permanently
+    /// locked, so every write that would change the sealed key must fail here.
+    #[test]
+    fn systemd_credentials_reject_writes_that_would_not_survive_a_restart() {
+        let root = std::env::temp_dir().join(format!("hsind-cred-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let store = CredentialKeyStore {
+            directory: root.clone(),
+        };
+        assert_eq!(store.load(1).unwrap(), None);
+        // Deleting a credential that was never provisioned is a no-op, so
+        // rotation cleanup on a fresh install must not report a failure.
+        store.delete(1).unwrap();
+
+        fs::write(
+            root.join(CredentialKeyStore::credential_name(1)),
+            "sealed\n",
+        )
+        .unwrap();
+        assert_eq!(store.load(1).unwrap().as_deref(), Some("sealed"));
+        // Re-storing the key systemd already supplied is the one accepted
+        // write: importing a matching recovery key must not fail.
+        store.store(1, "sealed").unwrap();
+        assert!(store.store(1, "different").is_err());
+        assert!(store.delete(1).is_err());
+    }
+
+    /// `hsind service install --system` seals the master key before the daemon
+    /// ever runs, so the first start finds a provisioned store and an empty
+    /// database. Generating a fresh key there would strand the sealed one and
+    /// lock the daemon on the next restart.
+    #[test]
+    fn initialization_adopts_a_provisioned_key_instead_of_generating_one() {
+        let root = std::env::temp_dir().join(format!("hsind-provision-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let provisioned = URL_SAFE_NO_PAD.encode([7_u8; KEY_BYTES]);
+        let store = Arc::new(MemoryStore::default());
+        store.store(1, &provisioned).unwrap();
+
+        let db = Arc::new(Database::open(&root.join("db"), &root.join("backups")).unwrap());
+        let crypto = CryptoManager::initialize(db, store.clone()).unwrap();
+
+        assert!(crypto.is_unlocked());
+        assert_eq!(
+            crypto.export_recovery_key().unwrap().expose_secret(),
+            format!("hsin-recovery-v1:1:{provisioned}")
+        );
+        assert_eq!(
+            store.load(1).unwrap().as_deref(),
+            Some(provisioned.as_str())
+        );
     }
 
     #[test]

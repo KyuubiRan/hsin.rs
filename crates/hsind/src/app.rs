@@ -27,7 +27,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     config::{self, ConfigTarget},
-    crypto::{CryptoManager, KeyStore, SystemKeyStore},
+    crypto::{self, CryptoManager, KeyStore},
     db::Database,
     error::{DaemonError, Result},
     model::ProviderInput,
@@ -88,7 +88,7 @@ fn credential_preview(secret: &str) -> String {
 
 impl App {
     pub fn open(paths: &Paths) -> Result<Arc<Self>> {
-        Self::open_with_store(paths, Arc::new(SystemKeyStore::for_home(&paths.home)))
+        Self::open_with_store(paths, crypto::default_key_store(&paths.home))
     }
 
     pub fn open_with_store(paths: &Paths, store: Arc<dyn KeyStore>) -> Result<Arc<Self>> {

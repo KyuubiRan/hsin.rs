@@ -442,6 +442,14 @@ pub fn data_home() -> PathBuf {
     })
 }
 
+/// Resolve the data home for an explicit account home directory, ignoring this
+/// process's environment. Installing a service for another account cannot read
+/// that account's `XDG_DATA_HOME`.
+#[must_use]
+pub fn data_home_for_account(home: &Path) -> PathBuf {
+    platform_data_home(None, None, Some(home.as_os_str()))
+}
+
 fn installed_home_from_current_exe() -> Option<PathBuf> {
     let executable = env::current_exe().ok()?;
     let name = executable.file_stem()?.to_str()?;

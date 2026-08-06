@@ -18,7 +18,13 @@ pub struct Paths {
 
 impl Paths {
     pub fn discover() -> Self {
-        let home = hsin_ipc::data_home();
+        Self::for_home(hsin_ipc::data_home())
+    }
+
+    /// Resolve paths for an explicit home. A system-scope service installation
+    /// runs as root but owns another account's home, so it cannot rely on the
+    /// environment-derived default.
+    pub fn for_home(home: PathBuf) -> Self {
         Self {
             database: home.join("hsin.sqlite3"),
             lock: home.join("hsind.lock"),

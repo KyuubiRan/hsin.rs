@@ -45,6 +45,7 @@ Never modify MCP servers, hooks, permissions, profiles, features, approval polic
 - Treat Codex `auth.json` and its encrypted backup as secret material.
 - Non-loopback proxy requests require the random client capability; never accept the fixed `HSIN_MANAGED_KEY` from a non-loopback peer.
 - Do not fall back to plaintext secret storage when the system keyring is unavailable. The daemon must remain recoverably locked.
+- A Linux system-scope service reads its master key from a systemd credential. That store is read-only at runtime; never make a write to it appear to succeed.
 - Bind credential helpers to provider identity and revision.
 - Capture one immutable provider and credential snapshot at proxy request start.
 - Use `secrecy` and `zeroize` at sensitive in-memory boundaries where supported.

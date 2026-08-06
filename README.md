@@ -68,3 +68,5 @@ MSVC cross-builds. Tagged releases are still built and smoke-tested on native
 GitHub Actions runners.
 
 See [docs/architecture.md](docs/architecture.md) and [docs/security.md](docs/security.md) for the process and trust boundaries.
+Headless Linux servers should use the system service described in
+[docs/linux-system-service.md](docs/linux-system-service.md).

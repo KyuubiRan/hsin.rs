@@ -25,8 +25,15 @@ struct Cli {
 enum Command {
     /// Run the daemon in the foreground.
     Run,
-    /// Install and control the per-user daemon service.
+    /// Install and control the daemon service.
     Service {
+        /// Operate on the system-wide unit instead of the per-user one. Linux
+        /// only; must run as root.
+        #[arg(long, global = true)]
+        system: bool,
+        /// Account that owns a system-scope service. Defaults to `SUDO_USER`.
+        #[arg(long, global = true, value_name = "NAME")]
+        account: Option<String>,
         #[command(subcommand)]
         command: ServiceCommand,
     },
@@ -37,6 +44,11 @@ enum ServiceCommand {
     Install {
         #[arg(long)]
         start: bool,
+        /// Read a recovery key from stdin and seal it as the system service's
+        /// master key. Use this when moving an existing database to system
+        /// scope; the Secret Service copy is unreachable from a system unit.
+        #[arg(long)]
+        recovery_key_stdin: bool,
     },
     Uninstall {
         #[arg(long)]
@@ -65,15 +77,41 @@ async fn main() {
 async fn execute(cli: Cli) -> Result<()> {
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => run().await,
-        Command::Service { command } => {
+        Command::Service {
+            system,
+            account,
+            command,
+        } => {
+            let scope = if system {
+                service::Scope::System
+            } else {
+                service::Scope::User
+            };
+            let target = service::Target::resolve(scope, account.as_deref())?;
             match command {
-                ServiceCommand::Install { start } => service::install(start)?,
-                ServiceCommand::Uninstall { purge } => service::uninstall(purge)?,
-                ServiceCommand::Start => service::start()?,
-                ServiceCommand::Stop => service::stop()?,
-                ServiceCommand::Restart => service::restart()?,
+                ServiceCommand::Install {
+                    start,
+                    recovery_key_stdin,
+                } => {
+                    // Reading from stdin keeps the key out of argv and shell
+                    // history, which `ps` and `.zsh_history` would both expose.
+                    let recovery = if recovery_key_stdin {
+                        Some(read_secret_line()?)
+                    } else {
+                        None
+                    };
+                    service::install(
+                        &target,
+                        start,
+                        recovery.as_ref().map(|value| value.as_str()),
+                    )?;
+                }
+                ServiceCommand::Uninstall { purge } => service::uninstall(&target, purge)?,
+                ServiceCommand::Start => service::start(&target)?,
+                ServiceCommand::Stop => service::stop(&target)?,
+                ServiceCommand::Restart => service::restart(&target)?,
                 ServiceCommand::Status => {
-                    let running = service::status()?;
+                    let running = service::status(&target)?;
                     println!("{}", if running { "running" } else { "stopped" });
                     if !running {
                         std::process::exit(3);
@@ -83,6 +121,18 @@ async fn execute(cli: Cli) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn read_secret_line() -> Result<zeroize::Zeroizing<String>> {
+    use std::io::BufRead as _;
+    let mut line = zeroize::Zeroizing::new(String::new());
+    std::io::stdin().lock().read_line(&mut line)?;
+    if line.trim().is_empty() {
+        return Err(error::DaemonError::Invalid(
+            "no recovery key was provided on stdin".into(),
+        ));
+    }
+    Ok(zeroize::Zeroizing::new(line.trim().to_owned()))
 }
 
 async fn run() -> Result<()> {
