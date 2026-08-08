@@ -32,7 +32,15 @@ pub(super) fn draw_models(frame: &mut Frame<'_>, area: Rect, picker: &ModelPicke
             .border_style(Style::default().fg(RED));
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
-        draw_input_field(frame, inner, i18n.text("model"), value, None, true, true);
+        draw_input_field(
+            frame,
+            inner,
+            i18n.text("model"),
+            value,
+            None,
+            Some(picker.cursor),
+            true,
+        );
         return;
     }
 
@@ -61,7 +69,7 @@ pub(super) fn draw_models(frame: &mut Frame<'_>, area: Rect, picker: &ModelPicke
             i18n.text("search"),
             &picker.query,
             None,
-            matches!(picker.mode, ModelPickerMode::Search),
+            matches!(picker.mode, ModelPickerMode::Search).then_some(picker.cursor),
             true,
         );
     }

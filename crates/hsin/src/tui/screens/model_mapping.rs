@@ -15,8 +15,8 @@ use super::super::{
 
 const ROW_HEIGHT: u16 = 3;
 const TIER_COUNT: u16 = 4;
-/// Master toggle plus one row per tier, inside the popup border.
-const POPUP_HEIGHT: u16 = ROW_HEIGHT * (TIER_COUNT + 1) + 2;
+/// Master toggle, default model, and one row per tier, inside the popup border.
+const POPUP_HEIGHT: u16 = ROW_HEIGHT * (TIER_COUNT + 2) + 2;
 /// Reserved on a tier row for the trailing 1M checkbox: `[x]` plus its borders.
 const CHECKBOX_WIDTH: u16 = 5;
 
@@ -58,15 +58,27 @@ pub(super) fn draw_model_mapping(
         mapping.field == 0,
     );
 
+    if rows > 1 {
+        draw_input_field(
+            frame,
+            row(1),
+            i18n.text("model_mapping_default"),
+            &mapping.default_model,
+            None,
+            (mapping.enabled && mapping.field == 1).then_some(mapping.cursor),
+            mapping.enabled,
+        );
+    }
+
     for (index, tier) in MAPPING_TIERS.iter().enumerate() {
-        let Ok(offset) = u16::try_from(index + 1) else {
+        let Ok(offset) = u16::try_from(index + 2) else {
             break;
         };
         if usize::from(offset) >= rows {
             break;
         }
         let area = row(offset);
-        let selected = mapping.enabled && mapping.field == index + 1;
+        let selected = mapping.enabled && mapping.field == index + 2;
         let value = &mapping.rows[index];
         // Only the tiers with a 1M variant reserve room for a checkbox; Haiku uses the full width.
         let (field_area, checkbox_area) = if tier.context_1m {
@@ -92,7 +104,7 @@ pub(super) fn draw_model_mapping(
             tier.label,
             &value.model,
             Some(tier.default_model),
-            selected,
+            selected.then_some(mapping.cursor),
             mapping.enabled,
         );
         if let Some(checkbox_area) = checkbox_area {

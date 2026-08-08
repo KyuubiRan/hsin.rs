@@ -12,7 +12,7 @@ use url::Url;
 pub const PROTOCOL_VERSION: u32 = 1;
 /// Monotonic CLI/daemon compatibility code. Bump when either side requires
 /// RPC fields or behavior that an older binary cannot provide.
-pub const VERSION_CODE: u32 = 22;
+pub const VERSION_CODE: u32 = 23;
 
 #[must_use]
 pub fn provider_name_from_url(value: &str) -> Option<String> {
@@ -315,6 +315,15 @@ impl ModelSlot {
 pub struct ClaudeModelMapping {
     #[serde(default)]
     pub enabled: bool,
+    /// The session default written to `ANTHROPIC_MODEL`.
+    ///
+    /// Claude Code resolves the startup model as `--model` > `ANTHROPIC_MODEL` > the selection
+    /// persisted in `settings.json`. Without this key a stale persisted selection — a first-party
+    /// model ID the upstream provider has never heard of — outranks the tier mapping and the
+    /// session fails before the mapping is ever consulted. No `[1m]` suffix: this value is the
+    /// model itself, not a tier alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fable: Option<ModelSlot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -340,22 +349,71 @@ impl ClaudeModelMapping {
     /// Whether this mapping writes anything at all.
     #[must_use]
     pub fn is_inert(&self) -> bool {
-        !self.enabled || self.slots().iter().all(|(_, slot)| slot.is_none())
+        !self.enabled
+            || (self.trimmed_default_model().is_none()
+                && self.slots().iter().all(|(_, slot)| slot.is_none()))
+    }
+
+    fn trimmed_default_model(&self) -> Option<&str> {
+        self.default_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+    }
+
+    /// The value to write for one of the [`CLAUDE_MODEL_ENV_KEYS`], or `None` when this mapping
+    /// does not own it.
+    ///
+    /// Each mapped tier drives three keys: the resolved model ID, the label Claude Code shows in
+    /// the model picker, and the description under it. Without the label the picker lists the raw
+    /// ID including the `[1m]` suffix, which is why the mapped model is otherwise invisible.
+    #[must_use]
+    pub fn env_value(&self, key: &str) -> Option<String> {
+        if key == CLAUDE_MODEL_ENV {
+            return self.trimmed_default_model().map(ToOwned::to_owned);
+        }
+        CLAUDE_TIER_ENV
+            .iter()
+            .zip(self.slots())
+            .find_map(|(tier, (_, slot))| {
+                let slot = slot?;
+                let bare = slot.model.trim();
+                if bare.is_empty() {
+                    return None;
+                }
+                if key == tier.model {
+                    Some(slot.resolved_model())
+                } else if key == tier.name {
+                    Some(bare.to_owned())
+                } else if key == tier.description {
+                    Some(format!("{} → {}", tier.label, slot.resolved_model()))
+                } else {
+                    None
+                }
+            })
     }
 
     /// Validate the mapping for a provider bound to `client`.
     ///
     /// # Errors
     ///
-    /// Returns [`ValidationError`] when the mapping is attached to a non-Claude provider, a mapped
-    /// model ID is empty or oversized, or 1M context is requested for the Haiku tier (which has no
-    /// 1M variant upstream).
+    /// Returns [`ValidationError`] when the mapping is attached to a non-Claude provider, the
+    /// default model or a mapped model ID is empty or oversized, or 1M context is requested for
+    /// the Haiku tier (which has no 1M variant upstream).
     pub fn validate(&self, client: ClientKind) -> Result<(), ValidationError> {
         if client != ClientKind::Claude {
             return Err(ValidationError::new(
                 "claude_model_mapping",
                 "unsupported_client",
             ));
+        }
+        if let Some(default_model) = self.default_model.as_deref() {
+            if default_model.trim().is_empty() {
+                return Err(ValidationError::new(CLAUDE_MODEL_ENV, "empty"));
+            }
+            if default_model.chars().count() > 256 {
+                return Err(ValidationError::new(CLAUDE_MODEL_ENV, "too_long"));
+            }
         }
         for (field, slot) in self.slots() {
             let Some(slot) = slot else { continue };
@@ -377,17 +435,63 @@ impl ClaudeModelMapping {
 }
 
 /// `settings.json` env keys owned by [`ClaudeModelMapping`].
+pub const CLAUDE_MODEL_ENV: &str = "ANTHROPIC_MODEL";
 pub const CLAUDE_FABLE_MODEL_ENV: &str = "ANTHROPIC_DEFAULT_FABLE_MODEL";
 pub const CLAUDE_OPUS_MODEL_ENV: &str = "ANTHROPIC_DEFAULT_OPUS_MODEL";
 pub const CLAUDE_SONNET_MODEL_ENV: &str = "ANTHROPIC_DEFAULT_SONNET_MODEL";
 pub const CLAUDE_HAIKU_MODEL_ENV: &str = "ANTHROPIC_DEFAULT_HAIKU_MODEL";
 
+/// The three env keys one tier owns, plus the tier's name in Claude Code's own vocabulary.
+struct TierEnv {
+    label: &'static str,
+    model: &'static str,
+    name: &'static str,
+    description: &'static str,
+}
+
+/// Aligned with [`ClaudeModelMapping::slots`].
+const CLAUDE_TIER_ENV: [TierEnv; 4] = [
+    TierEnv {
+        label: "Fable",
+        model: CLAUDE_FABLE_MODEL_ENV,
+        name: "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME",
+        description: "ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION",
+    },
+    TierEnv {
+        label: "Opus",
+        model: CLAUDE_OPUS_MODEL_ENV,
+        name: "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+        description: "ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION",
+    },
+    TierEnv {
+        label: "Sonnet",
+        model: CLAUDE_SONNET_MODEL_ENV,
+        name: "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+        description: "ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION",
+    },
+    TierEnv {
+        label: "Haiku",
+        model: CLAUDE_HAIKU_MODEL_ENV,
+        name: "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+        description: "ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION",
+    },
+];
+
 /// Every env key the Claude model mapping may write, in display order.
-pub const CLAUDE_MODEL_ENV_KEYS: [&str; 4] = [
-    CLAUDE_FABLE_MODEL_ENV,
-    CLAUDE_OPUS_MODEL_ENV,
-    CLAUDE_SONNET_MODEL_ENV,
-    CLAUDE_HAIKU_MODEL_ENV,
+pub const CLAUDE_MODEL_ENV_KEYS: [&str; 13] = [
+    CLAUDE_MODEL_ENV,
+    CLAUDE_TIER_ENV[0].model,
+    CLAUDE_TIER_ENV[0].name,
+    CLAUDE_TIER_ENV[0].description,
+    CLAUDE_TIER_ENV[1].model,
+    CLAUDE_TIER_ENV[1].name,
+    CLAUDE_TIER_ENV[1].description,
+    CLAUDE_TIER_ENV[2].model,
+    CLAUDE_TIER_ENV[2].name,
+    CLAUDE_TIER_ENV[2].description,
+    CLAUDE_TIER_ENV[3].model,
+    CLAUDE_TIER_ENV[3].name,
+    CLAUDE_TIER_ENV[3].description,
 ];
 
 /// Public provider metadata. Credentials are deliberately stored separately.
@@ -1151,6 +1255,61 @@ mod claude_model_mapping_tests {
         assert!(!mapping.is_inert());
         mapping.enabled = false;
         assert!(mapping.is_inert(), "the master switch overrides the tiers");
+    }
+
+    #[test]
+    fn a_default_model_alone_is_worth_writing() {
+        // ANTHROPIC_MODEL is useful with no tier mapped at all: on its own it stops a stale
+        // persisted selection from being sent to a provider that never had that model.
+        let mapping = ClaudeModelMapping {
+            enabled: true,
+            default_model: Some("deepseek-v4-pro".into()),
+            ..ClaudeModelMapping::default()
+        };
+        assert!(!mapping.is_inert());
+        assert_eq!(
+            mapping.env_value(CLAUDE_MODEL_ENV).as_deref(),
+            Some("deepseek-v4-pro")
+        );
+    }
+
+    #[test]
+    fn a_mapped_tier_names_and_describes_itself_for_the_model_picker() {
+        // Claude Code labels the picker entry with `_NAME` and falls back to the raw ID, suffix
+        // and all, when it is absent — which is what made the mapping invisible in the picker.
+        let mapping = ClaudeModelMapping {
+            enabled: true,
+            opus: Some(slot("deepseek-v4-pro", true)),
+            ..ClaudeModelMapping::default()
+        };
+        assert_eq!(
+            mapping.env_value(CLAUDE_OPUS_MODEL_ENV).as_deref(),
+            Some("deepseek-v4-pro[1m]")
+        );
+        assert_eq!(
+            mapping
+                .env_value("ANTHROPIC_DEFAULT_OPUS_MODEL_NAME")
+                .as_deref(),
+            Some("deepseek-v4-pro"),
+            "the label drops the suffix; it is a name, not a model ID"
+        );
+        assert_eq!(
+            mapping
+                .env_value("ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION")
+                .as_deref(),
+            Some("Opus → deepseek-v4-pro[1m]")
+        );
+        // An unmapped tier owns none of its three keys, so they are restored rather than written.
+        for key in [
+            CLAUDE_SONNET_MODEL_ENV,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION",
+        ] {
+            assert_eq!(mapping.env_value(key), None, "{key}");
+        }
+        // Every key the writer iterates has to be one some tier can claim.
+        assert!(CLAUDE_MODEL_ENV_KEYS.contains(&"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"));
+        assert!(CLAUDE_MODEL_ENV_KEYS.contains(&CLAUDE_MODEL_ENV));
     }
 
     #[test]

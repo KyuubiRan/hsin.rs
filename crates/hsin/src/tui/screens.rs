@@ -54,7 +54,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, state: &mut State, i18n: &I18n) {
     // The search bar stays docked above the list while it has focus or a filter is active, so it
     // never covers the providers behind it and a filter committed with enter remains visible.
     let has_search =
-        matches!(state.input, InputMode::Search(_)) || !state.active_query().is_empty();
+        matches!(state.input, InputMode::Search { .. }) || !state.active_query().is_empty();
     let (search_area, content) = if has_search {
         let parts = Layout::default()
             .direction(Direction::Vertical)
@@ -92,7 +92,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, state: &mut State, i18n: &I18n) {
     match &state.input {
         // The delete confirmation is only a footer prompt, so the provider list stays readable
         // while it is armed and nothing has to be redrawn here.
-        InputMode::Search(_) | InputMode::Normal | InputMode::DeleteConfirm { .. } => {}
+        InputMode::Search { .. } | InputMode::Normal | InputMode::DeleteConfirm { .. } => {}
         InputMode::Form(_) => unreachable!("provider form is drawn over the footer"),
         InputMode::Models(picker) => draw_models(frame, rows[2], picker, i18n),
         InputMode::ModelMapping(mapping) => draw_model_mapping(frame, overlay, mapping, i18n),

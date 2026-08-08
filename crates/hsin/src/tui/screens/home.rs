@@ -10,7 +10,7 @@ use ratatui::{
 use crate::i18n::I18n;
 
 use super::super::{
-    state::{InputMode, State},
+    state::{InputMode, MAPPING_TIERS, State},
     theme::{MUTED, RED, WHITE},
     widgets::draw_input_field,
 };
@@ -49,6 +49,14 @@ pub(super) fn draw_provider_list(
                 ListItem::new(Line::from(vec![
                     Span::styled(format!("{marker} "), Style::default().fg(RED)),
                     Span::styled(name, Style::default().fg(WHITE)),
+                    Span::styled(
+                        if model_mapping_active(provider) {
+                            format!(" {}", i18n.text("model_mapping_badge"))
+                        } else {
+                            String::new()
+                        },
+                        Style::default().fg(RED),
+                    ),
                     Span::styled(
                         format!("\n   {}", provider.base_url),
                         Style::default().fg(MUTED),
@@ -118,7 +126,7 @@ pub(super) fn draw_details(frame: &mut Frame<'_>, area: Rect, state: &State, i18
     } else {
         i18n.text("disabled")
     };
-    let lines = vec![
+    let mut lines = vec![
         Line::from(Span::styled(
             name,
             Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
@@ -130,6 +138,17 @@ pub(super) fn draw_details(frame: &mut Frame<'_>, area: Rect, state: &State, i18
         detail_line(i18n.text("auth_type"), auth),
         detail_line(i18n.text("tool_proxy"), proxy),
     ];
+    let mapping = model_mapping_summary(provider, i18n);
+    if let Some(mapping) = &mapping {
+        lines.push(detail_line(i18n.text("model_mapping"), &mapping.state));
+        // One tier per line: the mapped IDs are long enough that a joined list wraps mid-name.
+        lines.extend(mapping.tiers.iter().map(|tier| {
+            Line::from(Span::styled(
+                format!("  {tier}"),
+                Style::default().fg(WHITE),
+            ))
+        }));
+    }
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
@@ -148,15 +167,70 @@ fn detail_line<'a>(label: &'a str, value: &'a str) -> Line<'a> {
     ])
 }
 
+/// Whether this provider actually writes model-mapping keys into `settings.json`.
+fn model_mapping_active(provider: &hsin_core::Provider) -> bool {
+    !provider.official
+        && provider
+            .claude_model_mapping
+            .as_ref()
+            .is_some_and(|mapping| !mapping.is_inert())
+}
+
+/// The mapping status shown in the details pane: `None` for clients that have no mapping at all,
+/// otherwise on/off plus one entry per tier that is written.
+struct ModelMappingSummary {
+    state: String,
+    tiers: Vec<String>,
+}
+
+fn model_mapping_summary(
+    provider: &hsin_core::Provider,
+    i18n: &I18n,
+) -> Option<ModelMappingSummary> {
+    if provider.client != hsin_core::ClientKind::Claude || provider.official {
+        return None;
+    }
+    if !model_mapping_active(provider) {
+        return Some(ModelMappingSummary {
+            state: i18n.text("disabled").to_owned(),
+            tiers: Vec::new(),
+        });
+    }
+    let mapping = provider.claude_model_mapping.as_ref()?;
+    // The session default leads: it is what a fresh Claude Code run actually starts on.
+    let default_model = mapping
+        .default_model
+        .as_deref()
+        .map(|model| format!("{}: {model}", i18n.text("model_mapping_default")));
+    let tiers = default_model
+        .into_iter()
+        .chain(
+            MAPPING_TIERS
+                .iter()
+                .zip(mapping.slots())
+                .filter_map(|(tier, (_, slot))| {
+                    slot.map(|slot| format!("{} → {}", tier.label, slot.resolved_model()))
+                }),
+        )
+        .collect();
+    Some(ModelMappingSummary {
+        state: i18n.text("enabled").to_owned(),
+        tiers,
+    })
+}
+
 pub(super) fn draw_search(frame: &mut Frame<'_>, area: Rect, state: &State, i18n: &I18n) {
-    let focused = matches!(state.input, InputMode::Search(_));
+    let cursor = match &state.input {
+        InputMode::Search { cursor, .. } => Some(*cursor),
+        _ => None,
+    };
     draw_input_field(
         frame,
         area,
         i18n.text("search"),
         state.active_query(),
         None,
-        focused,
+        cursor,
         true,
     );
 }

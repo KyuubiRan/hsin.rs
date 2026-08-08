@@ -169,52 +169,15 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
             }))
         }
         Effect::Add(form) => {
-            let model = match form.model {
-                ModelUpdate::Set(model) => Some(model),
-                ModelUpdate::Preserve | ModelUpdate::Clear => None,
-            };
-            let request = ProviderAddParams {
-                provider: ProviderDraft {
-                    client: form.client,
-                    name: form.name,
-                    description: form.description,
-                    base_url: form.base_url,
-                    auth_scheme: form.auth_scheme,
-                    model,
-                    claude_model_mapping: None,
-                },
-                secret: if form.secret.is_empty() {
-                    SecretInput::Clear
-                } else {
-                    SecretInput::Replace(form.secret.to_string())
-                },
-            };
-            let _: Value = client.call("provider.add", &request).await?;
+            let _: Value = client
+                .call("provider.add", &provider_add_params(form))
+                .await?;
             Ok(Some("provider_added"))
         }
         Effect::Edit(form) => {
-            let id = form.id.context("edit form is missing provider ID")?;
-            let expected_revision = form
-                .revision
-                .context("edit form is missing provider revision")?;
-            let request = ProviderEditParams {
-                id,
-                expected_revision,
-                patch: ProviderPatch {
-                    name: Some(form.name),
-                    base_url: Some(form.base_url),
-                    auth_scheme: Some(form.auth_scheme),
-                    description: Some(form.description),
-                    model: form.model,
-                    claude_model_mapping: ClaudeModelMappingUpdate::Preserve,
-                },
-                secret: if form.secret.is_empty() {
-                    SecretInput::Preserve
-                } else {
-                    SecretInput::Replace(form.secret.to_string())
-                },
-            };
-            let _: Value = client.call("provider.edit", &request).await?;
+            let _: Value = client
+                .call("provider.edit", &provider_edit_params(form)?)
+                .await?;
             Ok(Some("provider_updated"))
         }
         Effect::Remove {
@@ -236,6 +199,59 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
         Effect::DiscoverModels(_) => unreachable!("model discovery is handled by the worker"),
         Effect::CopyProvider(_) => unreachable!("provider copying is handled by the worker"),
     }
+}
+
+/// Translate a saved provider form into the daemon request.
+///
+/// Split out from the call itself so the fields the form carries — the Claude model mapping in
+/// particular — can be checked without a running daemon.
+pub(super) fn provider_add_params(form: FormSubmission) -> ProviderAddParams {
+    let model = match form.model {
+        ModelUpdate::Set(model) => Some(model),
+        ModelUpdate::Preserve | ModelUpdate::Clear => None,
+    };
+    let claude_model_mapping = match form.claude_model_mapping {
+        ClaudeModelMappingUpdate::Set(mapping) => Some(mapping),
+        ClaudeModelMappingUpdate::Preserve | ClaudeModelMappingUpdate::Clear => None,
+    };
+    ProviderAddParams {
+        provider: ProviderDraft {
+            client: form.client,
+            name: form.name,
+            description: form.description,
+            base_url: form.base_url,
+            auth_scheme: form.auth_scheme,
+            model,
+            claude_model_mapping,
+        },
+        secret: if form.secret.is_empty() {
+            SecretInput::Clear
+        } else {
+            SecretInput::Replace(form.secret.to_string())
+        },
+    }
+}
+
+pub(super) fn provider_edit_params(form: FormSubmission) -> Result<ProviderEditParams> {
+    Ok(ProviderEditParams {
+        id: form.id.context("edit form is missing provider ID")?,
+        expected_revision: form
+            .revision
+            .context("edit form is missing provider revision")?,
+        patch: ProviderPatch {
+            name: Some(form.name),
+            base_url: Some(form.base_url),
+            auth_scheme: Some(form.auth_scheme),
+            description: Some(form.description),
+            model: form.model,
+            claude_model_mapping: form.claude_model_mapping,
+        },
+        secret: if form.secret.is_empty() {
+            SecretInput::Preserve
+        } else {
+            SecretInput::Replace(form.secret.to_string())
+        },
+    })
 }
 
 async fn resolve_provider_copy(

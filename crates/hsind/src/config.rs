@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::Write,
     ops::Range,
@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use toml_edit::{DocumentMut, ImDocument, Item, Table, value};
 use zeroize::{Zeroize, Zeroizing};
 
-use hsin_core::{CLAUDE_MODEL_ENV_KEYS, ModelSlot};
+use hsin_core::CLAUDE_MODEL_ENV_KEYS;
 
 use crate::{
     error::{DaemonError, Result},
@@ -61,6 +61,23 @@ pub struct ConfigTarget {
 pub struct ClaudeModelEnvSnapshot {
     #[serde(default)]
     pub values: BTreeMap<String, String>,
+    /// The keys this snapshot was taken for. Snapshots written before hsin owned more than the
+    /// four tier keys carry no list, so they default to exactly those four: everything else in the
+    /// file is still the user's own and has to be captured before hsin first overwrites it.
+    #[serde(default = "legacy_covered_keys")]
+    pub covered: BTreeSet<String>,
+}
+
+fn legacy_covered_keys() -> BTreeSet<String> {
+    [
+        "ANTHROPIC_DEFAULT_FABLE_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect()
 }
 
 impl ClaudeModelEnvSnapshot {
@@ -88,7 +105,38 @@ impl ClaudeModelEnvSnapshot {
                 values.insert(key.to_owned(), existing.to_owned());
             }
         }
-        Ok(Self { values })
+        Ok(Self {
+            values,
+            covered: CLAUDE_MODEL_ENV_KEYS
+                .iter()
+                .map(|key| (*key).to_owned())
+                .collect(),
+        })
+    }
+
+    /// Whether every key hsin currently owns has already been captured.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        CLAUDE_MODEL_ENV_KEYS
+            .iter()
+            .all(|key| self.covered.contains(*key))
+    }
+
+    /// Capture the keys this snapshot does not cover yet from the live file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DaemonError::Config`] when the text is not parseable JSONC.
+    pub fn extend_uncovered(&mut self, text: &str) -> Result<()> {
+        let fresh = Self::capture(text)?;
+        for key in CLAUDE_MODEL_ENV_KEYS {
+            if self.covered.insert(key.to_owned())
+                && let Some(value) = fresh.get(key)
+            {
+                self.values.insert(key.to_owned(), value.to_owned());
+            }
+        }
+        Ok(())
     }
 
     fn get(&self, key: &str) -> Option<&str> {
@@ -707,15 +755,7 @@ fn patch_claude_model_mapping(text: &str, target: &ConfigTarget) -> Result<Strin
     let snapshot = target.claude_model_env_before.clone().unwrap_or_default();
     let mut output = text.to_owned();
     for key in CLAUDE_MODEL_ENV_KEYS {
-        let mapped = mapping
-            .and_then(|mapping| {
-                mapping
-                    .slots()
-                    .into_iter()
-                    .find_map(|(slot_key, slot)| (slot_key == key).then_some(slot).flatten())
-            })
-            .map(ModelSlot::resolved_model)
-            .filter(|model| !model.is_empty());
+        let mapped = mapping.and_then(|mapping| mapping.env_value(key));
         let value = mapped.as_deref().or_else(|| snapshot.get(key));
         output = set_nested_string(&output, "env", key, value)?;
     }
@@ -1408,6 +1448,7 @@ fn newline(text: &str) -> &'static str {
 mod tests {
     use super::*;
     use crate::model::AuthScheme;
+    use hsin_core::ModelSlot;
 
     type NamedItems = Vec<(String, String)>;
 
@@ -1865,6 +1906,7 @@ mod tests {
         let mut claude = target(ClientKind::Claude);
         claude.provider.claude_model_mapping = Some(hsin_core::ClaudeModelMapping {
             enabled: true,
+            default_model: Some("deepseek-v4-pro".into()),
             fable: Some(mapped("claude-fable-5", false)),
             opus: Some(mapped("claude-opus-5", true)),
             sonnet: None,
@@ -1875,7 +1917,18 @@ mod tests {
         assert!(output.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL\": \"claude-opus-5[1m]\""));
         assert!(output.contains("\"ANTHROPIC_DEFAULT_HAIKU_MODEL\": \"claude-haiku-4-5\""));
         // An unmapped tier is not written at all rather than being blanked out.
-        assert!(!output.contains("ANTHROPIC_DEFAULT_SONNET_MODEL"));
+        assert!(!output.contains("\"ANTHROPIC_DEFAULT_SONNET_MODEL\""));
+
+        // The session default outranks whatever selection Claude Code persisted, so it is the key
+        // that keeps a stale first-party model ID from reaching an upstream that has never seen it.
+        assert!(output.contains("\"ANTHROPIC_MODEL\": \"deepseek-v4-pro\""));
+        // Each mapped tier also names itself in the picker; without these the picker lists the raw
+        // ID and the mapping is invisible to the user.
+        assert!(output.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"claude-opus-5\""));
+        assert!(output.contains(
+            "\"ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION\": \"Opus → claude-opus-5[1m]\""
+        ));
+        assert!(!output.contains("ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"));
     }
 
     #[test]
@@ -1922,16 +1975,62 @@ mod tests {
     }
 
     #[test]
-    fn the_claude_model_mapping_never_touches_anthropic_model() {
+    fn the_claude_model_mapping_owns_anthropic_model_without_losing_the_users_own() {
         let original = "{\n  \"env\": {\n    \"ANTHROPIC_MODEL\": \"user-choice\"\n  }\n}\n";
+        let snapshot = ClaudeModelEnvSnapshot::capture(original).unwrap();
         let mut claude = target(ClientKind::Claude);
+        claude.claude_model_env_before = Some(snapshot);
+
+        // A mapping that names no default model leaves the user's own selection alone: hsin owns
+        // the key, but owning it is not the same as always having a value for it.
         claude.provider.claude_model_mapping = Some(hsin_core::ClaudeModelMapping {
             enabled: true,
             opus: Some(mapped("claude-opus-5", false)),
             ..hsin_core::ClaudeModelMapping::default()
         });
-        let output = patch_claude_with_credential(original, &claude, None).unwrap();
-        assert!(output.contains("\"ANTHROPIC_MODEL\": \"user-choice\""));
+        let untouched = patch_claude_with_credential(original, &claude, None).unwrap();
+        assert!(untouched.contains("\"ANTHROPIC_MODEL\": \"user-choice\""));
+
+        // Naming one replaces it, because a stale first-party selection persisted in settings.json
+        // would otherwise outrank the tier mapping and be sent to a provider that never heard of it.
+        claude.provider.claude_model_mapping = Some(hsin_core::ClaudeModelMapping {
+            enabled: true,
+            default_model: Some("deepseek-v4-pro".into()),
+            opus: Some(mapped("claude-opus-5", false)),
+            ..hsin_core::ClaudeModelMapping::default()
+        });
+        let managed = patch_claude_with_credential(original, &claude, None).unwrap();
+        assert!(managed.contains("\"ANTHROPIC_MODEL\": \"deepseek-v4-pro\""));
+
+        // And dropping it hands the key back rather than deleting it.
+        claude.provider.claude_model_mapping = None;
+        let restored = patch_claude_with_credential(&managed, &claude, None).unwrap();
+        assert!(restored.contains("\"ANTHROPIC_MODEL\": \"user-choice\""));
+    }
+
+    #[test]
+    fn a_snapshot_from_an_older_hsin_still_captures_the_keys_added_since() {
+        // Older snapshots record no key list. They must be read as covering only the four tier
+        // keys that version owned, so the user's own `ANTHROPIC_MODEL` is captured before hsin
+        // first writes over it rather than being silently lost.
+        let stored: ClaudeModelEnvSnapshot =
+            serde_json::from_str("{\"values\":{\"ANTHROPIC_DEFAULT_OPUS_MODEL\":\"mine\"}}")
+                .unwrap();
+        assert!(!stored.is_complete());
+
+        let mut snapshot = stored;
+        snapshot
+            .extend_uncovered("{\"env\":{\"ANTHROPIC_MODEL\":\"user-choice\"}}")
+            .unwrap();
+        assert!(snapshot.is_complete());
+        assert_eq!(snapshot.get("ANTHROPIC_MODEL"), Some("user-choice"));
+
+        // The tier key was already covered, so hsin's own value in the live file cannot overwrite
+        // what was captured for it.
+        snapshot
+            .extend_uncovered("{\"env\":{\"ANTHROPIC_DEFAULT_OPUS_MODEL\":\"hsin-wrote-this\"}}")
+            .unwrap();
+        assert_eq!(snapshot.get("ANTHROPIC_DEFAULT_OPUS_MODEL"), Some("mine"));
     }
 
     #[test]
@@ -1990,7 +2089,7 @@ mod tests {
 
     #[test]
     fn claude_preserves_comments_and_unmanaged_fields() {
-        let input = "{\n  // keep me\n  \"permissions\": { \"allow\": [\"Read(心)\"] },\n  \"env\": {\n    \"OTHER\": \"keep\", // inline comment\n    \"ANTHROPIC_MODEL\": \"claude-test\",\n    \"ANTHROPIC_API_KEY\": \"remove\",\n    \"ANTHROPIC_AUTH_TOKEN\": \"remove too\"\n  },\n  \"hooks\": {\"Stop\": []},\n  \"mcpServers\": { \"keep\": { \"command\": \"unchanged\" } }\n}\n";
+        let input = "{\n  // keep me\n  \"permissions\": { \"allow\": [\"Read(心)\"] },\n  \"env\": {\n    \"OTHER\": \"keep\", // inline comment\n    \"ANTHROPIC_SMALL_FAST_MODEL\": \"claude-test\",\n    \"ANTHROPIC_API_KEY\": \"remove\",\n    \"ANTHROPIC_AUTH_TOKEN\": \"remove too\"\n  },\n  \"hooks\": {\"Stop\": []},\n  \"mcpServers\": { \"keep\": { \"command\": \"unchanged\" } }\n}\n";
         let output = patch_claude(input, &target(ClientKind::Claude)).unwrap();
 
         assert_eq!(claude_unowned_value(input), claude_unowned_value(&output));
@@ -1998,7 +2097,7 @@ mod tests {
             &output,
             &[
                 "// keep me\n  \"permissions\": { \"allow\": [\"Read(心)\"] },",
-                "\"OTHER\": \"keep\", // inline comment\n    \"ANTHROPIC_MODEL\": \"claude-test\"",
+                "\"OTHER\": \"keep\", // inline comment\n    \"ANTHROPIC_SMALL_FAST_MODEL\": \"claude-test\"",
                 "\"hooks\": {\"Stop\": []},\n  \"mcpServers\": { \"keep\": { \"command\": \"unchanged\" } }",
             ],
         );

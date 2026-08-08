@@ -444,6 +444,10 @@ impl App {
             ClaudeModelMappingUpdate::Set(mapping) => Some(mapping),
             ClaudeModelMappingUpdate::Clear => None,
         };
+        // The mapping env keys live in `settings.json` in both connection modes, so changing them on
+        // the active provider has to be written out even while the proxy owns the base URL.
+        let mapping_changed = current.client == ClientKind::Claude
+            && claude_model_mapping != current.claude_model_mapping;
         let name = params.patch.name.unwrap_or(current.name);
         let input = ProviderInput {
             client: current.client,
@@ -474,6 +478,7 @@ impl App {
         let active_direct = active && state.mode == ConnectionMode::Direct;
         let update_active_config = active
             && (active_direct
+                || mapping_changed
                 || (provider.client == ClientKind::Codex && provider.model.is_some()));
         if active_direct
             && !matches!(
@@ -950,10 +955,18 @@ impl App {
     /// The user's own values for the model-mapping env keys, captured the first time hsin builds a
     /// Claude config target and reused from then on — after that first capture the file may hold
     /// hsin's own values, which must never be mistaken for the user's.
+    ///
+    /// A snapshot taken by an older hsin only covers the keys that version owned. The keys added
+    /// since are still the user's own in the file, so they are captured now rather than being
+    /// overwritten unrecorded.
     fn claude_model_env_snapshot(&self) -> Result<config::ClaudeModelEnvSnapshot> {
         const SETTING: &str = "claude_model_env_before";
-        if let Some(stored) = self.db.setting(SETTING)? {
-            return Ok(serde_json::from_str(&stored)?);
+        let mut snapshot = match self.db.setting(SETTING)? {
+            Some(stored) => serde_json::from_str::<config::ClaudeModelEnvSnapshot>(&stored)?,
+            None => config::ClaudeModelEnvSnapshot::default(),
+        };
+        if snapshot.is_complete() {
+            return Ok(snapshot);
         }
         let path = self.config_path(ClientKind::Claude)?;
         let text = if path.exists() {
@@ -961,7 +974,7 @@ impl App {
         } else {
             String::new()
         };
-        let snapshot = config::ClaudeModelEnvSnapshot::capture(&text)?;
+        snapshot.extend_uncovered(&text)?;
         self.db
             .set_setting(SETTING, &serde_json::to_string(&snapshot)?)?;
         Ok(snapshot)
@@ -2984,6 +2997,100 @@ mod tests {
 
         app.notify_shutdown();
         proxy.await.unwrap().unwrap();
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn editing_the_mapping_rewrites_the_active_claude_configuration_in_proxy_mode() {
+        // The mapping env keys live in settings.json whichever mode the client runs in, so an edit
+        // that only changes the mapping still has to reach the file the proxy left alone.
+        let root = std::env::temp_dir().join(format!("hsind-mapping-{}", uuid::Uuid::new_v4()));
+        let paths = Paths {
+            database: root.join("hsin.sqlite3"),
+            lock: root.join("hsind.lock"),
+            logs: root.join("logs"),
+            backups: root.join("backups"),
+            home: root.clone(),
+        };
+        let settings_path = root.join("claude/settings.json");
+        let app = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
+        *app.config_paths.write() = HashMap::from([
+            (ClientKind::Codex, root.join("codex/config.toml")),
+            (ClientKind::Claude, settings_path.clone()),
+        ]);
+        let provider = app
+            .add_provider(ProviderAddParams {
+                provider: hsin_core::ProviderDraft {
+                    client: ClientKind::Claude,
+                    name: "Claude custom".into(),
+                    description: String::new(),
+                    base_url: "https://claude.example.test".into(),
+                    auth_scheme: AuthScheme::XApiKey,
+                    model: None,
+                    claude_model_mapping: None,
+                },
+                secret: SecretInput::Replace("claude-secret".into()),
+            })
+            .await
+            .unwrap();
+        let provider = app
+            .switch_provider(ProviderSwitchParams {
+                client: ClientKind::Claude,
+                provider_id: provider.id,
+            })
+            .await
+            .unwrap();
+        // Proxy mode without starting a listener: only the persisted mode drives the config write.
+        app.db
+            .set_mode(ClientKind::Claude, ConnectionMode::Proxy)
+            .unwrap();
+
+        let mapped = app
+            .edit_provider(ProviderEditParams {
+                id: provider.id.clone(),
+                expected_revision: provider.revision,
+                patch: hsin_core::ProviderPatch {
+                    claude_model_mapping: ClaudeModelMappingUpdate::Set(
+                        hsin_core::ClaudeModelMapping {
+                            enabled: true,
+                            opus: Some(hsin_core::ModelSlot {
+                                model: "deepseek-v4-flash".into(),
+                                context_1m: true,
+                            }),
+                            ..hsin_core::ClaudeModelMapping::default()
+                        },
+                    ),
+                    ..hsin_core::ProviderPatch::default()
+                },
+                secret: SecretInput::Preserve,
+            })
+            .await
+            .unwrap();
+        let configured = fs::read_to_string(&settings_path).unwrap();
+        assert!(configured.contains("\"ANTHROPIC_BASE_URL\": \"http://127.0.0.1:"));
+        assert!(
+            configured.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL\": \"deepseek-v4-flash[1m]\""),
+            "the mapped tier should be written in proxy mode: {configured}"
+        );
+
+        app.edit_provider(ProviderEditParams {
+            id: mapped.id.clone(),
+            expected_revision: mapped.revision,
+            patch: hsin_core::ProviderPatch {
+                claude_model_mapping: ClaudeModelMappingUpdate::Clear,
+                ..hsin_core::ProviderPatch::default()
+            },
+            secret: SecretInput::Preserve,
+        })
+        .await
+        .unwrap();
+        let cleared = fs::read_to_string(&settings_path).unwrap();
+        assert!(
+            !cleared.contains("ANTHROPIC_DEFAULT_OPUS_MODEL"),
+            "clearing the mapping should remove the key again: {cleared}"
+        );
+
         drop(app);
         fs::remove_dir_all(root).unwrap();
     }

@@ -12,6 +12,7 @@ use ratatui::{
 use zeroize::Zeroizing;
 
 use super::{
+    effects::{provider_add_params, provider_edit_params},
     screens::{TITLE, VERSION_LABEL, form_field_areas},
     state::{
         DELETE_CONFIRM_WINDOW, FormSubmission, InputMode, ModelPicker, ModelPickerMode,
@@ -745,6 +746,7 @@ fn add_form_defaults_empty_name_to_base_url_host() {
         error: None,
         secret_visible: false,
         discovering_models: false,
+        cursor: 0,
         claude_model_mapping: None,
     };
     let submission = take_form_submission(&mut form).unwrap();
@@ -1002,6 +1004,7 @@ fn model_picker_accepts_manual_model() {
             query: String::new(),
             mode: ModelPickerMode::Browse,
             warning: None,
+            cursor: 0,
         }),
         ..State::default()
     };
@@ -1844,7 +1847,7 @@ fn escape_in_the_search_box_keeps_the_previously_applied_filter() {
 
     // Reopening prefills the committed query, and abandoning the edit must not drop it.
     state.reduce(key(KeyCode::Char('/')));
-    assert!(matches!(&state.input, InputMode::Search(query) if query == "alpha"));
+    assert!(matches!(&state.input, InputMode::Search { query, .. } if query == "alpha"));
     type_query(&mut state, "zzz");
     state.reduce(key(KeyCode::Esc));
 
@@ -1859,7 +1862,7 @@ fn control_u_clears_the_search_query_instead_of_typing_u() {
     type_query(&mut state, "alpha");
     state.reduce(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL));
 
-    assert!(matches!(&state.input, InputMode::Search(query) if query.is_empty()));
+    assert!(matches!(&state.input, InputMode::Search { query, .. } if query.is_empty()));
     assert_eq!(state.visible_providers().len(), 2);
 }
 
@@ -1950,6 +1953,7 @@ fn claude_form(mapping: Option<ClaudeModelMapping>) -> ProviderForm {
         error: None,
         secret_visible: false,
         discovering_models: false,
+        cursor: 0,
         claude_model_mapping: mapping,
     }
 }
@@ -1972,6 +1976,13 @@ fn submitted_mapping(state: &mut State) -> ClaudeModelMappingUpdate {
     }
 }
 
+/// Move focus from the master toggle down to tier `index`, stepping past the default-model row.
+fn focus_tier(state: &mut State, index: usize) {
+    for _ in 0..index + 2 {
+        state.reduce(key(KeyCode::Down));
+    }
+}
+
 #[test]
 fn a_claude_form_opens_the_mapping_dialog_instead_of_saving_immediately() {
     // Codex resolves its model by discovery; Claude has no discovery endpoint, so the mapping
@@ -1987,7 +1998,7 @@ fn arrow_keys_do_not_flip_a_tier_1m_box() {
     // stray arrow while typing cannot silently change what gets requested upstream.
     let mut state = mapping_state(None);
     state.reduce(key(KeyCode::Char(' '))); // enable the mapping
-    state.reduce(key(KeyCode::Down)); // Fable
+    focus_tier(&mut state, 0); // Fable
     state.reduce(key(KeyCode::Tab));
     state.reduce(key(KeyCode::Right));
     state.reduce(key(KeyCode::Left));
@@ -2009,7 +2020,7 @@ fn arrow_keys_do_not_flip_a_tier_1m_box() {
 fn tab_completes_the_default_model_for_the_focused_tier() {
     let mut state = mapping_state(None);
     state.reduce(key(KeyCode::Char(' '))); // enable the mapping
-    state.reduce(key(KeyCode::Down)); // Fable
+    focus_tier(&mut state, 0); // Fable
     state.reduce(key(KeyCode::Tab));
     state.reduce(key(KeyCode::Down)); // Opus
     state.reduce(key(KeyCode::Tab));
@@ -2041,7 +2052,7 @@ fn tab_completes_the_default_model_for_the_focused_tier() {
 fn tab_does_not_overwrite_a_model_the_operator_typed() {
     let mut state = mapping_state(None);
     state.reduce(key(KeyCode::Char(' ')));
-    state.reduce(key(KeyCode::Down));
+    focus_tier(&mut state, 0);
     type_query(&mut state, "custom");
     state.reduce(key(KeyCode::Tab));
 
@@ -2056,7 +2067,7 @@ fn tab_does_not_overwrite_a_model_the_operator_typed() {
 fn control_u_clears_the_focused_mapping_row() {
     let mut state = mapping_state(None);
     state.reduce(key(KeyCode::Char(' ')));
-    state.reduce(key(KeyCode::Down));
+    focus_tier(&mut state, 0);
     state.reduce(key(KeyCode::Tab));
     state.reduce(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL));
 
@@ -2073,9 +2084,7 @@ fn the_haiku_tier_cannot_request_1m_context() {
     // key is inert there.
     let mut state = mapping_state(None);
     state.reduce(key(KeyCode::Char(' ')));
-    for _ in 0..4 {
-        state.reduce(key(KeyCode::Down));
-    }
+    focus_tier(&mut state, 3);
     state.reduce(key(KeyCode::Tab));
     state.reduce(key(KeyCode::Char(' ')));
 
@@ -2148,7 +2157,13 @@ fn the_mapping_dialog_sits_where_the_provider_form_did() {
     let mut mapping = mapping_state(None);
     let mapping_row = popup_row(&render(&mut mapping, 100, 32), "Model mapping");
 
-    assert_eq!(form_row, mapping_row);
+    // Both are centred in the same area, so the taller mapping dialog opens slightly higher. What
+    // this guards against is it landing somewhere else entirely, further down the screen.
+    assert!(
+        mapping_row <= form_row && form_row - mapping_row <= 2,
+        "the mapping dialog should stay centred where the form was, \
+         got form={form_row} mapping={mapping_row}"
+    );
 }
 
 /// The 0-based screen row carrying `title`, from a `render` dump of a 100-column terminal.
@@ -2159,4 +2174,234 @@ fn popup_row(rendered: &str, title: &str) -> usize {
         .chunks(100)
         .position(|row| row.iter().collect::<String>().contains(title))
         .unwrap_or_else(|| panic!("{title} is not on screen"))
+}
+
+#[test]
+fn the_default_model_reaches_the_daemon_and_takes_the_caret() {
+    // ANTHROPIC_MODEL is what a fresh Claude Code run starts on: it outranks the selection Claude
+    // Code persisted, so a stale first-party model ID never reaches an upstream that lacks it.
+    // It is also a plain text box, unlike the toggle above it and the checkboxes beside the tiers.
+    let mut state = mapping_state(None);
+    state.reduce(key(KeyCode::Char(' '))); // enable the mapping
+    state.reduce(key(KeyCode::Down)); // the default model row
+    type_query(&mut state, "deepseek-pro");
+    for _ in 0..4 {
+        state.reduce(key(KeyCode::Left));
+    }
+    type_query(&mut state, "-v4");
+
+    let InputMode::ModelMapping(mapping) = &state.input else {
+        panic!("expected the mapping dialog");
+    };
+    assert_eq!(mapping.default_model, "deepseek-v4-pro");
+    assert!(
+        mapping.rows.iter().all(|row| row.model.is_empty()),
+        "typing on the default row must not spill into a tier"
+    );
+
+    state.reduce(key(KeyCode::Enter));
+    let Some(Effect::Add(submission)) = state.take_effect() else {
+        panic!("expected an add effect");
+    };
+    let mapping = provider_add_params(submission)
+        .provider
+        .claude_model_mapping
+        .expect("the add request should carry the mapping");
+    assert_eq!(mapping.default_model.as_deref(), Some("deepseek-v4-pro"));
+}
+
+#[test]
+fn a_new_provider_carries_its_mapping_into_the_add_request() {
+    // The dialog exists to fill in the daemon request; a mapping that stops at the effect is
+    // accepted on screen and then silently never written.
+    let mut state = mapping_state(None);
+    state.reduce(key(KeyCode::Char(' '))); // enable the mapping
+    focus_tier(&mut state, 0); // Fable
+    state.reduce(key(KeyCode::Tab));
+    state.reduce(key(KeyCode::Enter));
+
+    let Some(Effect::Add(submission)) = state.take_effect() else {
+        panic!("expected an add effect");
+    };
+    let mapping = provider_add_params(submission)
+        .provider
+        .claude_model_mapping
+        .expect("the add request should carry the mapping");
+    assert!(mapping.enabled);
+    assert_eq!(
+        mapping.fable.expect("fable tier").model,
+        "claude-fable-5",
+        "the tier typed in the dialog should reach the daemon"
+    );
+}
+
+#[test]
+fn an_edited_provider_carries_its_mapping_into_the_edit_request() {
+    let mut form = claude_form(Some(ClaudeModelMapping {
+        enabled: true,
+        opus: Some(ModelSlot {
+            model: "my-opus".into(),
+            context_1m: true,
+        }),
+        ..ClaudeModelMapping::default()
+    }));
+    form.id = Some("provider-1".into());
+    form.revision = Some(3);
+    let mut state = State {
+        client: ClientKind::Claude,
+        loading: false,
+        input: InputMode::Form(form),
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Enter)); // form -> prefilled mapping dialog
+    state.reduce(key(KeyCode::Enter)); // save it unchanged
+
+    let Some(Effect::Edit(submission)) = state.take_effect() else {
+        panic!("expected an edit effect");
+    };
+    let request = provider_edit_params(submission).expect("edit request");
+    let ClaudeModelMappingUpdate::Set(mapping) = request.patch.claude_model_mapping else {
+        panic!("the edit request should set the mapping, not preserve it");
+    };
+    assert_eq!(
+        mapping.opus.expect("opus tier").resolved_model(),
+        "my-opus[1m]"
+    );
+}
+
+#[test]
+fn the_provider_details_report_the_mapping_state() {
+    // Whether a provider rewrites Claude Code's model tiers is invisible from the list alone, so
+    // the details pane spells it out and the row carries a badge.
+    let mut claude = example_provider();
+    claude.client = ClientKind::Claude;
+    claude.claude_model_mapping = Some(ClaudeModelMapping {
+        enabled: true,
+        opus: Some(ModelSlot {
+            model: "my-opus".into(),
+            context_1m: true,
+        }),
+        sonnet: Some(ModelSlot {
+            model: "my-sonnet".into(),
+            context_1m: false,
+        }),
+        ..ClaudeModelMapping::default()
+    });
+    let mut state = State {
+        client: ClientKind::Claude,
+        providers: vec![claude.clone()],
+        loading: false,
+        ..State::default()
+    };
+    let rendered = render(&mut state, 100, 32);
+    assert!(rendered.contains("[MAP]"));
+    assert!(rendered.contains("Model mapping: enabled"));
+    // Each tier owns a line: joined with commas the long IDs wrapped mid-name in the details pane.
+    let opus = popup_row(&rendered, "Opus → my-opus[1m]");
+    let sonnet = popup_row(&rendered, "Sonnet → my-sonnet");
+    assert_eq!(sonnet, opus + 1);
+
+    // A mapping the operator switched off must not read as active anywhere.
+    let mut disabled = claude;
+    disabled
+        .claude_model_mapping
+        .as_mut()
+        .expect("mapping")
+        .enabled = false;
+    state.providers = vec![disabled];
+    let rendered = render(&mut state, 100, 32);
+    assert!(!rendered.contains("[MAP]"));
+    assert!(!rendered.contains("my-opus"));
+}
+
+#[test]
+fn left_and_right_move_the_caret_inside_a_form_field() {
+    // Fixing a typo in the middle of a URL must not mean retyping everything after it.
+    let mut form = claude_form(None);
+    form.base_url = "https://api.example.test".into();
+    form.cursor = form.base_url.chars().count();
+    let mut state = State {
+        client: ClientKind::Claude,
+        loading: false,
+        input: InputMode::Form(form),
+        ..State::default()
+    };
+    for _ in 0..4 {
+        state.reduce(key(KeyCode::Left));
+    }
+    type_query(&mut state, "unit-");
+    state.reduce(key(KeyCode::Backspace));
+    let InputMode::Form(form) = &state.input else {
+        panic!("expected the provider form");
+    };
+    assert_eq!(form.base_url, "https://api.example.unittest");
+
+    // End parks the caret back after the last character, so typing appends again.
+    state.reduce(key(KeyCode::End));
+    type_query(&mut state, "/v1");
+    let InputMode::Form(form) = &state.input else {
+        panic!("expected the provider form");
+    };
+    assert_eq!(form.base_url, "https://api.example.unittest/v1");
+}
+
+#[test]
+fn moving_between_form_fields_parks_the_caret_at_the_end_of_the_text() {
+    // The caret belongs to whichever field has focus; carrying an old offset over would insert
+    // into the middle of the next field's prefilled value.
+    let mut form = claude_form(None);
+    form.name = "existing".into();
+    form.cursor = 0;
+    let mut state = State {
+        client: ClientKind::Claude,
+        loading: false,
+        input: InputMode::Form(form),
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Tab));
+    state.reduce(key(KeyCode::Tab));
+    type_query(&mut state, "!");
+    let InputMode::Form(form) = &state.input else {
+        panic!("expected the provider form");
+    };
+    assert_eq!(form.name, "existing!");
+}
+
+#[test]
+fn arrows_move_the_caret_on_a_mapping_row() {
+    let mut state = mapping_state(None);
+    state.reduce(key(KeyCode::Char(' '))); // enable the mapping
+    focus_tier(&mut state, 0); // Fable
+    type_query(&mut state, "deepseek");
+    state.reduce(key(KeyCode::Left));
+    state.reduce(key(KeyCode::Left));
+    type_query(&mut state, "-v4");
+
+    let InputMode::ModelMapping(mapping) = &state.input else {
+        panic!("expected the mapping dialog");
+    };
+    assert_eq!(mapping.rows[0].model, "deepse-v4ek");
+    assert!(
+        !mapping.rows[0].context_1m,
+        "moving the caret must not reach the 1M box"
+    );
+}
+
+#[test]
+fn the_search_box_edits_at_the_caret() {
+    let mut state = State {
+        providers: vec![example_provider()],
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Char('/')));
+    type_query(&mut state, "exmple");
+    for _ in 0..4 {
+        state.reduce(key(KeyCode::Left));
+    }
+    type_query(&mut state, "a");
+    let InputMode::Search { query, .. } = &state.input else {
+        panic!("expected the search box");
+    };
+    assert_eq!(query, "example");
 }

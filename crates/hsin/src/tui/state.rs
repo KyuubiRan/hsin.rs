@@ -100,7 +100,10 @@ impl Default for State {
 pub(super) enum InputMode {
     #[default]
     Normal,
-    Search(String),
+    Search {
+        query: String,
+        cursor: usize,
+    },
     Form(ProviderForm),
     Models(ModelPicker),
     ModelMapping(ModelMappingForm),
@@ -160,6 +163,8 @@ pub(super) struct ProviderForm {
     pub(super) error: Option<&'static str>,
     pub(super) secret_visible: bool,
     pub(super) discovering_models: bool,
+    /// Caret position, in characters, inside the focused field. Reset whenever the focus moves.
+    pub(super) cursor: usize,
     /// Carried through the form so the mapping dialog can prefill an existing provider's tiers.
     pub(super) claude_model_mapping: Option<ClaudeModelMapping>,
 }
@@ -224,9 +229,13 @@ pub(super) struct MappingRow {
 pub(super) struct ModelMappingForm {
     pub(super) form: FormSubmission,
     pub(super) enabled: bool,
+    /// `ANTHROPIC_MODEL` — the session default, independent of the four tiers.
+    pub(super) default_model: String,
     pub(super) rows: [MappingRow; 4],
-    /// `0` is the master toggle; `1..=4` are the tier rows.
+    /// `0` is the master toggle, `1` the default model, `2..=5` the tier rows.
     pub(super) field: usize,
+    /// Caret position, in characters, inside the focused text row.
+    pub(super) cursor: usize,
 }
 
 impl ModelMappingForm {
@@ -237,11 +246,18 @@ impl ModelMappingForm {
                 context_1m: slot.context_1m,
             })
         };
-        let (enabled, rows) = existing.map_or_else(
-            || (false, [(); 4].map(|()| MappingRow::default())),
+        let (enabled, default_model, rows) = existing.map_or_else(
+            || {
+                (
+                    false,
+                    String::new(),
+                    [(); 4].map(|()| MappingRow::default()),
+                )
+            },
             |mapping| {
                 (
                     mapping.enabled,
+                    mapping.default_model.clone().unwrap_or_default(),
                     [
                         slot(mapping.fable.as_ref()),
                         slot(mapping.opus.as_ref()),
@@ -254,8 +270,10 @@ impl ModelMappingForm {
         Self {
             form,
             enabled,
+            default_model,
             rows,
             field: 0,
+            cursor: 0,
         }
     }
 
@@ -269,14 +287,25 @@ impl ModelMappingForm {
                 context_1m: row.context_1m && MAPPING_TIERS[index].context_1m,
             })
         };
+        let default_model = self.default_model.trim();
         let mapping = ClaudeModelMapping {
             enabled: self.enabled,
+            default_model: (!default_model.is_empty()).then(|| default_model.to_owned()),
             fable: slot(0),
             opus: slot(1),
             sonnet: slot(2),
             haiku: slot(3),
         };
         (!mapping.is_inert()).then_some(mapping)
+    }
+
+    /// The text row with focus: the default model, then one per tier.
+    fn focused_text(&mut self) -> Option<&mut String> {
+        match self.field {
+            0 => None,
+            1 => Some(&mut self.default_model),
+            field => Some(&mut self.rows[field - 2].model),
+        }
     }
 }
 
@@ -287,6 +316,8 @@ pub(super) struct ModelPicker {
     pub(super) query: String,
     pub(super) mode: ModelPickerMode,
     pub(super) warning: Option<String>,
+    /// Caret position, in characters, inside whichever of the search or manual boxes is open.
+    pub(super) cursor: usize,
 }
 
 #[derive(Default)]
@@ -331,6 +362,7 @@ impl State {
                     selected: 0,
                     query: String::new(),
                     mode: ModelPickerMode::Browse,
+                    cursor: 0,
                     warning: None,
                 });
                 self.loading = false;
@@ -343,6 +375,7 @@ impl State {
                     selected: 0,
                     query: String::new(),
                     mode: ModelPickerMode::Browse,
+                    cursor: 0,
                     warning: Some(message),
                 });
                 self.loading = false;
@@ -438,7 +471,7 @@ impl State {
             _ => {}
         }
         match &mut self.input {
-            InputMode::Search(query) => match key.code {
+            InputMode::Search { query, cursor } => match key.code {
                 KeyCode::Enter => {
                     let committed = std::mem::take(query);
                     self.input = InputMode::Normal;
@@ -451,17 +484,14 @@ impl State {
                 }
                 KeyCode::Char('u' | 'U') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     query.clear();
+                    *cursor = 0;
                     self.selected = 0;
                 }
-                KeyCode::Backspace => {
-                    query.pop();
-                    self.selected = 0;
+                _ => {
+                    if edit_text(query, cursor, key) {
+                        self.selected = 0;
+                    }
                 }
-                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    query.push(character);
-                    self.selected = 0;
-                }
-                _ => {}
             },
             InputMode::Form(form) => match key.code {
                 KeyCode::Char('h' | 'H') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -469,31 +499,19 @@ impl State {
                 }
                 KeyCode::Char('u' | 'U') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     clear_form_field(form);
+                    form.cursor = 0;
                 }
                 KeyCode::Esc => self.input = InputMode::Normal,
                 KeyCode::Tab | KeyCode::Down => {
                     form.field = (form.field + 1) % 5;
+                    form.cursor = caret_end(form_field_text(form));
                     form.error = None;
                 }
                 KeyCode::BackTab | KeyCode::Up => {
                     form.field = (form.field + 4) % 5;
+                    form.cursor = caret_end(form_field_text(form));
                     form.error = None;
                 }
-                KeyCode::Backspace => match form.field {
-                    0 => {
-                        form.base_url.pop();
-                    }
-                    1 => {
-                        form.secret.pop();
-                    }
-                    2 => {
-                        form.name.pop();
-                    }
-                    3 => {
-                        form.description.pop();
-                    }
-                    _ => {}
-                },
                 KeyCode::Left | KeyCode::Right | KeyCode::Char('j' | 'l' | ' ')
                     if form.field == 4 =>
                 {
@@ -502,13 +520,6 @@ impl State {
                         AuthScheme::XApiKey | AuthScheme::OAuth => AuthScheme::Bearer,
                     };
                 }
-                KeyCode::Char(character) => match form.field {
-                    0 => form.base_url.push(character),
-                    1 => form.secret.push(character),
-                    2 => form.name.push(character),
-                    3 => form.description.push(character),
-                    _ => {}
-                },
                 KeyCode::Enter => match take_form_submission(form) {
                     Ok(submission) => {
                         // Codex resolves a model by discovery; Claude maps the model tiers by hand.
@@ -530,57 +541,63 @@ impl State {
                     }
                     Err(error) => form.error = Some(error),
                 },
-                _ => {}
+                _ => {
+                    let cursor = &mut form.cursor;
+                    match form.field {
+                        0 => edit_text(&mut form.base_url, cursor, key),
+                        1 => edit_text(&mut form.secret, cursor, key),
+                        2 => edit_text(&mut form.name, cursor, key),
+                        3 => edit_text(&mut form.description, cursor, key),
+                        _ => false,
+                    };
+                }
             },
             InputMode::ModelMapping(mapping) => match key.code {
                 KeyCode::Esc => self.input = InputMode::Normal,
                 KeyCode::Up | KeyCode::BackTab => {
                     mapping.field = mapping.field.saturating_sub(1);
+                    mapping.cursor = mapping_row_caret_end(mapping);
                 }
                 KeyCode::Down => {
                     let last = if mapping.enabled {
-                        MAPPING_TIERS.len()
+                        MAPPING_TIERS.len() + 1
                     } else {
                         0
                     };
                     mapping.field = (mapping.field + 1).min(last);
+                    mapping.cursor = mapping_row_caret_end(mapping);
                 }
                 KeyCode::Char('u' | 'U') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some(row) = mapping.field.checked_sub(1) {
-                        mapping.rows[row].model.clear();
+                    if let Some(text) = mapping.focused_text() {
+                        text.clear();
+                        mapping.cursor = 0;
                     }
                 }
                 // Tab completes the ghost default instead of moving focus; the model rows are the
                 // only place in the TUI where a suggested value is worth one keystroke.
                 KeyCode::Tab => {
-                    if let Some(row) = mapping.field.checked_sub(1)
+                    if let Some(row) = mapping.field.checked_sub(2)
                         && mapping.rows[row].model.trim().is_empty()
                     {
                         MAPPING_TIERS[row]
                             .default_model
                             .clone_into(&mut mapping.rows[row].model);
+                        mapping.cursor = caret_end(&mapping.rows[row].model);
                     }
                 }
-                // ←/→ only reaches the master switch: on a tier row those keys sit next to the
-                // model text being typed, so flipping 1M with them was too easy to do by accident.
+                // On the master switch ←/→ flip it; on a text row they move the caret through the
+                // model being typed, which is why space — not an arrow — owns the 1M box.
                 KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if mapping.field == 0 => {
                     mapping.enabled = !mapping.enabled;
                 }
                 KeyCode::Char(' ') => {
-                    if let Some(row) = mapping.field.checked_sub(1)
+                    if let Some(row) = mapping.field.checked_sub(2)
                         && MAPPING_TIERS[row].context_1m
                     {
                         mapping.rows[row].context_1m = !mapping.rows[row].context_1m;
-                    }
-                }
-                KeyCode::Backspace => {
-                    if let Some(row) = mapping.field.checked_sub(1) {
-                        mapping.rows[row].model.pop();
-                    }
-                }
-                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some(row) = mapping.field.checked_sub(1) {
-                        mapping.rows[row].model.push(character);
+                    } else if mapping.field == 1 {
+                        // The default model is a plain text box; a space belongs in the value.
+                        edit_text(&mut mapping.default_model, &mut mapping.cursor, key);
                     }
                 }
                 KeyCode::Enter => {
@@ -598,16 +615,31 @@ impl State {
                     self.loading = true;
                     self.input = InputMode::Normal;
                 }
-                _ => {}
+                _ => {
+                    let cursor = &mut mapping.cursor;
+                    match mapping.field {
+                        0 => {}
+                        1 => {
+                            edit_text(&mut mapping.default_model, cursor, key);
+                        }
+                        field => {
+                            edit_text(&mut mapping.rows[field - 2].model, cursor, key);
+                        }
+                    }
+                }
             },
             InputMode::Models(picker) => match &mut picker.mode {
                 ModelPickerMode::Browse => match key.code {
                     KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
                         self.input = InputMode::Normal;
                     }
-                    KeyCode::Char('s') => picker.mode = ModelPickerMode::Search,
+                    KeyCode::Char('s') => {
+                        picker.mode = ModelPickerMode::Search;
+                        picker.cursor = caret_end(&picker.query);
+                    }
                     KeyCode::Char('m') => {
                         picker.mode = ModelPickerMode::Manual(String::new());
+                        picker.cursor = 0;
                     }
                     KeyCode::Up | KeyCode::Char('i') => {
                         picker.selected = picker.selected.saturating_sub(1);
@@ -634,22 +666,14 @@ impl State {
                 },
                 ModelPickerMode::Search => match key.code {
                     KeyCode::Esc | KeyCode::Enter => picker.mode = ModelPickerMode::Browse,
-                    KeyCode::Backspace => {
-                        picker.query.pop();
-                        picker.selected = 0;
+                    _ => {
+                        if edit_text(&mut picker.query, &mut picker.cursor, key) {
+                            picker.selected = 0;
+                        }
                     }
-                    KeyCode::Char(character) => {
-                        picker.query.push(character);
-                        picker.selected = 0;
-                    }
-                    _ => {}
                 },
                 ModelPickerMode::Manual(value) => match key.code {
                     KeyCode::Esc => picker.mode = ModelPickerMode::Browse,
-                    KeyCode::Backspace => {
-                        value.pop();
-                    }
-                    KeyCode::Char(character) => value.push(character),
                     KeyCode::Enter if !value.trim().is_empty() => {
                         picker.form.model = ModelUpdate::Set(value.trim().to_owned());
                         let submission = take_submission(&mut picker.form);
@@ -661,7 +685,9 @@ impl State {
                         self.loading = true;
                         self.input = InputMode::Normal;
                     }
-                    _ => {}
+                    _ => {
+                        edit_text(value, &mut picker.cursor, key);
+                    }
                 },
             },
             InputMode::DeleteConfirm {
@@ -1015,7 +1041,12 @@ impl State {
                         page: SettingsPage::Root,
                     });
                 }
-                KeyCode::Char('/') => self.input = InputMode::Search(self.search.clone()),
+                KeyCode::Char('/') => {
+                    self.input = InputMode::Search {
+                        cursor: caret_end(&self.search),
+                        query: self.search.clone(),
+                    };
+                }
                 KeyCode::Char('a') => {
                     self.input = InputMode::Form(ProviderForm {
                         id: None,
@@ -1034,6 +1065,7 @@ impl State {
                         error: None,
                         secret_visible: false,
                         discovering_models: false,
+                        cursor: 0,
                         claude_model_mapping: None,
                     });
                 }
@@ -1045,6 +1077,7 @@ impl State {
                         }
                         let name =
                             normalize_generated_provider_name(&provider.name, &provider.base_url);
+                        let cursor = caret_end(&provider.base_url);
                         self.input = InputMode::Form(ProviderForm {
                             id: Some(provider.id),
                             revision: Some(provider.revision),
@@ -1059,6 +1092,7 @@ impl State {
                             error: None,
                             secret_visible: false,
                             discovering_models: false,
+                            cursor,
                             claude_model_mapping: provider.claude_model_mapping,
                         });
                     }
@@ -1082,17 +1116,16 @@ impl State {
                         return Transition::Continue;
                     };
                     let source = &clipboard.provider;
+                    let base_url =
+                        convert_provider_base_url(&source.base_url, source.client, self.client);
                     self.input = InputMode::Form(ProviderForm {
                         id: None,
                         revision: None,
                         client: self.client,
                         name: copied_provider_name(&self.providers, self.client, &source.name),
                         description: source.description.clone(),
-                        base_url: convert_provider_base_url(
-                            &source.base_url,
-                            source.client,
-                            self.client,
-                        ),
+                        cursor: caret_end(&base_url),
+                        base_url,
                         auth_scheme: if source.client == self.client {
                             source.auth_scheme
                         } else {
@@ -1158,7 +1191,7 @@ impl State {
     /// has focus, otherwise the query committed with enter.
     pub(super) fn active_query(&self) -> &str {
         match &self.input {
-            InputMode::Search(query) => query,
+            InputMode::Search { query, .. } => query,
             _ => &self.search,
         }
     }
@@ -1327,6 +1360,70 @@ fn copied_provider_name(providers: &[Provider], client: ClientKind, source_name:
         suffix += 1;
     }
     candidate
+}
+
+/// Caret-aware editing shared by every single-line text box. Positions are character indices, so a
+/// caret can never land inside a multi-byte character.
+///
+/// Returns whether `key` was an editing key; callers handle their own keys first and fall through
+/// to this for the rest.
+fn edit_text(text: &mut String, cursor: &mut usize, key: KeyEvent) -> bool {
+    *cursor = (*cursor).min(text.chars().count());
+    match key.code {
+        KeyCode::Left => *cursor = cursor.saturating_sub(1),
+        KeyCode::Right => *cursor = (*cursor + 1).min(text.chars().count()),
+        KeyCode::Home => *cursor = 0,
+        KeyCode::End => *cursor = text.chars().count(),
+        KeyCode::Backspace => {
+            if let Some(previous) = cursor.checked_sub(1) {
+                text.remove(character_offset(text, previous));
+                *cursor = previous;
+            }
+        }
+        KeyCode::Delete => {
+            if *cursor < text.chars().count() {
+                text.remove(character_offset(text, *cursor));
+            }
+        }
+        KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let offset = character_offset(text, *cursor);
+            text.insert(offset, character);
+            *cursor += 1;
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// The byte offset of character `index`, or the end of `text` when it is past the last character.
+fn character_offset(text: &str, index: usize) -> usize {
+    text.char_indices()
+        .nth(index)
+        .map_or(text.len(), |(offset, _)| offset)
+}
+
+fn caret_end(text: &str) -> usize {
+    text.chars().count()
+}
+
+/// The caret position at the end of the mapping row with focus; the master toggle has no text.
+fn mapping_row_caret_end(mapping: &ModelMappingForm) -> usize {
+    match mapping.field {
+        0 => 0,
+        1 => caret_end(&mapping.default_model),
+        field => caret_end(&mapping.rows[field - 2].model),
+    }
+}
+
+/// The text of the form field with focus; the auth scheme field carries none.
+fn form_field_text(form: &ProviderForm) -> &str {
+    match form.field {
+        0 => &form.base_url,
+        1 => &form.secret,
+        2 => &form.name,
+        3 => &form.description,
+        _ => "",
+    }
 }
 
 fn take_submission(form: &mut FormSubmission) -> FormSubmission {

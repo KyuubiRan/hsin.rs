@@ -27,9 +27,9 @@ Configuration writes are strict allowlists:
 
 - Codex `config.toml`: top-level `model_provider` and the complete `[model_providers.hsin]` subtree only.
 - Codex `auth.json`: top-level `auth_mode` and `OPENAI_API_KEY` only while a custom provider is active.
-- Claude Code: `env.ANTHROPIC_BASE_URL`, `env.ANTHROPIC_API_KEY`, `env.ANTHROPIC_AUTH_TOKEN`, root `apiKeyHelper`, and — only when the active provider enables model mapping — `env.ANTHROPIC_DEFAULT_FABLE_MODEL`, `env.ANTHROPIC_DEFAULT_OPUS_MODEL`, `env.ANTHROPIC_DEFAULT_SONNET_MODEL`, and `env.ANTHROPIC_DEFAULT_HAIKU_MODEL`.
+- Claude Code: `env.ANTHROPIC_BASE_URL`, `env.ANTHROPIC_API_KEY`, `env.ANTHROPIC_AUTH_TOKEN`, root `apiKeyHelper`, and — only when the active provider enables model mapping — `env.ANTHROPIC_MODEL` plus, for each of the `FABLE`, `OPUS`, `SONNET`, and `HAIKU` tiers, `env.ANTHROPIC_DEFAULT_<TIER>_MODEL`, `env.ANTHROPIC_DEFAULT_<TIER>_MODEL_NAME`, and `env.ANTHROPIC_DEFAULT_<TIER>_MODEL_DESCRIPTION` (thirteen keys, enumerated by `CLAUDE_MODEL_ENV_KEYS`).
 
-Never modify MCP servers, hooks, permissions, profiles, features, approval policy, or sandbox settings. Claude Code model selection is owned only through the four `ANTHROPIC_DEFAULT_*_MODEL` keys above; `ANTHROPIC_MODEL` and every other selection knob stay untouched. The user's own values for the four owned keys are snapshotted before hsin first writes them and restored whenever a tier is unmapped.
+Never modify MCP servers, hooks, permissions, profiles, features, approval policy, or sandbox settings. Claude Code model selection is owned only through the thirteen keys above; `ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_CUSTOM_MODEL_OPTION*`, `ANTHROPIC_DEFAULT_*_MODEL_SUPPORTED_CAPABILITIES`, and the root `model` key stay untouched. `ANTHROPIC_MODEL` is owned because Claude Code resolves the startup model as `--model` > `ANTHROPIC_MODEL` > the selection persisted in `settings.json`: without it a stale persisted first-party model ID outranks the tier mapping and reaches a provider that never heard of it. The user's own values for every owned key are snapshotted before hsin first writes them and restored whenever hsin has no value of its own; a snapshot taken before a key was owned records which keys it covers, so keys added later are captured rather than lost.
 
 - Preserve non-owned fields, comments, ordering, line endings, and Unicode byte-for-byte.
 - Retain CAS checks, file locking, permission preservation, atomic replacement, and operation recovery.
@@ -79,6 +79,14 @@ cargo xwin check --workspace --all-targets --target x86_64-pc-windows-msvc
 ```
 
 Configuration, IPC, crypto, proxy, service, or database changes require focused tests in addition to the workspace gates. Use temporary `HSIN_HOME`, `CODEX_HOME`, and `CLAUDE_CONFIG_DIR` values for integration tests, then remove test keyring entries.
+
+Once the gates pass, produce the binaries with the build script rather than a bare `cargo build`:
+
+```zsh
+scripts/build.sh
+```
+
+It builds the workspace and copies `hsin` and `hsind` into `artifacts/<target>/<profile>/`, so the change can be exercised as a real binary. Pass `release` for an optimized build and a platform alias (`macos-arm64`, `macos-x64`, `linux-x64`, `windows-x64`, …) to cross-build; `scripts/build.ps1` is the Windows equivalent.
 
 ## Git
 

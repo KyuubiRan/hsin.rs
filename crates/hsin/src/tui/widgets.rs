@@ -14,22 +14,24 @@ use super::{
     theme::{INPUT_BG, MUTED, RED, WHITE},
 };
 
-/// `selected` is the focused field, `enabled` whether it can be focused at all — a dimmed border
-/// means the field is inert, not merely unfocused.
+/// `focus` carries the caret position, in characters, when the field has focus, and is `None` when
+/// it does not. `enabled` is whether the field can be focused at all — a dimmed border means the
+/// field is inert, not merely unfocused.
 pub(super) fn draw_input_field(
     frame: &mut Frame<'_>,
     area: Rect,
     label: &str,
     value: &str,
     placeholder: Option<&str>,
-    selected: bool,
+    focus: Option<usize>,
     enabled: bool,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let available = usize::from(area.width.saturating_sub(2));
-    let visible = visible_tail(value, available);
+    let caret = focus.unwrap_or_else(|| value.chars().count());
+    let (visible, column) = visible_window(value, caret, available);
     let line = if visible.is_empty() {
         Line::from(Span::styled(
             placeholder.unwrap_or(""),
@@ -41,7 +43,7 @@ pub(super) fn draw_input_field(
             Style::default().fg(if enabled { WHITE } else { MUTED }),
         ))
     };
-    let border = if selected {
+    let border = if focus.is_some() {
         RED
     } else if enabled {
         WHITE
@@ -59,8 +61,8 @@ pub(super) fn draw_input_field(
             ),
         area,
     );
-    if selected && area.width > 2 && area.height > 2 {
-        let offset = u16::try_from(display_width(&visible).min(available)).unwrap_or(0);
+    if focus.is_some() && area.width > 2 && area.height > 2 {
+        let offset = u16::try_from(column).unwrap_or(0);
         frame.set_cursor_position((area.x.saturating_add(1 + offset), area.y.saturating_add(1)));
     }
 }
@@ -98,7 +100,7 @@ pub(super) fn draw_banner(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
 pub(super) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &State, i18n: &I18n) {
     let help = match &state.input {
         InputMode::Normal => i18n.text("help"),
-        InputMode::Search(_) => i18n.text("search_help"),
+        InputMode::Search { .. } => i18n.text("search_help"),
         InputMode::Form(_) => i18n.text("form_help"),
         InputMode::Models(picker) => match picker.mode {
             ModelPickerMode::Browse => i18n.text("model_help"),
@@ -190,6 +192,26 @@ fn visible_tail(value: &str, width: usize) -> String {
         reversed.push(character);
     }
     reversed.into_iter().rev().collect()
+}
+
+/// The slice of `value` that fits in `width`, and the caret's column inside it. The window is
+/// anchored on the caret, so text scrolls once the caret would sit past the right edge.
+fn visible_window(value: &str, caret: usize, width: usize) -> (String, usize) {
+    let characters = value.chars().collect::<Vec<char>>();
+    let caret = caret.min(characters.len());
+    let head = characters[..caret].iter().collect::<String>();
+    let mut window = visible_tail(&head, width);
+    let column = display_width(&window);
+    let mut used = column;
+    for character in &characters[caret..] {
+        let character_width = character.width().unwrap_or(0);
+        if used + character_width > width {
+            break;
+        }
+        used += character_width;
+        window.push(*character);
+    }
+    (window, column)
 }
 
 pub(super) fn content_width(area: Rect, desired: usize, minimum: u16, maximum: u16) -> u16 {
