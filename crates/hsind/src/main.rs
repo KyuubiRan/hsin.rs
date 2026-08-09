@@ -9,6 +9,8 @@ mod proxy;
 mod rpc;
 mod service;
 
+use std::path::{Path, PathBuf};
+
 use clap::{Parser, Subcommand};
 use error::Result;
 use paths::{InstanceGuard, Paths};
@@ -24,7 +26,20 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the daemon in the foreground.
-    Run,
+    Run {
+        /// Data home for this instance, overriding `HSIN_HOME`. A service
+        /// definition cannot carry environment variables, so the installer
+        /// records the values it resolved as arguments instead.
+        #[arg(long, value_name = "PATH")]
+        home: Option<PathBuf>,
+        /// Directory holding the Codex configuration, overriding `CODEX_HOME`.
+        #[arg(long, value_name = "PATH")]
+        codex_home: Option<PathBuf>,
+        /// Directory holding the Claude Code configuration, overriding
+        /// `CLAUDE_CONFIG_DIR`.
+        #[arg(long, value_name = "PATH")]
+        claude_config_dir: Option<PathBuf>,
+    },
     /// Install and control the daemon service.
     Service {
         /// Operate on the system-wide unit instead of the per-user one. Linux
@@ -75,8 +90,23 @@ async fn main() {
 }
 
 async fn execute(cli: Cli) -> Result<()> {
-    match cli.command.unwrap_or(Command::Run) {
-        Command::Run => run().await,
+    match cli.command.unwrap_or(Command::Run {
+        home: None,
+        codex_home: None,
+        claude_config_dir: None,
+    }) {
+        Command::Run {
+            home,
+            codex_home,
+            claude_config_dir,
+        } => {
+            run(
+                home.as_deref(),
+                codex_home.as_deref(),
+                claude_config_dir.as_deref(),
+            )
+            .await
+        }
         Command::Service {
             system,
             account,
@@ -135,11 +165,15 @@ fn read_secret_line() -> Result<zeroize::Zeroizing<String>> {
     Ok(zeroize::Zeroizing::new(line.trim().to_owned()))
 }
 
-async fn run() -> Result<()> {
-    let paths = Paths::discover();
+async fn run(
+    home: Option<&Path>,
+    codex_home: Option<&Path>,
+    claude_config_dir: Option<&Path>,
+) -> Result<()> {
+    let paths = home.map_or_else(Paths::discover, |home| Paths::for_home(home.to_path_buf()));
     paths.prepare()?;
     let _instance = InstanceGuard::acquire(&paths.lock)?;
-    let app = app::App::open(&paths)?;
+    let app = app::App::open(&paths, codex_home, claude_config_dir)?;
     tolerate_locked("recover operations", app.recover_operations())?;
     tolerate_locked("initialize providers", app.initialize_providers())?;
     tolerate_locked(

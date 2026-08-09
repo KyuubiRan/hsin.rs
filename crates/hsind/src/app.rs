@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -87,11 +87,32 @@ fn credential_preview(secret: &str) -> String {
 }
 
 impl App {
-    pub fn open(paths: &Paths) -> Result<Arc<Self>> {
-        Self::open_with_store(paths, crypto::default_key_store(&paths.home))
+    pub fn open(
+        paths: &Paths,
+        codex_home: Option<&Path>,
+        claude_config_dir: Option<&Path>,
+    ) -> Result<Arc<Self>> {
+        Self::open_inner(
+            paths,
+            crypto::default_key_store(&paths.home),
+            codex_home,
+            claude_config_dir,
+        )
     }
 
+    /// Test seam: the production path is [`App::open`], which also carries the
+    /// client home overrides a service definition passes on the command line.
+    #[cfg(test)]
     pub fn open_with_store(paths: &Paths, store: Arc<dyn KeyStore>) -> Result<Arc<Self>> {
+        Self::open_inner(paths, store, None, None)
+    }
+
+    fn open_inner(
+        paths: &Paths,
+        store: Arc<dyn KeyStore>,
+        codex_home: Option<&Path>,
+        claude_config_dir: Option<&Path>,
+    ) -> Result<Arc<Self>> {
         paths.prepare()?;
         let db = Arc::new(Database::open(&paths.database, &paths.backups)?);
         let crypto = Arc::new(CryptoManager::initialize(db.clone(), store)?);
@@ -101,11 +122,11 @@ impl App {
         let config_paths = HashMap::from([
             (
                 ClientKind::Codex,
-                config::default_config_path(ClientKind::Codex)?,
+                config::default_config_path(ClientKind::Codex, codex_home)?,
             ),
             (
                 ClientKind::Claude,
-                config::default_config_path(ClientKind::Claude)?,
+                config::default_config_path(ClientKind::Claude, claude_config_dir)?,
             ),
         ]);
         let http_client = reqwest::Client::builder()

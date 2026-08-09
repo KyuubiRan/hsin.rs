@@ -692,14 +692,21 @@ fn task_definition_path(paths: &Paths) -> PathBuf {
 /// that only an administrator may create. A trigger scoped to the installing
 /// account needs no elevation, and only the XML form can express it.
 ///
-/// The XML also carries three settings the command line cannot reach at all:
-/// without them Task Scheduler refuses to start the daemon while the machine is
-/// on battery, kills it when the machine is unplugged, and terminates it after
-/// a 72-hour default execution limit.
+/// The XML also carries settings the command line cannot reach at all: without
+/// them Task Scheduler refuses to start the daemon while the machine is on
+/// battery, kills it when the machine is unplugged, and terminates it after a
+/// 72-hour default execution limit.
+///
+/// The daemon is the task's own process rather than a batch wrapper's child.
+/// Ending a task terminates only the process Task Scheduler launched, so a
+/// wrapper left the daemon orphaned and still holding the instance lock, which
+/// made `stop`, `restart` and `uninstall` all fail. `RestartOnFailure` replaces
+/// the wrapper's respawn loop and, unlike it, is bounded.
 #[cfg(windows)]
-fn render_task_definition(wrapper: &Path, sid: &str) -> String {
+fn render_task_definition(daemon: &Path, arguments: &str, sid: &str) -> String {
     let sid = xml(sid);
-    let command = xml(&wrapper.to_string_lossy());
+    let command = xml(&daemon.to_string_lossy());
+    let arguments = xml(arguments);
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -718,6 +725,10 @@ fn render_task_definition(wrapper: &Path, sid: &str) -> String {
   </Principals>
   <Settings>
     <Enabled>true</Enabled>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
@@ -726,11 +737,31 @@ fn render_task_definition(wrapper: &Path, sid: &str) -> String {
   <Actions Context="Author">
     <Exec>
       <Command>{command}</Command>
+      <Arguments>{arguments}</Arguments>
     </Exec>
   </Actions>
 </Task>
 "#
     )
+}
+
+/// The task carries no environment, so every value the installing session
+/// resolved travels as an argument instead. `HSIN_HOME` is included rather than
+/// left to the daemon's own location so an unrelated `HSIN_HOME` in the user's
+/// environment cannot capture an instance installed against a different home.
+#[cfg(windows)]
+fn service_arguments(paths: &Paths) -> Result<String> {
+    let mut arguments = String::from("run");
+    for (key, value) in service_environment(paths)? {
+        let flag = match key {
+            "HSIN_HOME" => "--home",
+            "CODEX_HOME" => "--codex-home",
+            "CLAUDE_CONFIG_DIR" => "--claude-config-dir",
+            _ => continue,
+        };
+        write!(&mut arguments, " {flag} \"{value}\"").expect("writing to a String cannot fail");
+    }
+    Ok(arguments)
 }
 
 /// `schtasks /Create /XML` decodes the file as ANSI unless it opens with a
@@ -747,27 +778,14 @@ fn write_utf16le(path: &Path, content: &str) -> Result<()> {
 #[cfg(windows)]
 fn install_definition(target: &Target, daemon: &Path, _recovery_key: Option<&str>) -> Result<()> {
     let paths = &target.paths;
-    let wrapper = paths.home.join("bin/run-hsind.cmd");
-    let mut variables = String::new();
-    for (key, value) in service_environment(paths)? {
-        write!(
-            &mut variables,
-            "set \"{key}={}\"\r\n",
-            value.replace('%', "%%")
-        )
-        .expect("writing to a String cannot fail");
-    }
-    let daemon = daemon.to_string_lossy().replace('%', "%%");
-    fs::write(
-        &wrapper,
-        format!(
-            "@echo off\r\n{variables}:run\r\n\"{daemon}\" run\r\nif not errorlevel 1 exit /b 0\r\n>nul 2>&1 timeout /t 2 /nobreak\r\ngoto run\r\n"
-        ),
-    )?;
     let definition = task_definition_path(paths);
     write_utf16le(
         &definition,
-        &render_task_definition(&wrapper, &hsin_ipc::current_user_sid()?),
+        &render_task_definition(
+            daemon,
+            &service_arguments(paths)?,
+            &hsin_ipc::current_user_sid()?,
+        ),
     )?;
     let label = service_label(paths);
     let definition = definition.to_string_lossy().into_owned();
@@ -1107,6 +1125,31 @@ mod tests {
         fs::remove_dir_all(root).ok();
     }
 
+    /// Ending a task terminates only the process Task Scheduler launched. While
+    /// the task ran a batch wrapper, the daemon was that wrapper's child, so it
+    /// survived `schtasks /End` orphaned and still holding the instance lock,
+    /// which made stop, restart and uninstall all fail against a daemon the
+    /// task had started. The daemon must be the task's own process, and what
+    /// the wrapper used to export must travel as arguments instead.
+    #[cfg(windows)]
+    #[test]
+    fn the_task_runs_the_daemon_itself() {
+        let definition = render_task_definition(
+            Path::new(r"C:\Users\kitsune\AppData\Local\hsin\bin\hsind.exe"),
+            r#"run --home "C:\Users\kitsune\AppData\Local\hsin""#,
+            "S-1-5-21-1-2-3-1000",
+        );
+        assert!(
+            definition
+                .contains(r"<Command>C:\Users\kitsune\AppData\Local\hsin\bin\hsind.exe</Command>")
+        );
+        assert!(!definition.contains(".cmd"), "no batch wrapper may remain");
+        assert!(definition.contains("run --home"));
+        // The wrapper respawned the daemon forever; its replacement is bounded.
+        assert!(definition.contains("<RestartOnFailure>"));
+        assert!(definition.contains("<Count>3</Count>"));
+    }
+
     /// `schtasks /SC ONLOGON` registers a logon trigger with no `UserId`, which
     /// Task Scheduler reads as "when any user logs on" — a machine-wide
     /// registration only an administrator may create. That is why a standard
@@ -1116,7 +1159,8 @@ mod tests {
     #[test]
     fn the_logon_trigger_names_the_installing_account() {
         let definition = render_task_definition(
-            Path::new(r"C:\Users\kitsune\AppData\Local\hsin\bin\run-hsind.cmd"),
+            Path::new(r"C:\Users\kitsune\AppData\Local\hsin\bin\hsind.exe"),
+            "run",
             "S-1-5-21-1-2-3-1000",
         );
         let trigger = definition
@@ -1139,7 +1183,8 @@ mod tests {
     #[test]
     fn the_daemon_survives_battery_power_and_long_uptime() {
         let definition = render_task_definition(
-            Path::new(r"C:\hsin\bin\run-hsind.cmd"),
+            Path::new(r"C:\hsin\bin\hsind.exe"),
+            "run",
             "S-1-5-21-1-2-3-1000",
         );
         assert!(
@@ -1156,10 +1201,11 @@ mod tests {
     #[test]
     fn the_definition_escapes_the_data_home() {
         let definition = render_task_definition(
-            Path::new(r"C:\Users\A&B<C>\bin\run-hsind.cmd"),
+            Path::new(r"C:\Users\A&B<C>\bin\hsind.exe"),
+            r#"run --home "C:\Users\A&B<C>""#,
             "S-1-5-21-1-2-3-1000",
         );
-        assert!(definition.contains(r"C:\Users\A&amp;B&lt;C&gt;\bin\run-hsind.cmd"));
+        assert!(definition.contains(r"C:\Users\A&amp;B&lt;C&gt;\bin\hsind.exe"));
         assert!(!definition.contains("A&B"));
     }
 
@@ -1173,11 +1219,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("hsin-task-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("hsind-task.xml");
-        let wrapper = r"C:\Users\张三\AppData\Local\hsin\bin\run-hsind.cmd";
+        let daemon = r"C:\Users\张三\AppData\Local\hsin\bin\hsind.exe";
 
         write_utf16le(
             &path,
-            &render_task_definition(Path::new(wrapper), "S-1-5-21-1-2-3-1000"),
+            &render_task_definition(Path::new(daemon), "run", "S-1-5-21-1-2-3-1000"),
         )
         .unwrap();
 
@@ -1191,7 +1237,7 @@ mod tests {
             .chunks_exact(2)
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect();
-        assert!(String::from_utf16(&units).unwrap().contains(wrapper));
+        assert!(String::from_utf16(&units).unwrap().contains(daemon));
 
         fs::remove_dir_all(root).ok();
     }

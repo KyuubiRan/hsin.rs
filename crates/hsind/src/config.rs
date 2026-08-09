@@ -157,17 +157,29 @@ pub struct CodexAuthSnapshot {
     pub openai_api_key: Option<String>,
 }
 
-pub fn default_config_path(client: ClientKind) -> Result<PathBuf> {
+/// Resolve a client's configuration path.
+///
+/// `home_override` wins over the environment so a daemon launched by a service
+/// definition that cannot carry environment variables still reaches the same
+/// files the installing session did.
+pub fn default_config_path(client: ClientKind, home_override: Option<&Path>) -> Result<PathBuf> {
     let home = BaseDirs::new()
         .ok_or_else(|| DaemonError::Config("cannot resolve the user home directory".into()))?
         .home_dir()
         .to_path_buf();
+    let client_home = home_override.map(PathBuf::from).or_else(|| {
+        std::env::var_os(match client {
+            ClientKind::Codex => "CODEX_HOME",
+            ClientKind::Claude => "CLAUDE_CONFIG_DIR",
+        })
+        .map(PathBuf::from)
+    });
     Ok(match client {
-        ClientKind::Codex => std::env::var_os("CODEX_HOME")
-            .map_or_else(|| home.join(".codex"), PathBuf::from)
+        ClientKind::Codex => client_home
+            .unwrap_or_else(|| home.join(".codex"))
             .join("config.toml"),
-        ClientKind::Claude => std::env::var_os("CLAUDE_CONFIG_DIR")
-            .map_or_else(|| home.join(".claude"), PathBuf::from)
+        ClientKind::Claude => client_home
+            .unwrap_or_else(|| home.join(".claude"))
             .join("settings.json"),
     })
 }
