@@ -143,6 +143,12 @@ if [ "$target" != "$host" ]; then
     *-pc-windows-msvc)
       build_tool=cargo
       build_subcommand=xwin
+      if [ "$target" = aarch64-pc-windows-msvc ]; then
+        # ring compiles its C sources with the GCC-style clang driver on Windows
+        # AArch64, which rejects the /imsvc include flags that cargo-xwin's
+        # default clang-cl backend emits.
+        export XWIN_CROSS_COMPILER=clang
+      fi
       ;;
   esac
 fi

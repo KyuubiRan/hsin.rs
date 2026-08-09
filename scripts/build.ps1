@@ -71,6 +71,12 @@ try {
     elseif ($TargetTriple -like "*-pc-windows-msvc") {
         $Builder = "cargo xwin build"
         $CargoArgs = @("xwin", "build", "--workspace", "--target", $TargetTriple)
+        if ($TargetTriple -eq "aarch64-pc-windows-msvc") {
+            # ring compiles its C sources with the GCC-style clang driver on Windows
+            # AArch64, which rejects the /imsvc include flags that cargo-xwin's
+            # default clang-cl backend emits.
+            $env:XWIN_CROSS_COMPILER = "clang"
+        }
         $SourceDirectory = Join-Path $RepoRoot "target/$TargetTriple/$Configuration"
     }
     else {
