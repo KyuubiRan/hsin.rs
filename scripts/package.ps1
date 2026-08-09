@@ -1,9 +1,9 @@
 param([Parameter(Mandatory = $true)][string]$Target)
 $ErrorActionPreference = "Stop"
 
-$metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
-$version = ($metadata.packages | Where-Object name -eq "hsin").version
-$root = "dist/hsin-$version-$Target"
+# The tag carries the version. Keeping it out of the archive name gives every
+# release the same asset names, so a download URL never needs rewriting.
+$root = "dist/hsin-$Target"
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $root | Out-Null
 Copy-Item "target/$Target/release/hsin.exe" "$root/hsin.exe"

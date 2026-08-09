@@ -24,30 +24,32 @@ Download the archive for your platform from
 
 | Platform | Archive |
 | --- | --- |
-| macOS, Apple Silicon | `hsin-<version>-aarch64-apple-darwin.tar.gz` |
-| Linux, x86-64 | `hsin-<version>-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux, ARM64 | `hsin-<version>-aarch64-unknown-linux-gnu.tar.gz` |
-| Windows, x86-64 | `hsin-<version>-x86_64-pc-windows-msvc.zip` |
-| Windows, ARM64 | `hsin-<version>-aarch64-pc-windows-msvc.zip` |
+| macOS, Apple Silicon | `hsin-aarch64-apple-darwin.tar.gz` |
+| Linux, x86-64 | `hsin-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux, ARM64 | `hsin-aarch64-unknown-linux-gnu.tar.gz` |
+| Windows, x86-64 | `hsin-x86_64-pc-windows-msvc.zip` |
+| Windows, ARM64 | `hsin-aarch64-pc-windows-msvc.zip` |
+
+Asset names carry no version — the tag does — so a download URL keeps working
+across releases.
 
 Intel macOS has no published archive because GitHub retired its Intel macOS
 runners; build it locally with `./scripts/build.sh release macos-x64`.
 
 Each archive holds a single folder containing `hsin` and `hsind`. On macOS and
-Linux, move both onto your `PATH`. On Windows, pick `aarch64` for ARM64
-machines and `x86_64` otherwise, then run this in PowerShell:
+Linux, move both onto your `PATH`. On Windows, run this in PowerShell — it
+picks the right architecture and installs the newest release:
 
 ```powershell
-$version = "0.1.8"
 $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "aarch64" } else { "x86_64" }
 $destination = "$env:LOCALAPPDATA\Programs\hsin"
-$archive = "$env:TEMP\hsin-$version.zip"
+$archive = "$env:TEMP\hsin.zip"
 
 Invoke-WebRequest -UseBasicParsing -OutFile $archive -Uri `
-  "https://github.com/KyuubiRan/hsin.rs/releases/download/v$version/hsin-$version-$arch-pc-windows-msvc.zip"
-Expand-Archive -Path $archive -DestinationPath "$env:TEMP\hsin-$version" -Force
+  "https://github.com/KyuubiRan/hsin.rs/releases/latest/download/hsin-$arch-pc-windows-msvc.zip"
+Expand-Archive -Path $archive -DestinationPath "$env:TEMP\hsin" -Force
 New-Item -ItemType Directory -Force -Path $destination | Out-Null
-Copy-Item "$env:TEMP\hsin-$version\*\*.exe" -Destination $destination
+Copy-Item "$env:TEMP\hsin\*\*.exe" -Destination $destination
 [Environment]::SetEnvironmentVariable(
   "Path", "$([Environment]::GetEnvironmentVariable('Path', 'User'));$destination", "User")
 ```

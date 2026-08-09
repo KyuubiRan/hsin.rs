@@ -110,4 +110,5 @@ It builds the workspace and copies `hsin` and `hsind` into `artifacts/<target>/<
 - Wait for CI to pass on the commit *before* the version bump. The bump itself carries no code, so it is not covered by CI.
 - Run the `Release` workflow with `tag=vX.Y.Z`. It refuses to publish when the tag does not match the workspace version, creates the tag on the dispatched commit when it does not exist yet, and reuses the tag when re-running after a partial failure.
 - Do not create the tag by hand. A tag pushed from a workstation runs CI a second time on the same commit and can point at the wrong one.
-- Releases are pre-releases by default; clear the `prerelease` input deliberately.
+- Releases are published as full releases. GitHub excludes pre-releases from `/releases/latest`, which the documented download URLs resolve through, so set the `prerelease` input only for a preview that nobody should be pointed at.
+- Release assets are named `hsin-<target>.<ext>` with no version. The tag carries the version, so every release has the same asset names and a download URL never needs rewriting. Changing an asset name breaks the README instructions and the Homebrew formula together.

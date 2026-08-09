@@ -2,13 +2,9 @@
 set -eu
 
 target="${1:?usage: scripts/package.sh <target>}"
-metadata="$(cargo metadata --no-deps --format-version 1)"
-version="$(printf '%s\n' "$metadata" | sed -n 's/.*\"name\":\"hsin\",\"version\":\"\([^\"]*\)\".*/\1/p' | head -n 1)"
-if [ -z "$version" ]; then
-  echo "could not determine the hsin package version" >&2
-  exit 1
-fi
-root="dist/hsin-${version}-${target}"
+# The tag carries the version. Keeping it out of the archive name gives every
+# release the same asset names, so a download URL never needs rewriting.
+root="dist/hsin-${target}"
 
 rm -rf "$root"
 mkdir -p "$root"
