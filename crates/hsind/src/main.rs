@@ -1,3 +1,11 @@
+// A console-subsystem binary gets a console window whenever Windows starts it
+// interactively, so the scheduled task that runs the daemon at logon put one on
+// the user's desktop for the whole session. Windows allocates no console for a
+// windows-subsystem binary; standard handles the parent passes in are still
+// inherited, so `hsin` keeps reading this process's output. No effect anywhere
+// but Windows.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod app;
 mod config;
 mod crypto;

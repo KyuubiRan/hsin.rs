@@ -60,7 +60,7 @@ needs an elevated prompt.
 ### Register the background service
 
 ```bash
-hsind service install --start
+hsin daemon install --start
 ```
 
 This is optional: any `hsin` command bootstraps the daemon when the local IPC
@@ -125,8 +125,8 @@ endpoint, keyring entries and service identity. `CODEX_HOME` and
 ### Uninstall
 
 ```bash
-hsind service uninstall            # remove the service, keep providers and keys
-hsind service uninstall --purge    # also remove the data home and keyring entries
+hsin daemon uninstall            # remove the service, keep providers and keys
+hsin daemon uninstall --purge    # also remove the data home and keyring entries
 ```
 
 ## Development

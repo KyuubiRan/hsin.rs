@@ -70,7 +70,12 @@ jobs:
         shell: pwsh
         run: |
           & "target/${{ matrix.target }}/release/hsin.exe" --version
-          & "target/${{ matrix.target }}/release/hsind.exe" --version
+          # hsind is a windows-subsystem binary so it owns no console, which
+          # means pwsh does not wait for it and its output arrives only through
+          # a pipe. Without the pipe and the assertion this step would pass even
+          # if the binary printed nothing at all.
+          $version = & "target/${{ matrix.target }}/release/hsind.exe" --version | Out-String
+          if ($version -notmatch 'hsind') { throw "hsind --version printed '$version'" }
       - if: matrix.archive == 'tar'
         run: sh scripts/package.sh ${{ matrix.target }}
       - if: matrix.archive == 'zip'
