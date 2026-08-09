@@ -43,7 +43,7 @@ $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "aarch64" } else { "x86_6
 $destination = "$env:LOCALAPPDATA\Programs\hsin"
 $archive = "$env:TEMP\hsin-$version.zip"
 
-Invoke-WebRequest -OutFile $archive -Uri `
+Invoke-WebRequest -UseBasicParsing -OutFile $archive -Uri `
   "https://github.com/KyuubiRan/hsin.rs/releases/download/v$version/hsin-$version-$arch-pc-windows-msvc.zip"
 Expand-Archive -Path $archive -DestinationPath "$env:TEMP\hsin-$version" -Force
 New-Item -ItemType Directory -Force -Path $destination | Out-Null
