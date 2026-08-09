@@ -76,7 +76,15 @@ cargo check --workspace --all-targets --target x86_64-apple-darwin
 cargo zigbuild --workspace --all-targets --target x86_64-unknown-linux-gnu
 cargo zigbuild --workspace --all-targets --target aarch64-unknown-linux-gnu
 cargo xwin check --workspace --all-targets --target x86_64-pc-windows-msvc
+XWIN_CROSS_COMPILER=clang cargo xwin check --workspace --all-targets --target aarch64-pc-windows-msvc
 ```
+
+`XWIN_CROSS_COMPILER=clang` is required for `aarch64-pc-windows-msvc` only.
+`ring` forces the GNU-driver `clang` for its Windows AArch64 C sources, so
+cargo-xwin has to emit `-imsvc` include flags instead of clang-cl's `/imsvc`.
+`scripts/build.sh` and `scripts/build.ps1` set it themselves; a bare `cargo
+xwin` invocation does not, and a `.cargo/config.toml` `[env]` entry does not
+reach cargo-xwin because it reads the variable before Cargo applies that table.
 
 Configuration, IPC, crypto, proxy, service, or database changes require focused tests in addition to the workspace gates. Use temporary `HSIN_HOME`, `CODEX_HOME`, and `CLAUDE_CONFIG_DIR` values for integration tests, then remove test keyring entries.
 
