@@ -60,6 +60,7 @@ const fn assume_held() -> bool {
 
 pub struct DaemonClient {
     inner: tokio::sync::Mutex<hsin_ipc::IpcClient>,
+    daemon_version: String,
 }
 
 impl DaemonClient {
@@ -67,7 +68,7 @@ impl DaemonClient {
         let mut inner = hsin_ipc::IpcClient::connect_default()
             .await
             .context("connect to hsind")?;
-        inner
+        let hello = inner
             .hello(&hsin_ipc::HelloParams::new(
                 "hsin",
                 env!("CARGO_PKG_VERSION"),
@@ -76,12 +77,13 @@ impl DaemonClient {
             .context("negotiate hsind protocol")?;
         Ok(Self {
             inner: tokio::sync::Mutex::new(inner),
+            daemon_version: hello.daemon_version,
         })
     }
 
     pub async fn connect_or_bootstrap() -> Result<Self> {
         let initial_error = match Self::connect().await {
-            Ok(client) => return Ok(client),
+            Ok(client) => return client.reinstall_if_stale().await,
             Err(error) => error,
         };
 
@@ -96,6 +98,23 @@ impl DaemonClient {
 
         bootstrap::install_and_start().await?;
         Self::wait_until_ready(Some(initial_error)).await
+    }
+
+    /// A daemon that still speaks the same protocol answers the handshake, so an
+    /// upgrade that changed no RPC field leaves the previously installed daemon
+    /// serving every command, and its service definition starts that same old
+    /// binary again at the next logon. Version codes only move when the wire
+    /// contract does, so the build identity is what has to be compared: without
+    /// this, a release that fixes only daemon behaviour never reaches anyone who
+    /// already had hsin installed.
+    async fn reinstall_if_stale(self) -> Result<Self> {
+        if self.daemon_version == env!("CARGO_PKG_VERSION") {
+            return Ok(self);
+        }
+        // Reinstalling stops the daemon, so let go of the connection first.
+        drop(self);
+        bootstrap::install_and_start().await?;
+        Self::wait_until_ready(None).await
     }
 
     async fn wait_for_running_daemon(mut last_error: anyhow::Error) -> Result<Self> {
