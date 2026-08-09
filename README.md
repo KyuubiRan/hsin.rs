@@ -11,7 +11,17 @@ WIP
 
 ## Install
 
-### macOS and Linux
+### macOS
+
+```sh
+brew install KyuubiRan/tap/hsin
+```
+
+Upgrades then follow `brew upgrade` along with everything else you have
+installed. The script below works on macOS too if you would rather not use
+Homebrew.
+
+### Linux, and macOS without Homebrew
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/KyuubiRan/hsin.rs/main/scripts/install.sh | sh
@@ -21,12 +31,6 @@ Installs into `~/.local/bin`, and tells you if that is not on your `PATH`. Set
 `HSIN_INSTALL_DIR` to install elsewhere, or `HSIN_VERSION` to pin a tag such as
 `v0.2.0`. The archive is checked against the release's `SHA256SUMS` before
 anything is installed.
-
-On macOS, Homebrew works too, and keeps `brew upgrade` in charge of updates:
-
-```sh
-brew install KyuubiRan/tap/hsin
-```
 
 ### Windows
 
