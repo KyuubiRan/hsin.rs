@@ -841,8 +841,15 @@ fn validate_peer(_stream: &TokioLocalStream) {
     // named pipe listener is created.
 }
 
+/// The calling account's SID, resolved without depending on the display
+/// language: `whoami.exe` localizes its header row but never the SID itself.
+///
+/// # Errors
+///
+/// Returns [`io::ErrorKind::PermissionDenied`] when `whoami.exe` cannot be run
+/// or fails, and [`io::ErrorKind::InvalidData`] when its output carries no SID.
 #[cfg(windows)]
-fn current_user_security_descriptor() -> io::Result<SecurityDescriptor> {
+pub fn current_user_sid() -> io::Result<String> {
     let output = std::process::Command::new("whoami.exe")
         .args(["/user", "/fo", "csv", "/nh"])
         .output()?;
@@ -859,11 +866,17 @@ fn current_user_security_descriptor() -> io::Result<SecurityDescriptor> {
             "whoami.exe returned no current user SID",
         )
     })?;
-    let sid = output[start..]
+    output[start..]
         .split(|character: char| character == '"' || character == ',' || character.is_whitespace())
         .next()
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid current user SID"))?;
+        .map(str::to_owned)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid current user SID"))
+}
+
+#[cfg(windows)]
+fn current_user_security_descriptor() -> io::Result<SecurityDescriptor> {
+    let sid = current_user_sid()?;
     let sddl = U16CString::from_str(format!("D:P(A;;GA;;;{sid})"))
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
     SecurityDescriptor::deserialize(sddl.as_ucstr())

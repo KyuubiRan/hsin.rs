@@ -172,13 +172,11 @@ pub fn uninstall(target: &Target, purge: bool) -> Result<()> {
     guard_scope(target)?;
     let paths = &target.paths;
     stop(target)?;
-    #[cfg(target_os = "macos")]
-    uninstall_definition(paths)?;
-    #[cfg(any(target_os = "linux", windows))]
-    uninstall_definition(target);
+    uninstall_definition(target)?;
     let _ = fs::remove_file(paths.home.join("bin").join(exe_name("hsind")));
     let _ = fs::remove_file(paths.home.join("bin").join(exe_name("hsin")));
     let _ = fs::remove_file(paths.home.join("bin/run-hsind.cmd"));
+    let _ = fs::remove_file(paths.home.join("bin/hsind-task.xml"));
     #[cfg(target_os = "linux")]
     if target.scope == Scope::System {
         unlink_from_path(&paths.home.join("bin"));
@@ -685,6 +683,68 @@ fn unlink_from(directory: &Path, bin: &Path) {
 }
 
 #[cfg(windows)]
+fn task_definition_path(paths: &Paths) -> PathBuf {
+    paths.home.join("bin/hsind-task.xml")
+}
+
+/// `schtasks /SC ONLOGON` emits a logon trigger with no `UserId`, which Task
+/// Scheduler reads as "when any user logs on" — a machine-wide registration
+/// that only an administrator may create. A trigger scoped to the installing
+/// account needs no elevation, and only the XML form can express it.
+///
+/// The XML also carries three settings the command line cannot reach at all:
+/// without them Task Scheduler refuses to start the daemon while the machine is
+/// on battery, kills it when the machine is unplugged, and terminates it after
+/// a 72-hour default execution limit.
+#[cfg(windows)]
+fn render_task_definition(wrapper: &Path, sid: &str) -> String {
+    let sid = xml(sid);
+    let command = xml(&wrapper.to_string_lossy());
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{sid}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{sid}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <Enabled>true</Enabled>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{command}</Command>
+    </Exec>
+  </Actions>
+</Task>
+"#
+    )
+}
+
+/// `schtasks /Create /XML` decodes the file as ANSI unless it opens with a
+/// UTF-16 byte order mark, so a data home under a non-ASCII profile name would
+/// register a mojibake path and the daemon would start against the wrong home.
+#[cfg(windows)]
+fn write_utf16le(path: &Path, content: &str) -> Result<()> {
+    let mut bytes = vec![0xFF, 0xFE];
+    bytes.extend(content.encode_utf16().flat_map(u16::to_le_bytes));
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+#[cfg(windows)]
 fn install_definition(target: &Target, daemon: &Path, _recovery_key: Option<&str>) -> Result<()> {
     let paths = &target.paths;
     let wrapper = paths.home.join("bin/run-hsind.cmd");
@@ -704,35 +764,62 @@ fn install_definition(target: &Target, daemon: &Path, _recovery_key: Option<&str
             "@echo off\r\n{variables}:run\r\n\"{daemon}\" run\r\nif not errorlevel 1 exit /b 0\r\n>nul 2>&1 timeout /t 2 /nobreak\r\ngoto run\r\n"
         ),
     )?;
-    let task_command = format!("\"{}\"", wrapper.display());
-    command(Command::new("schtasks").args([
-        "/Create",
-        "/F",
-        "/SC",
-        "ONLOGON",
-        "/RL",
-        "LIMITED",
-        "/TN",
-        &service_label(paths),
-        "/TR",
-        &task_command,
-    ]))
+    let definition = task_definition_path(paths);
+    write_utf16le(
+        &definition,
+        &render_task_definition(&wrapper, &hsin_ipc::current_user_sid()?),
+    )?;
+    let label = service_label(paths);
+    let definition = definition.to_string_lossy().into_owned();
+    command(Command::new("schtasks").args(["/Create", "/F", "/TN", &label, "/XML", &definition]))
+}
+
+/// Deleting a definition is not proof that it is gone. Both `fs::remove_file`
+/// and the service managers refuse a delete for reasons the caller cannot read
+/// back — a refusal is reported in the operator's own display language — so the
+/// end state is the only trustworthy signal. Reporting success while the
+/// definition survives leaves an autostart entry that resurrects the daemon.
+///
+/// Windows has no counterpart here: its definition is a Task Scheduler
+/// registration rather than a file, so it verifies with [`task_exists`].
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn remove_definition_file(path: &Path) -> Result<()> {
+    let _ = fs::remove_file(path);
+    if path.exists() {
+        return Err(DaemonError::PermissionDenied(format!(
+            "{} still exists after the uninstall; re-run with the privileges that installed it",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn task_exists(label: &str) -> bool {
+    Command::new("schtasks")
+        .args(["/Query", "/TN", label])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 #[cfg(target_os = "macos")]
-fn uninstall_definition(paths: &Paths) -> Result<()> {
+fn uninstall_definition(target: &Target) -> Result<()> {
+    let paths = &target.paths;
     let domain = format!("gui/{}", uid()?);
     let plist = launch_agent_path(paths)?;
+    // `bootout` fails whenever the job is not loaded, which is the normal state
+    // for a service that is already stopped. Only the plist is evidence.
     let _ = Command::new("launchctl")
         .args(["bootout", &domain, &plist.to_string_lossy()])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
-    let _ = fs::remove_file(plist);
-    Ok(())
+    remove_definition_file(&plist)
 }
 #[cfg(target_os = "linux")]
-fn uninstall_definition(target: &Target) {
+fn uninstall_definition(target: &Target) -> Result<()> {
     let paths = &target.paths;
     let unit = service_unit(paths);
     if target.scope == Scope::System {
@@ -741,13 +828,13 @@ fn uninstall_definition(target: &Target) {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
-        let _ = fs::remove_file(system_unit_path(paths));
+        remove_definition_file(&system_unit_path(paths))?;
         let _ = Command::new("systemctl")
             .arg("daemon-reload")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
-        return;
+        return Ok(());
     }
     if systemd_user_available() {
         let _ = Command::new("systemctl")
@@ -756,17 +843,28 @@ fn uninstall_definition(target: &Target) {
             .stderr(std::process::Stdio::null())
             .status();
     }
+    // The fallback tier writes no unit, so an unset HOME leaves nothing behind.
     if let Some(home) = std::env::var_os("HOME") {
-        let _ = fs::remove_file(PathBuf::from(home).join(".config/systemd/user").join(unit));
+        remove_definition_file(&PathBuf::from(home).join(".config/systemd/user").join(unit))?;
     }
+    Ok(())
 }
 #[cfg(windows)]
-fn uninstall_definition(target: &Target) {
+fn uninstall_definition(target: &Target) -> Result<()> {
+    let label = service_label(&target.paths);
+    // `schtasks` reports a refused delete in the operator's display language, so
+    // neither its exit status nor its stderr can be classified. Absence is.
     let _ = Command::new("schtasks")
-        .args(["/Delete", "/F", "/TN", &service_label(&target.paths)])
+        .args(["/Delete", "/F", "/TN", &label])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
+    if task_exists(&label) {
+        return Err(DaemonError::PermissionDenied(format!(
+            "scheduled task {label} is still registered after the uninstall; re-run from an elevated prompt"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -785,7 +883,7 @@ fn uid() -> Result<String> {
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().into())
 }
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn xml(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -980,6 +1078,122 @@ mod tests {
         assert!(!lock_file_held(&lock_path).unwrap());
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// Uninstall reported success while the definition survived, so a refused
+    /// delete left an autostart entry that resurrected the daemon at the next
+    /// logon. The service managers report a refusal in the operator's own
+    /// display language, so absence of the definition is the only proof.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_definition_that_survives_removal_is_a_failure() {
+        let root = std::env::temp_dir().join(format!("hsin-definition-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+
+        // Never installed, or already removed: uninstall stays idempotent.
+        remove_definition_file(&root.join("absent")).unwrap();
+
+        let definition = root.join("definition");
+        fs::write(&definition, b"definition").unwrap();
+        remove_definition_file(&definition).unwrap();
+        assert!(!definition.exists());
+
+        // A directory stands in for the definition the daemon is refused: every
+        // supported platform rejects `remove_file` on one, and it survives.
+        let refused = root.join("refused");
+        fs::create_dir_all(&refused).unwrap();
+        assert!(remove_definition_file(&refused).is_err());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// `schtasks /SC ONLOGON` registers a logon trigger with no `UserId`, which
+    /// Task Scheduler reads as "when any user logs on" — a machine-wide
+    /// registration only an administrator may create. That is why a standard
+    /// account could not install the service at all, so the trigger itself must
+    /// name the installing account.
+    #[cfg(windows)]
+    #[test]
+    fn the_logon_trigger_names_the_installing_account() {
+        let definition = render_task_definition(
+            Path::new(r"C:\Users\kitsune\AppData\Local\hsin\bin\run-hsind.cmd"),
+            "S-1-5-21-1-2-3-1000",
+        );
+        let trigger = definition
+            .split_once("<LogonTrigger>")
+            .and_then(|(_, rest)| rest.split_once("</LogonTrigger>"))
+            .map(|(trigger, _)| trigger)
+            .expect("the definition declares a logon trigger");
+        assert!(
+            trigger.contains("<UserId>S-1-5-21-1-2-3-1000</UserId>"),
+            "the logon trigger must be scoped to the installing account: {trigger}"
+        );
+        assert!(definition.contains("<LogonType>InteractiveToken</LogonType>"));
+    }
+
+    /// Task Scheduler's command-line defaults refuse to start the task while the
+    /// machine is on battery, stop it when the machine is unplugged, and
+    /// terminate it after 72 hours. A laptop therefore lost the daemon at logon
+    /// and a desktop lost it after three days; only the XML form overrides them.
+    #[cfg(windows)]
+    #[test]
+    fn the_daemon_survives_battery_power_and_long_uptime() {
+        let definition = render_task_definition(
+            Path::new(r"C:\hsin\bin\run-hsind.cmd"),
+            "S-1-5-21-1-2-3-1000",
+        );
+        assert!(
+            definition.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>")
+        );
+        assert!(definition.contains("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"));
+        assert!(definition.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+    }
+
+    /// A data home under a profile name containing XML metacharacters produced a
+    /// definition `schtasks` rejected with a message the operator could not act
+    /// on.
+    #[cfg(windows)]
+    #[test]
+    fn the_definition_escapes_the_data_home() {
+        let definition = render_task_definition(
+            Path::new(r"C:\Users\A&B<C>\bin\run-hsind.cmd"),
+            "S-1-5-21-1-2-3-1000",
+        );
+        assert!(definition.contains(r"C:\Users\A&amp;B&lt;C&gt;\bin\run-hsind.cmd"));
+        assert!(!definition.contains("A&B"));
+    }
+
+    /// `schtasks /Create /XML` decodes the task file as ANSI unless it opens
+    /// with a UTF-16 byte order mark, so a data home under a non-ASCII profile
+    /// name registered a mojibake path and the daemon started against the wrong
+    /// directory.
+    #[cfg(windows)]
+    #[test]
+    fn the_definition_survives_a_non_ascii_data_home() {
+        let root = std::env::temp_dir().join(format!("hsin-task-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("hsind-task.xml");
+        let wrapper = r"C:\Users\张三\AppData\Local\hsin\bin\run-hsind.cmd";
+
+        write_utf16le(
+            &path,
+            &render_task_definition(Path::new(wrapper), "S-1-5-21-1-2-3-1000"),
+        )
+        .unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(
+            &bytes[..2],
+            &[0xFF, 0xFE],
+            "schtasks needs the byte order mark to stop decoding the file as ANSI"
+        );
+        let units: Vec<u16> = bytes[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        assert!(String::from_utf16(&units).unwrap().contains(wrapper));
+
+        fs::remove_dir_all(root).ok();
     }
 
     /// A system installation runs as root but must own the target account's

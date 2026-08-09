@@ -1702,6 +1702,7 @@ impl From<&DaemonError> for AppError {
             DaemonError::Config(_) | DaemonError::Io(_) => ErrorCode::ConfigUnavailable,
             DaemonError::Protocol(_) => ErrorCode::ProtocolMismatch,
             DaemonError::Keyring(_) => ErrorCode::KeyStoreUnavailable,
+            DaemonError::PermissionDenied(_) => ErrorCode::PermissionDenied,
             _ => ErrorCode::Internal,
         };
         AppError::new(code)

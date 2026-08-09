@@ -35,6 +35,8 @@ pub enum DaemonError {
     Crypto,
     #[error("system keyring error: {0}")]
     Keyring(String),
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -57,6 +59,7 @@ impl DaemonError {
             Self::Json(_) => "serialization_error",
             Self::Crypto => "crypto_error",
             Self::Keyring(_) => "keyring_error",
+            Self::PermissionDenied(_) => "permission_denied",
             Self::Internal(_) => "internal_error",
         }
     }
