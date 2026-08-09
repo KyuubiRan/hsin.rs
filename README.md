@@ -11,16 +11,39 @@ WIP
 
 ## Install
 
-### Homebrew (macOS on Apple Silicon, Linux on x86-64 or ARM64)
+### macOS and Linux
 
-```bash
+```sh
+curl -fsSL https://raw.githubusercontent.com/KyuubiRan/hsin.rs/main/scripts/install.sh | sh
+```
+
+Installs into `~/.local/bin`, and tells you if that is not on your `PATH`. Set
+`HSIN_INSTALL_DIR` to install elsewhere, or `HSIN_VERSION` to pin a tag such as
+`v0.2.0`. The archive is checked against the release's `SHA256SUMS` before
+anything is installed.
+
+On macOS, Homebrew works too, and keeps `brew upgrade` in charge of updates:
+
+```sh
 brew install KyuubiRan/tap/hsin
 ```
 
-### Release archive (all supported platforms)
+### Windows
 
-Download the archive for your platform from
-[Releases](https://github.com/KyuubiRan/hsin.rs/releases):
+```powershell
+irm https://raw.githubusercontent.com/KyuubiRan/hsin.rs/main/scripts/install.ps1 | iex
+```
+
+Installs into `%LOCALAPPDATA%\Programs\hsin` and adds it to your user `PATH`, so
+open a new terminal afterwards. It takes the same `HSIN_INSTALL_DIR` and
+`HSIN_VERSION` overrides and performs the same checksum check. Nothing here
+needs an elevated prompt.
+
+### Manual download
+
+Both scripts do nothing you cannot do by hand: pick the archive for your
+platform from [Releases](https://github.com/KyuubiRan/hsin.rs/releases), verify
+it against `SHA256SUMS`, and put `hsin` and `hsind` on your `PATH`.
 
 | Platform | Archive |
 | --- | --- |
@@ -31,31 +54,10 @@ Download the archive for your platform from
 | Windows, ARM64 | `hsin-aarch64-pc-windows-msvc.zip` |
 
 Asset names carry no version — the tag does — so a download URL keeps working
-across releases.
+across releases. Each archive holds a single folder containing both binaries.
 
 Intel macOS has no published archive because GitHub retired its Intel macOS
 runners; build it locally with `./scripts/build.sh release macos-x64`.
-
-Each archive holds a single folder containing `hsin` and `hsind`. On macOS and
-Linux, move both onto your `PATH`. On Windows, run this in PowerShell — it
-picks the right architecture and installs the newest release:
-
-```powershell
-$arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "aarch64" } else { "x86_64" }
-$destination = "$env:LOCALAPPDATA\Programs\hsin"
-$archive = "$env:TEMP\hsin.zip"
-
-Invoke-WebRequest -UseBasicParsing -OutFile $archive -Uri `
-  "https://github.com/KyuubiRan/hsin.rs/releases/latest/download/hsin-$arch-pc-windows-msvc.zip"
-Expand-Archive -Path $archive -DestinationPath "$env:TEMP\hsin" -Force
-New-Item -ItemType Directory -Force -Path $destination | Out-Null
-Copy-Item "$env:TEMP\hsin\*\*.exe" -Destination $destination
-[Environment]::SetEnvironmentVariable(
-  "Path", "$([Environment]::GetEnvironmentVariable('Path', 'User'));$destination", "User")
-```
-
-Open a new terminal afterwards so the updated `PATH` takes effect. Nothing here
-needs an elevated prompt.
 
 ### Register the background service
 
