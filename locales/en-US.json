@@ -46,6 +46,7 @@
   "cli.mode.set.arg.mode": "Connection mode to activate",
   "cli.status.about": "Show daemon, proxy, and managed-client state",
   "cli.doctor.about": "Run configuration, security, IPC, and service diagnostics",
+  "cli.update.about": "Update hsin to the latest release",
   "cli.daemon.about": "Manage the background daemon service",
   "cli.daemon.status.about": "Show background service status",
   "cli.daemon.start.about": "Start the background service",

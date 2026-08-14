@@ -39,6 +39,8 @@ pub enum Command {
     Status,
     /// Run diagnostics.
     Doctor,
+    /// Update hsin to the latest release.
+    Update,
     /// Manage the background daemon.
     Daemon {
         #[command(subcommand)]
@@ -437,6 +439,12 @@ mod tests {
         assert_eq!(proxy_host.as_deref(), Some("0.0.0.0"));
         assert_eq!(proxy_port, Some(9998));
         assert_eq!(proxy_enabled, Some(true));
+    }
+
+    #[test]
+    fn parses_top_level_update() {
+        let cli = Cli::try_parse_from(["hsin", "update"]).expect("valid command");
+        assert!(matches!(cli.command, Some(Command::Update)));
     }
 
     #[test]

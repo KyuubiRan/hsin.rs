@@ -16,7 +16,7 @@ use crate::{
     },
     i18n::I18n,
     rpc::DaemonClient,
-    tui,
+    tui, updater,
 };
 
 pub async fn run(cli: Cli, i18n: &mut I18n) -> Result<()> {
@@ -29,6 +29,9 @@ pub async fn run(cli: Cli, i18n: &mut I18n) -> Result<()> {
 
     if let Command::Daemon { command } = command {
         return run_daemon_command(command, cli.json).await;
+    }
+    if let Command::Update = command {
+        return updater::run().await;
     }
 
     let client = DaemonClient::connect_or_bootstrap().await?;
@@ -44,6 +47,7 @@ pub async fn run(cli: Cli, i18n: &mut I18n) -> Result<()> {
             let value: Value = client.call("doctor", &json!({})).await?;
             print_value(&value, cli.json)
         }
+        Command::Update => unreachable!("update command handled before connecting"),
         Command::Security { command } => run_security(command, &client, cli.json).await,
         Command::Settings { command } => run_settings(command, &client, cli.json).await,
         Command::Credential {

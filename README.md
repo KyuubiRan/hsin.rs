@@ -43,6 +43,19 @@ open a new terminal afterwards. It takes the same `HSIN_INSTALL_DIR` and
 `HSIN_VERSION` overrides and performs the same checksum check. Nothing here
 needs an elevated prompt.
 
+### Update
+
+```bash
+hsin update
+```
+
+The command checks GitHub's latest release before downloading anything. On
+macOS, when the running `hsin` binary belongs to the installed Homebrew formula,
+it updates through `brew upgrade`; merely having Homebrew installed does not
+change a script or manual installation. Linux, Windows, and non-Homebrew macOS
+installations use the same checksum-verified scripts shown above. An existing
+background service is updated immediately with the new daemon binary.
+
 ### Manual download
 
 Both scripts do nothing you cannot do by hand: pick the archive for your
@@ -105,6 +118,7 @@ scriptable:
 ```bash
 hsin status                                   # daemon, proxy and client state
 hsin doctor                                   # configuration, security and service checks
+hsin update                                   # update to the latest release
 
 hsin provider import-current --client codex   # adopt what a client already uses
 hsin provider add codex --name Example \

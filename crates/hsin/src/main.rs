@@ -4,6 +4,7 @@ mod cli;
 mod i18n;
 mod rpc;
 mod tui;
+mod updater;
 
 use std::process::ExitCode;
 

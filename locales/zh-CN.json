@@ -46,6 +46,7 @@
   "cli.mode.set.arg.mode": "要启用的连接模式",
   "cli.status.about": "显示 daemon、代理和已托管客户端状态",
   "cli.doctor.about": "检查配置、安全、IPC 和后台服务状态",
+  "cli.update.about": "将 hsin 更新到最新版本",
   "cli.daemon.about": "管理后台 daemon 服务",
   "cli.daemon.status.about": "显示后台服务状态",
   "cli.daemon.start.about": "启动后台服务",
