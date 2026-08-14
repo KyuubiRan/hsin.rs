@@ -18,7 +18,7 @@ The Cargo workspace contains:
 - Do not add SQLite, keyring, proxy-server, or client-config parsing dependencies to `hsin`.
 - Keep public provider DTOs free of complete credentials. Only `credential.resolve` may return credential material.
 - Preserve IPC method names, wire enum values, protocol checks, frame limits, request IDs, and hello negotiation.
-- Daemon/CLI RPC contract changes require incrementing `hsin_core::VERSION_CODE` and shipping matching `hsind` and `hsin` binaries. Version-code mismatches must continue to reinstall the daemon automatically.
+- Every workspace release must set `hsin_core::VERSION_CODE` to exactly one greater than the preceding release and ship matching `hsind` and `hsin` binaries. A compatibility change may make that increment before the release-only version commit; never increment it twice for one release. Version-code mismatches must continue to reinstall the daemon automatically.
 - `HSIN_HOME` instances must remain isolated across storage, IPC, keyring entries, installation markers, and service identities.
 
 ## Configuration And Authentication
@@ -106,7 +106,7 @@ It builds the workspace and copies `hsin` and `hsind` into `artifacts/<target>/<
 
 ## Releasing
 
-- Bump `version` in the workspace `Cargo.toml`, refresh `Cargo.lock`, and commit it alone as `chore: release X.Y.Z [skip ci]`.
+- Bump `version` in the workspace `Cargo.toml`, ensure `hsin_core::VERSION_CODE` is exactly one greater than the preceding release (increment it now only when the code changes have not already done so), refresh `Cargo.lock`, and commit the release-only changes together as `chore: release X.Y.Z [skip ci]`.
 - Wait for CI to pass on the commit *before* the version bump. The bump itself carries no code, so it is not covered by CI.
 - Run the `Release` workflow with `tag=vX.Y.Z`. It refuses to publish when the tag does not match the workspace version, creates the tag on the dispatched commit when it does not exist yet, and reuses the tag when re-running after a partial failure.
 - Do not create the tag by hand. A tag pushed from a workstation runs CI a second time on the same commit and can point at the wrong one.

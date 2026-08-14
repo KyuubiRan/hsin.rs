@@ -10,9 +10,10 @@ use url::Url;
 
 /// Wire protocol version implemented by this workspace.
 pub const PROTOCOL_VERSION: u32 = 1;
-/// Monotonic CLI/daemon compatibility code. Bump when either side requires
-/// RPC fields or behavior that an older binary cannot provide.
-pub const VERSION_CODE: u32 = 23;
+/// Monotonic CLI/daemon release compatibility code. Every published workspace
+/// version must be exactly one greater than the preceding release so a new CLI
+/// always replaces an older daemon.
+pub const VERSION_CODE: u32 = 24;
 
 #[must_use]
 pub fn provider_name_from_url(value: &str) -> Option<String> {

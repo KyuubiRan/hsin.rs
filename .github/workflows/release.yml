@@ -23,11 +23,37 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Check the tag names the version being shipped
         run: |
           version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
           if [ "${{ inputs.tag }}" != "v$version" ]; then
             echo "::error::tag ${{ inputs.tag }} does not match workspace version $version"
+            exit 1
+          fi
+      - name: Check the daemon compatibility code
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          current_code=$(sed -nE 's/^pub const VERSION_CODE: u32 = ([0-9]+);$/\1/p' crates/hsin-core/src/lib.rs)
+          previous_tag=$(git tag --list 'v*' --sort=-version:refname | awk -v current="$TAG" '$0 != current { print; exit }')
+          if [ -z "$current_code" ]; then
+            echo "::error::could not read hsin_core::VERSION_CODE"
+            exit 1
+          fi
+          if [ -z "$previous_tag" ]; then
+            echo "No previous release tag; VERSION_CODE is $current_code"
+            exit 0
+          fi
+          previous_code=$(git show "${previous_tag}:crates/hsin-core/src/lib.rs" | sed -nE 's/^pub const VERSION_CODE: u32 = ([0-9]+);$/\1/p')
+          if [ -z "$previous_code" ]; then
+            echo "::error::could not read VERSION_CODE from $previous_tag"
+            exit 1
+          fi
+          expected_code=$((previous_code + 1))
+          if [ "$current_code" -ne "$expected_code" ]; then
+            echo "::error::VERSION_CODE must be $expected_code for $TAG; found $current_code (previous release: $previous_tag)"
             exit 1
           fi
 
