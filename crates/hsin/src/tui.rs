@@ -1,6 +1,11 @@
 use std::{io, time::Duration};
 
 use anyhow::{Context, Result};
+#[cfg(windows)]
+use crossterm::{
+    cursor::{MoveTo, Show},
+    terminal::{Clear, ClearType},
+};
 use crossterm::{
     event::{
         Event, EventStream, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
@@ -119,6 +124,8 @@ impl Drop for RestoreTerminal {
             PopKeyboardEnhancementFlags,
             LeaveAlternateScreen
         );
+        #[cfg(windows)]
+        let _ = execute!(io::stdout(), Clear(ClearType::All), MoveTo(0, 0), Show);
     }
 }
 
