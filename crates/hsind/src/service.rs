@@ -7,12 +7,15 @@ use std::{
 
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use std::fmt::Write as _;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use crate::{
     crypto::{KeyStore, SystemKeyStore},
     error::{DaemonError, Result},
     paths::Paths,
 };
+#[cfg(not(windows))]
 use atomic_write_file::AtomicWriteFile;
 use fs2::FileExt;
 
@@ -175,6 +178,11 @@ pub fn uninstall(target: &Target, purge: bool) -> Result<()> {
     uninstall_definition(target)?;
     let _ = fs::remove_file(paths.home.join("bin").join(exe_name("hsind")));
     let _ = fs::remove_file(paths.home.join("bin").join(exe_name("hsin")));
+    #[cfg(windows)]
+    {
+        cleanup_legacy_atomic_binary_temps(&paths.home.join("bin").join(exe_name("hsind")));
+        cleanup_legacy_atomic_binary_temps(&paths.home.join("bin").join(exe_name("hsin")));
+    }
     let _ = fs::remove_file(paths.home.join("bin/run-hsind.cmd"));
     let _ = fs::remove_file(paths.home.join("bin/hsind-task.xml"));
     #[cfg(target_os = "linux")]
@@ -365,16 +373,96 @@ fn install_binary(source: &Path, destination: &Path) -> Result<()> {
     if source == destination {
         return Ok(());
     }
-    let mut input = File::open(source)?;
-    let mut output = AtomicWriteFile::open(destination)?;
-    io::copy(&mut input, &mut output)?;
-    output.commit()?;
-    #[cfg(unix)]
+
+    // On Windows the daemon releases its instance lock before the process has fully unmapped its
+    // executable. Replacing the file in that short interval fails with access denied even though
+    // `wait_for_instance_stop` has already succeeded. Retry only that transient error; other I/O
+    // failures still surface immediately.
+    let attempts = if cfg!(windows) { 300 } else { 1 };
+    for attempt in 0..attempts {
+        match copy_binary(source, destination) {
+            Ok(()) => {
+                #[cfg(unix)]
+                fs::set_permissions(destination, fs::Permissions::from_mode(0o755))?;
+                #[cfg(windows)]
+                cleanup_legacy_atomic_binary_temps(destination);
+                return Ok(());
+            }
+            Err(error)
+                if cfg!(windows)
+                    && error.kind() == io::ErrorKind::PermissionDenied
+                    && attempt + 1 < attempts =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    unreachable!("the binary installation loop always returns")
+}
+
+fn copy_binary(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(destination, fs::Permissions::from_mode(0o755))?;
+        // atomic-write-file's generic Windows backend ends with `fs::rename`, which cannot
+        // replace an existing destination. Service binaries are derived copies and the source
+        // beside the CLI remains available for recovery, so overwrite the stopped image directly.
+        clear_readonly(destination)?;
+        fs::copy(source, destination)?;
+        // `fs::copy` preserves file permissions. A read-only release source must not make the
+        // daemon-owned copy impossible to replace during the next automatic update.
+        clear_readonly(destination)?;
+    }
+    #[cfg(not(windows))]
+    {
+        let mut input = File::open(source)?;
+        let mut output = AtomicWriteFile::open(destination)?;
+        io::copy(&mut input, &mut output)?;
+        output.commit()?;
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn clear_readonly(path: &Path) -> io::Result<()> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut permissions = metadata.permissions();
+    if permissions.readonly() {
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn cleanup_legacy_atomic_binary_temps(destination: &Path) {
+    let Some(directory) = destination.parent() else {
+        return;
+    };
+    let Some(destination_name) = destination.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if is_legacy_atomic_binary_temp(&name.to_string_lossy(), destination_name) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn is_legacy_atomic_binary_temp(candidate: &str, destination_name: &str) -> bool {
+    let Some(suffix) = candidate.strip_prefix(&format!(".{destination_name}.")) else {
+        return false;
+    };
+    suffix.len() == 6 && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
 #[cfg(target_os = "macos")]
@@ -789,7 +877,11 @@ fn install_definition(target: &Target, daemon: &Path, _recovery_key: Option<&str
     )?;
     let label = service_label(paths);
     let definition = definition.to_string_lossy().into_owned();
-    command(Command::new("schtasks").args(["/Create", "/F", "/TN", &label, "/XML", &definition]))
+    command(Command::new("schtasks").args(["/Create", "/F", "/TN", &label, "/XML", &definition]))?;
+    // Releases before 0.2.0 launched a batch wrapper. Remove it only after the replacement task
+    // is registered successfully so a failed upgrade keeps the previous definition recoverable.
+    let _ = fs::remove_file(paths.home.join("bin/run-hsind.cmd"));
+    Ok(())
 }
 
 /// Deleting a definition is not proof that it is gone. Both `fs::remove_file`
@@ -1095,6 +1187,51 @@ mod tests {
         FileExt::unlock(&lock).unwrap();
         assert!(!lock_file_held(&lock_path).unwrap());
 
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recognizes_only_legacy_atomic_binary_temps() {
+        assert!(is_legacy_atomic_binary_temp(
+            ".hsind.exe.aB019z",
+            "hsind.exe"
+        ));
+        assert!(!is_legacy_atomic_binary_temp(
+            ".hsind.exe.aB019z.extra",
+            "hsind.exe"
+        ));
+        assert!(!is_legacy_atomic_binary_temp(
+            ".hsin.exe.aB019z",
+            "hsind.exe"
+        ));
+        assert!(!is_legacy_atomic_binary_temp(
+            ".hsind.exe.aB-19z",
+            "hsind.exe"
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_readonly_release_binary_stays_replaceable() {
+        let directory =
+            std::env::temp_dir().join(format!("hsin-readonly-copy-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source.exe");
+        let destination = directory.join("destination.exe");
+        fs::write(&source, b"new daemon").unwrap();
+        fs::write(&destination, b"old daemon").unwrap();
+
+        for path in [&source, &destination] {
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+
+        copy_binary(&source, &destination).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"new daemon");
+        assert!(!fs::metadata(&destination).unwrap().permissions().readonly());
+
+        clear_readonly(&source).unwrap();
         fs::remove_dir_all(directory).unwrap();
     }
 

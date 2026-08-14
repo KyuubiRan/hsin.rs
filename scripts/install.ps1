@@ -9,6 +9,9 @@ $ErrorActionPreference = "Stop"
 
 $repo = "KyuubiRan/hsin.rs"
 $destination = if ($env:HSIN_INSTALL_DIR) { $env:HSIN_INSTALL_DIR } else { "$env:LOCALAPPDATA\Programs\hsin" }
+$serviceHome = if ($env:HSIN_HOME) { [IO.Path]::GetFullPath($env:HSIN_HOME) } else { "$env:LOCALAPPDATA\hsin" }
+$serviceInstalled = (Test-Path (Join-Path $serviceHome ".hsin-home")) -or
+    (Test-Path (Join-Path $serviceHome "bin\hsind.exe"))
 
 $architecture = switch ($env:PROCESSOR_ARCHITECTURE) {
     "ARM64" { "aarch64" }
@@ -69,6 +72,12 @@ try {
 
     Write-Host "installed hsin.exe and hsind.exe into $destination"
 
+    if ($serviceInstalled) {
+        Write-Host "updating the existing background daemon"
+        & "$destination\hsin.exe" daemon update
+        if ($LASTEXITCODE -ne 0) { throw "hsin daemon update exited with $LASTEXITCODE" }
+    }
+
     $user = [Environment]::GetEnvironmentVariable("Path", "User")
     if ($user -notlike "*$destination*") {
         [Environment]::SetEnvironmentVariable("Path", "$user;$destination", "User")
@@ -76,9 +85,11 @@ try {
         Write-Host "Added $destination to your PATH. Open a new terminal for it to apply."
     }
 
-    Write-Host ""
-    Write-Host "Run 'hsin' to start. It registers and starts the background daemon by"
-    Write-Host "itself the first time it needs one, and needs no administrator rights."
+    if (-not $serviceInstalled) {
+        Write-Host ""
+        Write-Host "Run 'hsin' to start. It registers and starts the background daemon by"
+        Write-Host "itself the first time it needs one, and needs no administrator rights."
+    }
 }
 finally {
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
