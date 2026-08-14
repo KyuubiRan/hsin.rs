@@ -414,6 +414,13 @@ impl Database {
         Ok(())
     }
 
+    pub fn delete_setting(&self, key: &str) -> Result<()> {
+        self.connection
+            .lock()
+            .execute("DELETE FROM settings WHERE key=?1", [key])?;
+        Ok(())
+    }
+
     pub fn begin_operation(
         &self,
         kind: &str,

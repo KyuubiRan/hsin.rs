@@ -35,6 +35,7 @@ use crate::{
 };
 
 const CODEX_AUTH_BACKUP_KEY: &str = "codex_auth_backup_v1";
+const CLAUDE_MODEL_ENV_BEFORE_KEY: &str = "claude_model_env_before";
 /// Records that the operator holds a copy of the current master key. Losing the
 /// keyring entry without one is unrecoverable, so this must track the actual
 /// export instead of merely asserting that a key exists.
@@ -46,6 +47,15 @@ fn client_host_for_listener(host: IpAddr) -> IpAddr {
         IpAddr::V6(host) if host.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
         host => host,
     }
+}
+
+fn claude_model_mapping_active(provider: &Provider) -> bool {
+    provider.client == ClientKind::Claude
+        && !provider.official
+        && provider
+            .claude_model_mapping
+            .as_ref()
+            .is_some_and(|mapping| !mapping.is_inert())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -608,6 +618,7 @@ impl App {
             self.db
                 .set_active(provider.client, &provider.id, "synchronized")?;
             self.db.set_mode(provider.client, target.mode)?;
+            self.release_claude_model_env_snapshot(&target)?;
             self.db.finish_operation(&operation, "complete", None)?;
         }
         Ok(provider)
@@ -813,7 +824,9 @@ impl App {
         let _ = self.db.secret(&provider.id)?;
         let state = self.db.client_state(params.client)?;
         if state.mode == ConnectionMode::Proxy {
-            if provider.client == ClientKind::Codex && provider.model.is_some() {
+            if (provider.client == ClientKind::Codex && provider.model.is_some())
+                || self.claude_model_mapping_transition(&provider)?
+            {
                 self.apply_configuration(&provider, ConnectionMode::Proxy)?;
                 return Ok(provider);
             }
@@ -938,6 +951,7 @@ impl App {
             self.db
                 .set_setting("client_auth", &serde_json::to_string(&client_auth)?)?;
         }
+        self.release_claude_model_env_snapshot(&target)?;
         self.db.finish_operation(&operation, "complete", None)?;
         Ok(())
     }
@@ -955,7 +969,9 @@ impl App {
             None
         };
         let claude_model_env_before = if provider.client == ClientKind::Claude {
-            Some(self.claude_model_env_snapshot()?)
+            self.claude_model_mapping_transition(provider)?
+                .then(|| self.claude_model_env_snapshot())
+                .transpose()?
         } else {
             None
         };
@@ -973,16 +989,15 @@ impl App {
         })
     }
 
-    /// The user's own values for the model-mapping env keys, captured the first time hsin builds a
-    /// Claude config target and reused from then on — after that first capture the file may hold
-    /// hsin's own values, which must never be mistaken for the user's.
+    /// The user's own values for the model-mapping env keys, captured when hsin enters mapping
+    /// ownership and reused until it restores and releases them. While owned, the live file may
+    /// hold hsin's values, which must never be mistaken for the user's.
     ///
     /// A snapshot taken by an older hsin only covers the keys that version owned. The keys added
     /// since are still the user's own in the file, so they are captured now rather than being
     /// overwritten unrecorded.
     fn claude_model_env_snapshot(&self) -> Result<config::ClaudeModelEnvSnapshot> {
-        const SETTING: &str = "claude_model_env_before";
-        let mut snapshot = match self.db.setting(SETTING)? {
+        let mut snapshot = match self.db.setting(CLAUDE_MODEL_ENV_BEFORE_KEY)? {
             Some(stored) => serde_json::from_str::<config::ClaudeModelEnvSnapshot>(&stored)?,
             None => config::ClaudeModelEnvSnapshot::default(),
         };
@@ -996,9 +1011,47 @@ impl App {
             String::new()
         };
         snapshot.extend_uncovered(&text)?;
-        self.db
-            .set_setting(SETTING, &serde_json::to_string(&snapshot)?)?;
+        self.db.set_setting(
+            CLAUDE_MODEL_ENV_BEFORE_KEY,
+            &serde_json::to_string(&snapshot)?,
+        )?;
         Ok(snapshot)
+    }
+
+    /// Whether applying `provider` crosses or remains inside hsin's ownership of Claude's model
+    /// env keys. The active provider is still the old one while a switch or edit is prepared.
+    fn claude_model_mapping_transition(&self, provider: &Provider) -> Result<bool> {
+        if provider.client != ClientKind::Claude {
+            return Ok(false);
+        }
+        if claude_model_mapping_active(provider) {
+            return Ok(true);
+        }
+        // Older releases could switch the database to an unmapped provider in proxy mode without
+        // restoring the file. The retained snapshot is the durable evidence that hsin still owns
+        // those keys, even when neither the requested nor persisted active provider is mapped.
+        if self.db.setting(CLAUDE_MODEL_ENV_BEFORE_KEY)?.is_some() {
+            return Ok(true);
+        }
+        let state = self.db.client_state(ClientKind::Claude)?;
+        let Some(active_id) = state.active_provider_id else {
+            return Ok(false);
+        };
+        self.db
+            .get_provider(&active_id)
+            .map(|active| claude_model_mapping_active(&active))
+    }
+
+    /// Once a transition has restored the user's model env values, hsin releases those keys. A
+    /// later unmapped configuration write must leave any newer user or Claude Code changes alone.
+    fn release_claude_model_env_snapshot(&self, target: &ConfigTarget) -> Result<()> {
+        if target.client == ClientKind::Claude
+            && target.claude_model_env_before.is_some()
+            && !claude_model_mapping_active(&target.provider)
+        {
+            self.db.delete_setting(CLAUDE_MODEL_ENV_BEFORE_KEY)?;
+        }
+        Ok(())
     }
 
     fn config_credential(&self, target: &ConfigTarget) -> Result<Option<SecretString>> {
@@ -1274,6 +1327,7 @@ impl App {
         client_auth.set_disable_custom_auth(client, target.disable_custom_auth);
         self.db
             .set_setting("client_auth", &serde_json::to_string(&client_auth)?)?;
+        self.release_claude_model_env_snapshot(&target)?;
         Ok(RecoveryOutcome::Complete)
     }
 
@@ -3111,6 +3165,179 @@ mod tests {
         assert!(
             !cleared.contains("ANTHROPIC_DEFAULT_OPUS_MODEL"),
             "clearing the mapping should remove the key again: {cleared}"
+        );
+        assert!(
+            app.db
+                .setting(CLAUDE_MODEL_ENV_BEFORE_KEY)
+                .unwrap()
+                .is_none(),
+            "clearing the mapping should release ownership of the model env keys"
+        );
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn proxy_switches_restore_and_release_claude_model_mapping_keys() {
+        let root =
+            std::env::temp_dir().join(format!("hsind-mapping-switch-{}", uuid::Uuid::new_v4()));
+        let paths = Paths {
+            database: root.join("hsin.sqlite3"),
+            lock: root.join("hsind.lock"),
+            logs: root.join("logs"),
+            backups: root.join("backups"),
+            home: root.clone(),
+        };
+        let settings_path = root.join("claude/settings.json");
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        fs::write(
+            &settings_path,
+            "{\n  \"env\": {\n    \"ANTHROPIC_MODEL\": \"user-default\",\n    \"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"User Opus\"\n  },\n  \"permissions\": {\"allow\": [\"Read\"]}\n}\n",
+        )
+        .unwrap();
+        let app = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
+        *app.config_paths.write() = HashMap::from([
+            (ClientKind::Codex, root.join("codex/config.toml")),
+            (ClientKind::Claude, settings_path.clone()),
+        ]);
+        let mapped = app
+            .add_provider(ProviderAddParams {
+                provider: hsin_core::ProviderDraft {
+                    client: ClientKind::Claude,
+                    name: "Mapped Claude".into(),
+                    description: String::new(),
+                    base_url: "https://mapped.example.test".into(),
+                    auth_scheme: AuthScheme::XApiKey,
+                    model: None,
+                    claude_model_mapping: Some(hsin_core::ClaudeModelMapping {
+                        enabled: true,
+                        default_model: Some("mapped-default".into()),
+                        opus: Some(hsin_core::ModelSlot {
+                            model: "mapped-opus".into(),
+                            context_1m: false,
+                        }),
+                        ..hsin_core::ClaudeModelMapping::default()
+                    }),
+                },
+                secret: SecretInput::Replace("mapped-secret".into()),
+            })
+            .await
+            .unwrap();
+        let unmapped = app
+            .add_provider(ProviderAddParams {
+                provider: hsin_core::ProviderDraft {
+                    client: ClientKind::Claude,
+                    name: "Unmapped Claude".into(),
+                    description: String::new(),
+                    base_url: "https://unmapped.example.test".into(),
+                    auth_scheme: AuthScheme::XApiKey,
+                    model: None,
+                    claude_model_mapping: None,
+                },
+                secret: SecretInput::Replace("unmapped-secret".into()),
+            })
+            .await
+            .unwrap();
+
+        app.switch_provider(ProviderSwitchParams {
+            client: ClientKind::Claude,
+            provider_id: mapped.id.clone(),
+        })
+        .await
+        .unwrap();
+        let configured = fs::read_to_string(&settings_path).unwrap();
+        assert!(configured.contains("\"ANTHROPIC_MODEL\": \"mapped-default\""));
+        assert!(configured.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"mapped-opus\""));
+
+        // Proxy switches used to update only the database, leaving the previous provider's model
+        // names and default selected in Claude Code.
+        app.db
+            .set_mode(ClientKind::Claude, ConnectionMode::Proxy)
+            .unwrap();
+        app.switch_provider(ProviderSwitchParams {
+            client: ClientKind::Claude,
+            provider_id: unmapped.id.clone(),
+        })
+        .await
+        .unwrap();
+        let restored = fs::read_to_string(&settings_path).unwrap();
+        assert!(restored.contains("\"ANTHROPIC_MODEL\": \"user-default\""));
+        assert!(restored.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"User Opus\""));
+        assert!(!restored.contains("ANTHROPIC_DEFAULT_OPUS_MODEL\""));
+        assert!(!restored.contains("ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION"));
+        assert!(
+            app.db
+                .setting(CLAUDE_MODEL_ENV_BEFORE_KEY)
+                .unwrap()
+                .is_none()
+        );
+
+        // After release, ordinary unmapped configuration writes must preserve newer user values.
+        let latest = restored
+            .replace("user-default", "latest-default")
+            .replace("User Opus", "Latest Opus");
+        fs::write(&settings_path, latest).unwrap();
+        app.set_mode(ClientKind::Claude, ConnectionMode::Direct)
+            .await
+            .unwrap();
+        let untouched = fs::read_to_string(&settings_path).unwrap();
+        assert!(untouched.contains("\"ANTHROPIC_MODEL\": \"latest-default\""));
+        assert!(untouched.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"Latest Opus\""));
+
+        // Re-entering mapping captures the latest values, and the next proxy switch restores them.
+        app.db
+            .set_mode(ClientKind::Claude, ConnectionMode::Proxy)
+            .unwrap();
+        app.switch_provider(ProviderSwitchParams {
+            client: ClientKind::Claude,
+            provider_id: mapped.id.clone(),
+        })
+        .await
+        .unwrap();
+        assert!(
+            app.db
+                .setting(CLAUDE_MODEL_ENV_BEFORE_KEY)
+                .unwrap()
+                .is_some()
+        );
+        app.switch_provider(ProviderSwitchParams {
+            client: ClientKind::Claude,
+            provider_id: unmapped.id.clone(),
+        })
+        .await
+        .unwrap();
+        let restored_again = fs::read_to_string(&settings_path).unwrap();
+        assert!(restored_again.contains("\"ANTHROPIC_MODEL\": \"latest-default\""));
+        assert!(restored_again.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"Latest Opus\""));
+        assert!(
+            app.db
+                .setting(CLAUDE_MODEL_ENV_BEFORE_KEY)
+                .unwrap()
+                .is_none()
+        );
+
+        // Releases before this fix could persist the unmapped provider without touching the file.
+        // Startup reconciliation must treat the retained snapshot as ownership and repair it.
+        app.switch_provider(ProviderSwitchParams {
+            client: ClientKind::Claude,
+            provider_id: mapped.id,
+        })
+        .await
+        .unwrap();
+        app.db
+            .set_active(ClientKind::Claude, &unmapped.id, "synchronized")
+            .unwrap();
+        app.reconcile_proxy_configurations().unwrap();
+        let migrated = fs::read_to_string(&settings_path).unwrap();
+        assert!(migrated.contains("\"ANTHROPIC_MODEL\": \"latest-default\""));
+        assert!(migrated.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"Latest Opus\""));
+        assert!(
+            app.db
+                .setting(CLAUDE_MODEL_ENV_BEFORE_KEY)
+                .unwrap()
+                .is_none()
         );
 
         drop(app);

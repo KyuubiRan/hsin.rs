@@ -49,8 +49,9 @@ pub struct ConfigTarget {
     pub disable_custom_auth: bool,
     #[serde(default)]
     pub codex_auth_before_hash: Option<String>,
-    /// Values the user had for the model-mapping env keys before hsin first took them over.
-    /// Restored whenever a tier is not mapped, so disabling the mapping is non-destructive.
+    /// Values the user had for the model-mapping env keys before hsin took them over.
+    /// `None` means this operation does not own or modify any model-mapping key; `Some` applies an
+    /// active mapping or restores the snapshot once while leaving a mapping.
     #[serde(default)]
     pub claude_model_env_before: Option<ClaudeModelEnvSnapshot>,
 }
@@ -755,15 +756,19 @@ pub fn patch_claude_with_credential(
 
 /// Write the per-provider model mapping into `env`.
 ///
-/// Every key is written on every apply: a mapped tier gets the provider's model ID, an unmapped
-/// tier is restored to the value the user had before hsin took the key over (or removed when they
-/// had none). That keeps switching providers, and disabling the mapping, non-destructive.
+/// While hsin owns the keys, a mapped tier gets the provider's model ID and an unmapped tier is
+/// restored to the value the user had before hsin took it over (or removed when they had none).
+/// With no active mapping and no restoration snapshot, the whole block is left byte-for-byte
+/// untouched.
 fn patch_claude_model_mapping(text: &str, target: &ConfigTarget) -> Result<String> {
     let mapping = target
         .provider
         .claude_model_mapping
         .as_ref()
-        .filter(|mapping| !target.provider.official && mapping.enabled);
+        .filter(|mapping| !target.provider.official && !mapping.is_inert());
+    if mapping.is_none() && target.claude_model_env_before.is_none() {
+        return Ok(text.to_owned());
+    }
     let snapshot = target.claude_model_env_before.clone().unwrap_or_default();
     let mut output = text.to_owned();
     for key in CLAUDE_MODEL_ENV_KEYS {
@@ -1972,6 +1977,7 @@ mod tests {
     #[test]
     fn a_provider_without_a_mapping_removes_keys_the_user_never_set() {
         let mut claude = target(ClientKind::Claude);
+        claude.claude_model_env_before = Some(ClaudeModelEnvSnapshot::default());
         claude.provider.claude_model_mapping = Some(hsin_core::ClaudeModelMapping {
             enabled: true,
             opus: Some(mapped("claude-opus-5", false)),
@@ -1984,6 +1990,28 @@ mod tests {
         claude.provider.claude_model_mapping = None;
         let cleared = patch_claude_with_credential(&managed, &claude, None).unwrap();
         assert!(!cleared.contains("ANTHROPIC_DEFAULT_OPUS_MODEL"));
+    }
+
+    #[test]
+    fn an_unmanaged_claude_mapping_leaves_all_model_keys_untouched() {
+        let original = "{\n  \"env\": {\n    \"ANTHROPIC_MODEL\": \"user-default\",\n    \"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"User Opus\",\n    \"ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION\": \"keep this\"\n  }\n}\n";
+        let mut claude = target(ClientKind::Claude);
+
+        assert_eq!(
+            patch_claude_model_mapping(original, &claude).unwrap(),
+            original
+        );
+
+        claude.provider.claude_model_mapping = Some(hsin_core::ClaudeModelMapping {
+            enabled: false,
+            default_model: Some("ignored".into()),
+            opus: Some(mapped("ignored", false)),
+            ..hsin_core::ClaudeModelMapping::default()
+        });
+        assert_eq!(
+            patch_claude_model_mapping(original, &claude).unwrap(),
+            original
+        );
     }
 
     #[test]
