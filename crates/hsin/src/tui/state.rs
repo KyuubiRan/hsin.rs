@@ -190,34 +190,28 @@ pub(super) struct FormSubmission {
 }
 
 /// The Claude model tiers, in display order. The default is the ghost text shown in an empty box
-/// and completed by tab; `context_1m` marks the tiers that actually have a 1M-context variant.
+/// and completed by tab.
 pub(super) struct MappingTier {
     pub(super) label: &'static str,
     pub(super) default_model: &'static str,
-    pub(super) context_1m: bool,
 }
 
 pub(super) const MAPPING_TIERS: [MappingTier; 4] = [
     MappingTier {
         label: "Fable",
         default_model: "claude-fable-5",
-        context_1m: true,
     },
     MappingTier {
         label: "Opus",
         default_model: "claude-opus-5",
-        context_1m: true,
     },
     MappingTier {
         label: "Sonnet",
         default_model: "claude-sonnet-5",
-        context_1m: true,
     },
     MappingTier {
-        // Haiku 4.5 has no 1M-context variant upstream, so it gets no checkbox.
         label: "Haiku",
         default_model: "claude-haiku-4-5",
-        context_1m: false,
     },
 ];
 
@@ -290,7 +284,7 @@ impl ModelMappingForm {
             let model = row.model.trim();
             (!model.is_empty()).then(|| ModelSlot {
                 model: model.to_owned(),
-                context_1m: row.context_1m && MAPPING_TIERS[index].context_1m,
+                context_1m: row.context_1m,
             })
         };
         let default_model = self.default_model.trim();
@@ -602,9 +596,7 @@ impl State {
                 KeyCode::Char(' ') => {
                     if mapping.field == 1 {
                         mapping.default_context_1m = !mapping.default_context_1m;
-                    } else if let Some(row) = mapping.field.checked_sub(2)
-                        && MAPPING_TIERS[row].context_1m
-                    {
+                    } else if let Some(row) = mapping.field.checked_sub(2) {
                         mapping.rows[row].context_1m = !mapping.rows[row].context_1m;
                     }
                 }

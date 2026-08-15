@@ -1963,12 +1963,12 @@ mod tests {
             fable: Some(mapped("claude-fable-5", false)),
             opus: Some(mapped("claude-opus-5", true)),
             sonnet: None,
-            haiku: Some(mapped("claude-haiku-4-5", false)),
+            haiku: Some(mapped("deepseek-flash", true)),
         });
         let output = patch_claude_with_credential("", &claude, None).unwrap();
         assert!(output.contains("\"ANTHROPIC_DEFAULT_FABLE_MODEL\": \"claude-fable-5\""));
         assert!(output.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL\": \"claude-opus-5[1m]\""));
-        assert!(output.contains("\"ANTHROPIC_DEFAULT_HAIKU_MODEL\": \"claude-haiku-4-5\""));
+        assert!(output.contains("\"ANTHROPIC_DEFAULT_HAIKU_MODEL\": \"deepseek-flash[1m]\""));
         // An unmapped tier is not written at all rather than being blanked out.
         assert!(!output.contains("\"ANTHROPIC_DEFAULT_SONNET_MODEL\""));
 

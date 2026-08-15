@@ -2134,13 +2134,20 @@ fn control_u_clears_the_focused_mapping_row() {
 }
 
 #[test]
-fn the_haiku_tier_cannot_request_1m_context() {
-    // claude-haiku-4-5 has no 1M variant upstream, so the row renders no checkbox and the toggle
-    // key is inert there.
+fn the_haiku_tier_can_request_1m_context_for_a_custom_model() {
+    // Haiku is only the Claude Code tier name. Its mapping may point at a third-party model that
+    // supports 1M context, so the row must expose the same checkbox as every other tier.
     let mut state = mapping_state(None);
     state.reduce(key(KeyCode::Char(' ')));
     focus_tier(&mut state, 3);
-    state.reduce(key(KeyCode::Tab));
+    let rendered = render(&mut state, 100, 32);
+    let haiku_row = rendered
+        .lines()
+        .find(|line| line.contains("Haiku"))
+        .expect("Haiku row");
+    assert!(haiku_row.contains("1M"));
+
+    type_query(&mut state, "deepseek-flash");
     state.reduce(key(KeyCode::Char(' ')));
 
     state.reduce(key(KeyCode::Enter));
@@ -2150,8 +2157,8 @@ fn the_haiku_tier_cannot_request_1m_context() {
     assert_eq!(
         mapping.haiku,
         Some(ModelSlot {
-            model: "claude-haiku-4-5".into(),
-            context_1m: false,
+            model: "deepseek-flash".into(),
+            context_1m: true,
         })
     );
 }

@@ -59,7 +59,7 @@ pub(super) fn draw_model_mapping(
     );
 
     if rows > 1 {
-        let (field_area, checkbox_area) = model_row_areas(row(1), true);
+        let (field_area, checkbox_area) = model_row_areas(row(1));
         let selected = mapping.enabled && mapping.field == 1;
         draw_input_field(
             frame,
@@ -70,16 +70,14 @@ pub(super) fn draw_model_mapping(
             selected.then_some(mapping.cursor),
             mapping.enabled,
         );
-        if let Some(checkbox_area) = checkbox_area {
-            draw_checkbox(
-                frame,
-                checkbox_area,
-                mapping.default_context_1m,
-                selected,
-                mapping.enabled,
-                i18n,
-            );
-        }
+        draw_checkbox(
+            frame,
+            checkbox_area,
+            mapping.default_context_1m,
+            selected,
+            mapping.enabled,
+            i18n,
+        );
     }
 
     for (index, tier) in MAPPING_TIERS.iter().enumerate() {
@@ -92,8 +90,7 @@ pub(super) fn draw_model_mapping(
         let area = row(offset);
         let selected = mapping.enabled && mapping.field == index + 2;
         let value = &mapping.rows[index];
-        // Only the tiers with a 1M variant reserve room for a checkbox; Haiku uses the full width.
-        let (field_area, checkbox_area) = model_row_areas(area, tier.context_1m);
+        let (field_area, checkbox_area) = model_row_areas(area);
         draw_input_field(
             frame,
             field_area,
@@ -103,35 +100,29 @@ pub(super) fn draw_model_mapping(
             selected.then_some(mapping.cursor),
             mapping.enabled,
         );
-        if let Some(checkbox_area) = checkbox_area {
-            draw_checkbox(
-                frame,
-                checkbox_area,
-                value.context_1m,
-                selected,
-                mapping.enabled,
-                i18n,
-            );
-        }
+        draw_checkbox(
+            frame,
+            checkbox_area,
+            value.context_1m,
+            selected,
+            mapping.enabled,
+            i18n,
+        );
     }
 }
 
-fn model_row_areas(area: Rect, include_checkbox: bool) -> (Rect, Option<Rect>) {
-    if !include_checkbox {
-        return (area, None);
-    }
-
+fn model_row_areas(area: Rect) -> (Rect, Rect) {
     let field_width = area.width.saturating_sub(CHECKBOX_WIDTH);
     (
         Rect {
             width: field_width,
             ..area
         },
-        Some(Rect {
+        Rect {
             x: area.x.saturating_add(field_width),
             width: CHECKBOX_WIDTH,
             ..area
-        }),
+        },
     )
 }
 

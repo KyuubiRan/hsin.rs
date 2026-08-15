@@ -415,9 +415,8 @@ impl ClaudeModelMapping {
     ///
     /// # Errors
     ///
-    /// Returns [`ValidationError`] when the mapping is attached to a non-Claude provider, the
-    /// default model or a mapped model ID is empty or oversized, or 1M context is requested for
-    /// the Haiku tier (which has no 1M variant upstream).
+    /// Returns [`ValidationError`] when the mapping is attached to a non-Claude provider, or the
+    /// default model or a mapped model ID is empty or oversized.
     pub fn validate(&self, client: ClientKind) -> Result<(), ValidationError> {
         if client != ClientKind::Claude {
             return Err(ValidationError::new(
@@ -447,12 +446,6 @@ impl ClaudeModelMapping {
             if slot.model.chars().count() > 256 {
                 return Err(ValidationError::new(field, "too_long"));
             }
-        }
-        if self.haiku.as_ref().is_some_and(|slot| slot.context_1m) {
-            return Err(ValidationError::new(
-                CLAUDE_HAIKU_MODEL_ENV,
-                "context_1m_unsupported",
-            ));
         }
         Ok(())
     }
@@ -1390,13 +1383,18 @@ mod claude_model_mapping_tests {
         };
         assert!(empty.validate(ClientKind::Claude).is_err());
 
-        // claude-haiku-4-5 has no 1M-context variant upstream.
+        // A tier can map to any upstream model, so support is determined by that model rather than
+        // the first-party Claude model used as the tier's placeholder.
         let haiku_1m = ClaudeModelMapping {
             enabled: true,
-            haiku: Some(slot("claude-haiku-4-5", true)),
+            haiku: Some(slot("deepseek-flash", true)),
             ..ClaudeModelMapping::default()
         };
-        assert!(haiku_1m.validate(ClientKind::Claude).is_err());
+        assert!(haiku_1m.validate(ClientKind::Claude).is_ok());
+        assert_eq!(
+            haiku_1m.env_value(CLAUDE_HAIKU_MODEL_ENV).as_deref(),
+            Some("deepseek-flash[1m]")
+        );
 
         let default_1m_without_model = ClaudeModelMapping {
             enabled: true,
