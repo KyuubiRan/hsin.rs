@@ -36,6 +36,7 @@ use crate::{
 
 const CODEX_AUTH_BACKUP_KEY: &str = "codex_auth_backup_v1";
 const CLAUDE_MODEL_ENV_BEFORE_KEY: &str = "claude_model_env_before";
+const CLAUDE_MODEL_NAMES_ENABLED_KEY: &str = "claude_model_names_enabled";
 /// Records that the operator holds a copy of the current master key. Losing the
 /// keyring entry without one is unrecoverable, so this must track the actual
 /// export instead of merely asserting that a key exists.
@@ -856,7 +857,7 @@ impl App {
     }
 
     fn apply_configuration(&self, provider: &Provider, mode: ConnectionMode) -> Result<()> {
-        self.apply_configuration_with_auth(provider, mode, None)
+        self.apply_configuration_with_overrides(provider, mode, None, None)
     }
 
     fn apply_configuration_with_auth(
@@ -864,6 +865,25 @@ impl App {
         provider: &Provider,
         mode: ConnectionMode,
         disable_custom_auth: Option<bool>,
+    ) -> Result<()> {
+        self.apply_configuration_with_overrides(provider, mode, disable_custom_auth, None)
+    }
+
+    fn apply_configuration_with_model_names(
+        &self,
+        provider: &Provider,
+        mode: ConnectionMode,
+        enabled: bool,
+    ) -> Result<()> {
+        self.apply_configuration_with_overrides(provider, mode, None, Some(enabled))
+    }
+
+    fn apply_configuration_with_overrides(
+        &self,
+        provider: &Provider,
+        mode: ConnectionMode,
+        disable_custom_auth: Option<bool>,
+        claude_model_names_enabled: Option<bool>,
     ) -> Result<()> {
         if mode == ConnectionMode::Proxy && provider.auth_scheme == AuthScheme::OAuth {
             return Err(DaemonError::OAuthProxyUnsupported);
@@ -880,7 +900,12 @@ impl App {
                     .into(),
             ));
         }
-        let target = self.config_target(provider, mode, disable_custom_auth)?;
+        let target = self.config_target_with_overrides(
+            provider,
+            mode,
+            disable_custom_auth,
+            claude_model_names_enabled,
+        )?;
         let credential = self.config_credential(&target)?;
         let path = self.config_path(provider.client)?;
         let before_hash = config::file_hash(&path)?;
@@ -951,6 +976,10 @@ impl App {
             self.db
                 .set_setting("client_auth", &serde_json::to_string(&client_auth)?)?;
         }
+        if let Some(enabled) = claude_model_names_enabled {
+            self.db
+                .set_setting(CLAUDE_MODEL_NAMES_ENABLED_KEY, &enabled.to_string())?;
+        }
         self.release_claude_model_env_snapshot(&target)?;
         self.db.finish_operation(&operation, "complete", None)?;
         Ok(())
@@ -962,6 +991,16 @@ impl App {
         mode: ConnectionMode,
         disable_custom_auth: Option<bool>,
     ) -> Result<ConfigTarget> {
+        self.config_target_with_overrides(provider, mode, disable_custom_auth, None)
+    }
+
+    fn config_target_with_overrides(
+        &self,
+        provider: &Provider,
+        mode: ConnectionMode,
+        disable_custom_auth: Option<bool>,
+        claude_model_names_enabled: Option<bool>,
+    ) -> Result<ConfigTarget> {
         let codex_auth_before_hash = if provider.client == ClientKind::Codex {
             let config_path = self.config_path(ClientKind::Codex)?;
             config::file_hash(&config::codex_auth_path(&config_path)?)?
@@ -969,8 +1008,10 @@ impl App {
             None
         };
         let claude_model_env_before = if provider.client == ClientKind::Claude {
+            let refresh_model_names =
+                claude_model_names_enabled == Some(true) && !self.claude_model_names_enabled()?;
             self.claude_model_mapping_transition(provider)?
-                .then(|| self.claude_model_env_snapshot())
+                .then(|| self.claude_model_env_snapshot(refresh_model_names))
                 .transpose()?
         } else {
             None
@@ -984,6 +1025,9 @@ impl App {
             proxy_port: self.proxy_port()?,
             disable_custom_auth: disable_custom_auth
                 .unwrap_or(self.disable_custom_auth(provider.client)?),
+            claude_model_names_enabled: claude_model_names_enabled
+                .unwrap_or(self.claude_model_names_enabled()?),
+            claude_model_names_update: claude_model_names_enabled,
             codex_auth_before_hash,
             claude_model_env_before,
         })
@@ -996,12 +1040,15 @@ impl App {
     /// A snapshot taken by an older hsin only covers the keys that version owned. The keys added
     /// since are still the user's own in the file, so they are captured now rather than being
     /// overwritten unrecorded.
-    fn claude_model_env_snapshot(&self) -> Result<config::ClaudeModelEnvSnapshot> {
+    fn claude_model_env_snapshot(
+        &self,
+        refresh_model_names: bool,
+    ) -> Result<config::ClaudeModelEnvSnapshot> {
         let mut snapshot = match self.db.setting(CLAUDE_MODEL_ENV_BEFORE_KEY)? {
             Some(stored) => serde_json::from_str::<config::ClaudeModelEnvSnapshot>(&stored)?,
             None => config::ClaudeModelEnvSnapshot::default(),
         };
-        if snapshot.is_complete() {
+        if snapshot.is_complete() && !refresh_model_names {
             return Ok(snapshot);
         }
         let path = self.config_path(ClientKind::Claude)?;
@@ -1011,6 +1058,9 @@ impl App {
             String::new()
         };
         snapshot.extend_uncovered(&text)?;
+        if refresh_model_names {
+            snapshot.refresh_model_names(&text)?;
+        }
         self.db.set_setting(
             CLAUDE_MODEL_ENV_BEFORE_KEY,
             &serde_json::to_string(&snapshot)?,
@@ -1327,6 +1377,10 @@ impl App {
         client_auth.set_disable_custom_auth(client, target.disable_custom_auth);
         self.db
             .set_setting("client_auth", &serde_json::to_string(&client_auth)?)?;
+        if let Some(enabled) = target.claude_model_names_update {
+            self.db
+                .set_setting(CLAUDE_MODEL_NAMES_ENABLED_KEY, &enabled.to_string())?;
+        }
         self.release_claude_model_env_snapshot(&target)?;
         Ok(RecoveryOutcome::Complete)
     }
@@ -1356,6 +1410,7 @@ impl App {
             proxy_enabled: self.proxy_enabled(),
             clients: self.client_settings()?,
             client_auth: self.client_auth_settings()?,
+            claude_model_names_enabled: self.claude_model_names_enabled()?,
         })
     }
 
@@ -1379,6 +1434,32 @@ impl App {
             .map_err(|error| DaemonError::Config(format!("invalid client auth settings: {error}")))
     }
 
+    fn claude_model_names_enabled(&self) -> Result<bool> {
+        let Some(value) = self.db.setting(CLAUDE_MODEL_NAMES_ENABLED_KEY)? else {
+            return Ok(true);
+        };
+        serde_json::from_str(&value).map_err(|error| {
+            DaemonError::Config(format!("invalid Claude model-name setting: {error}"))
+        })
+    }
+
+    fn update_claude_model_names_setting(&self, enabled: Option<bool>) -> Result<()> {
+        let Some(enabled) = enabled else {
+            return Ok(());
+        };
+        if enabled == self.claude_model_names_enabled()? {
+            return Ok(());
+        }
+        let state = self.db.client_state(ClientKind::Claude)?;
+        if let Some(provider_id) = state.active_provider_id {
+            let provider = self.db.get_provider(&provider_id)?;
+            self.apply_configuration_with_model_names(&provider, state.mode, enabled)
+        } else {
+            self.db
+                .set_setting(CLAUDE_MODEL_NAMES_ENABLED_KEY, &enabled.to_string())
+        }
+    }
+
     pub fn disable_custom_auth(&self, client: ClientKind) -> Result<bool> {
         Ok(self.client_auth_settings()?.disable_custom_auth(client))
     }
@@ -1392,6 +1473,7 @@ impl App {
             proxy_enabled,
             clients,
             client_auth,
+            claude_model_names_enabled,
         } = patch;
         if clients.as_ref().is_some_and(|clients| !clients.is_valid()) {
             return Err(DaemonError::Invalid(
@@ -1467,6 +1549,7 @@ impl App {
                     .set_setting("client_auth", &serde_json::to_string(&client_auth)?)?;
             }
         }
+        self.update_claude_model_names_setting(claude_model_names_enabled)?;
         if proxy_enabled == Some(true) {
             self.set_proxy_enabled_locked(true).await?;
         }
@@ -2010,6 +2093,7 @@ mod tests {
                 proxy_enabled: None,
                 clients: Some(clients.clone()),
                 client_auth: None,
+                claude_model_names_enabled: None,
             })
             .await
             .unwrap();
@@ -2027,6 +2111,7 @@ mod tests {
                     visible: Vec::new(),
                 }),
                 client_auth: None,
+                claude_model_names_enabled: None,
             })
             .await;
         assert!(matches!(invalid, Err(DaemonError::Invalid(_))));
@@ -2111,6 +2196,7 @@ mod tests {
                     client: ClientKind::Codex,
                     disable_custom_auth: true,
                 }),
+                claude_model_names_enabled: None,
             })
             .await
             .unwrap();
@@ -2151,6 +2237,7 @@ mod tests {
                     client: ClientKind::Codex,
                     disable_custom_auth: false,
                 }),
+                claude_model_names_enabled: None,
             })
             .await
             .unwrap();
@@ -2183,6 +2270,7 @@ mod tests {
                 client: ClientKind::Codex,
                 disable_custom_auth: true,
             }),
+            claude_model_names_enabled: None,
         })
         .await
         .unwrap();
@@ -2926,6 +3014,7 @@ mod tests {
                 proxy_enabled: None,
                 clients: None,
                 client_auth: None,
+                claude_model_names_enabled: None,
             })
             .await
             .unwrap();
@@ -2978,6 +3067,7 @@ mod tests {
                 client: ClientKind::Codex,
                 disable_custom_auth: true,
             }),
+            claude_model_names_enabled: None,
         })
         .await
         .unwrap();
@@ -3010,6 +3100,7 @@ mod tests {
                 proxy_enabled: None,
                 clients: None,
                 client_auth: None,
+                claude_model_names_enabled: None,
             })
             .await
             .unwrap();
@@ -3058,6 +3149,7 @@ mod tests {
             proxy_enabled: Some(false),
             clients: None,
             client_auth: None,
+            claude_model_names_enabled: None,
         })
         .await
         .unwrap();
@@ -3078,6 +3170,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn editing_the_mapping_rewrites_the_active_claude_configuration_in_proxy_mode() {
         // The mapping env keys live in settings.json whichever mode the client runs in, so an edit
         // that only changes the mapping still has to reach the file the proxy left alone.
@@ -3090,6 +3183,12 @@ mod tests {
             home: root.clone(),
         };
         let settings_path = root.join("claude/settings.json");
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        fs::write(
+            &settings_path,
+            "{\n  \"model\": \"claude-opus-5[1m]\",\n  \"env\": {\n    \"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"User Opus\",\n    \"ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION\": \"User description\"\n  }\n}\n",
+        )
+        .unwrap();
         let app = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
         *app.config_paths.write() = HashMap::from([
             (ClientKind::Codex, root.join("codex/config.toml")),
@@ -3149,6 +3248,75 @@ mod tests {
             configured.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL\": \"deepseek-v4-flash[1m]\""),
             "the mapped tier should be written in proxy mode: {configured}"
         );
+        assert!(
+            configured.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"deepseek-v4-flash\"")
+        );
+        assert!(app.settings().unwrap().claude_model_names_enabled);
+
+        let settings = app
+            .update_settings(SettingsPatch {
+                language: None,
+                proxy_host: None,
+                proxy_port: None,
+                proxy_enabled: None,
+                clients: None,
+                client_auth: None,
+                claude_model_names_enabled: Some(false),
+            })
+            .await
+            .unwrap();
+        assert!(!settings.claude_model_names_enabled);
+        let unnamed = fs::read_to_string(&settings_path).unwrap();
+        assert!(unnamed.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL\": \"deepseek-v4-flash[1m]\""));
+        assert!(unnamed.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"User Opus\""));
+        assert!(
+            unnamed.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION\": \"User description\"")
+        );
+        assert!(unnamed.contains("\"model\": \"claude-opus-5[1m]\""));
+
+        let latest_user_names = unnamed
+            .replace("User Opus", "Latest User Opus")
+            .replace("User description", "Latest user description");
+        fs::write(&settings_path, latest_user_names).unwrap();
+        app.apply_configuration(&mapped, ConnectionMode::Proxy)
+            .unwrap();
+        let untouched = fs::read_to_string(&settings_path).unwrap();
+        assert!(untouched.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"Latest User Opus\""));
+
+        app.update_settings(SettingsPatch {
+            language: None,
+            proxy_host: None,
+            proxy_port: None,
+            proxy_enabled: None,
+            clients: None,
+            client_auth: None,
+            claude_model_names_enabled: Some(true),
+        })
+        .await
+        .unwrap();
+        let renamed = fs::read_to_string(&settings_path).unwrap();
+        assert!(renamed.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"deepseek-v4-flash\""));
+
+        app.update_settings(SettingsPatch {
+            language: None,
+            proxy_host: None,
+            proxy_port: None,
+            proxy_enabled: None,
+            clients: None,
+            client_auth: None,
+            claude_model_names_enabled: Some(false),
+        })
+        .await
+        .unwrap();
+        let restored_latest = fs::read_to_string(&settings_path).unwrap();
+        assert!(
+            restored_latest.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"Latest User Opus\"")
+        );
+        assert!(
+            restored_latest.contains(
+                "\"ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION\": \"Latest user description\""
+            )
+        );
 
         app.edit_provider(ProviderEditParams {
             id: mapped.id.clone(),
@@ -3163,7 +3331,7 @@ mod tests {
         .unwrap();
         let cleared = fs::read_to_string(&settings_path).unwrap();
         assert!(
-            !cleared.contains("ANTHROPIC_DEFAULT_OPUS_MODEL"),
+            !cleared.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL\":"),
             "clearing the mapping should remove the key again: {cleared}"
         );
         assert!(

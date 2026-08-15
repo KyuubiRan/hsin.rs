@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use toml_edit::{DocumentMut, ImDocument, Item, Table, value};
 use zeroize::{Zeroize, Zeroizing};
 
-use hsin_core::CLAUDE_MODEL_ENV_KEYS;
+use hsin_core::{CLAUDE_MODEL_ENV_KEYS, CLAUDE_MODEL_NAME_ENV_KEYS};
 
 use crate::{
     error::{DaemonError, Result},
@@ -47,6 +47,11 @@ pub struct ConfigTarget {
     pub proxy_port: u16,
     #[serde(default)]
     pub disable_custom_auth: bool,
+    #[serde(default = "default_true")]
+    pub claude_model_names_enabled: bool,
+    /// Present only when this operation also changes the persisted client-level switch.
+    #[serde(default)]
+    pub claude_model_names_update: Option<bool>,
     #[serde(default)]
     pub codex_auth_before_hash: Option<String>,
     /// Values the user had for the model-mapping env keys before hsin took them over.
@@ -54,6 +59,10 @@ pub struct ConfigTarget {
     /// active mapping or restores the snapshot once while leaving a mapping.
     #[serde(default)]
     pub claude_model_env_before: Option<ClaudeModelEnvSnapshot>,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 /// The user's own values for the env keys owned by [`ClaudeModelMapping`], captured once before
@@ -134,6 +143,19 @@ impl ClaudeModelEnvSnapshot {
             if self.covered.insert(key.to_owned())
                 && let Some(value) = fresh.get(key)
             {
+                self.values.insert(key.to_owned(), value.to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    /// Refresh the picker-name subset after hsin has released those keys to the user.
+    pub fn refresh_model_names(&mut self, text: &str) -> Result<()> {
+        let fresh = Self::capture(text)?;
+        for key in CLAUDE_MODEL_NAME_ENV_KEYS {
+            self.covered.insert(key.to_owned());
+            self.values.remove(key);
+            if let Some(value) = fresh.get(key) {
                 self.values.insert(key.to_owned(), value.to_owned());
             }
         }
@@ -772,7 +794,18 @@ fn patch_claude_model_mapping(text: &str, target: &ConfigTarget) -> Result<Strin
     let snapshot = target.claude_model_env_before.clone().unwrap_or_default();
     let mut output = text.to_owned();
     for key in CLAUDE_MODEL_ENV_KEYS {
-        let mapped = mapping.and_then(|mapping| mapping.env_value(key));
+        let name_key = CLAUDE_MODEL_NAME_ENV_KEYS.contains(&key);
+        if name_key
+            && !target.claude_model_names_enabled
+            && target.claude_model_names_update != Some(false)
+        {
+            continue;
+        }
+        let mapped = mapping.and_then(|mapping| {
+            (!name_key || target.claude_model_names_enabled)
+                .then(|| mapping.env_value(key))
+                .flatten()
+        });
         let value = mapped.as_deref().or_else(|| snapshot.get(key));
         output = set_nested_string(&output, "env", key, value)?;
     }
@@ -1491,6 +1524,8 @@ mod tests {
             proxy_host: "127.0.0.1".into(),
             proxy_port: 9999,
             disable_custom_auth: false,
+            claude_model_names_enabled: true,
+            claude_model_names_update: None,
             codex_auth_before_hash: None,
             claude_model_env_before: None,
         }
@@ -1946,6 +1981,38 @@ mod tests {
             "\"ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION\": \"Opus → claude-opus-5[1m]\""
         ));
         assert!(!output.contains("ANTHROPIC_DEFAULT_SONNET_MODEL_NAME"));
+    }
+
+    #[test]
+    fn disabling_model_name_mapping_restores_names_without_changing_routing() {
+        let original = "{\n  \"model\": \"claude-opus-5[1m]\",\n  \"env\": {\n    \"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"User Opus\",\n    \"ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION\": \"User description\"\n  }\n}\n";
+        let snapshot = ClaudeModelEnvSnapshot::capture(original).unwrap();
+        let mut claude = target(ClientKind::Claude);
+        claude.claude_model_env_before = Some(snapshot);
+        claude.provider.claude_model_mapping = Some(hsin_core::ClaudeModelMapping {
+            enabled: true,
+            opus: Some(mapped("deepseek-v4-pro", true)),
+            ..hsin_core::ClaudeModelMapping::default()
+        });
+
+        let named = patch_claude_with_credential(original, &claude, None).unwrap();
+        assert!(named.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL\": \"deepseek-v4-pro[1m]\""));
+        assert!(named.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"deepseek-v4-pro\""));
+
+        claude.claude_model_names_enabled = false;
+        claude.claude_model_names_update = Some(false);
+        let restored = patch_claude_with_credential(&named, &claude, None).unwrap();
+        assert!(restored.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL\": \"deepseek-v4-pro[1m]\""));
+        assert!(restored.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"User Opus\""));
+        assert!(
+            restored.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION\": \"User description\"")
+        );
+        assert!(restored.contains("\"model\": \"claude-opus-5[1m]\""));
+
+        claude.claude_model_names_update = None;
+        let user_changed = restored.replace("User Opus", "Latest User Opus");
+        let untouched = patch_claude_with_credential(&user_changed, &claude, None).unwrap();
+        assert!(untouched.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"Latest User Opus\""));
     }
 
     #[test]

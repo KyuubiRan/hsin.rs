@@ -348,6 +348,36 @@ fn client_configuration_toggles_custom_auth_per_client() {
 }
 
 #[test]
+fn claude_client_configuration_toggles_model_name_mapping() {
+    let mut state = State {
+        loading: false,
+        input: InputMode::Settings(SettingsScreen {
+            selected: 1,
+            page: SettingsPage::ClientConfig {
+                client: ClientKind::Claude,
+                selected: 1,
+            },
+        }),
+        ..State::default()
+    };
+
+    assert!(state.claude_model_names_enabled);
+    state.reduce(key(KeyCode::Enter));
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::SetClaudeModelNames(false))
+    ));
+
+    state.claude_model_names_enabled = false;
+    state.loading = false;
+    state.reduce(key(KeyCode::Enter));
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::SetClaudeModelNames(true))
+    ));
+}
+
+#[test]
 fn home_p_toggles_the_current_client_proxy_mode() {
     let mut state = State::default();
     state.status.codex_active_provider = Some("provider-1".into());
@@ -625,6 +655,10 @@ fn proxy_settings_edits_address_and_port_while_enabled() {
 #[test]
 fn client_configuration_imports_the_corresponding_current_provider() {
     for client in ClientKind::ALL {
+        let import_index = match client {
+            ClientKind::Codex => 1,
+            ClientKind::Claude => 2,
+        };
         let mut state = State {
             input: InputMode::Settings(SettingsScreen {
                 selected: match client {
@@ -638,7 +672,9 @@ fn client_configuration_imports_the_corresponding_current_provider() {
             }),
             ..State::default()
         };
-        state.reduce(key(KeyCode::Down));
+        for _ in 0..import_index {
+            state.reduce(key(KeyCode::Down));
+        }
         state.reduce(key(KeyCode::Enter));
         assert!(matches!(
             state.take_effect(),
@@ -647,9 +683,9 @@ fn client_configuration_imports_the_corresponding_current_provider() {
         assert!(matches!(
             state.input,
             InputMode::Settings(SettingsScreen {
-                page: SettingsPage::ClientConfig { selected: 1, .. },
+                page: SettingsPage::ClientConfig { selected, .. },
                 ..
-            })
+            }) if selected == import_index
         ));
     }
 }
@@ -1710,7 +1746,7 @@ fn client_configuration_renders_import_current_provider() {
             selected: 1,
             page: SettingsPage::ClientConfig {
                 client: ClientKind::Claude,
-                selected: 1,
+                selected: 2,
             },
         }),
         ..State::default()
@@ -1732,6 +1768,25 @@ fn client_configuration_renders_import_current_provider() {
     assert!(rendered.contains("A new Provider is created only when"));
     assert!(!rendered.contains("Import all"));
     assert!(!rendered.contains("reduces security"));
+}
+
+#[test]
+fn claude_client_configuration_renders_model_name_mapping_on_by_default() {
+    let mut state = State {
+        loading: false,
+        input: InputMode::Settings(SettingsScreen {
+            selected: 1,
+            page: SettingsPage::ClientConfig {
+                client: ClientKind::Claude,
+                selected: 1,
+            },
+        }),
+        ..State::default()
+    };
+    let rendered = render(&mut state, 80, 24);
+    assert!(rendered.contains("Map model names"));
+    assert!(rendered.contains("upstream model IDs"));
+    assert!(rendered.contains("[on]"));
 }
 
 fn rendered_with(status: crate::rpc::StatusSnapshot) -> String {

@@ -60,6 +60,7 @@ pub(super) struct State {
     pub(super) proxy_port: u16,
     pub(super) client_settings: ClientSettings,
     pub(super) client_auth: ClientAuthSettings,
+    pub(super) claude_model_names_enabled: bool,
     pub(super) clipboard: Option<ProviderClipboard>,
     pub(super) loading: bool,
     pub(super) notice: Option<String>,
@@ -85,6 +86,7 @@ impl Default for State {
             proxy_port: 9999,
             client_settings: ClientSettings::default(),
             client_auth: ClientAuthSettings::default(),
+            claude_model_names_enabled: true,
             clipboard: None,
             loading: true,
             notice: None,
@@ -405,6 +407,7 @@ impl State {
         self.proxy_port = settings.proxy_port;
         self.client_settings = settings.clients;
         self.client_auth = settings.client_auth;
+        self.claude_model_names_enabled = settings.claude_model_names_enabled;
         if !self.client_settings.visible.contains(&self.client)
             && let Some(client) = self.client_settings.visible_in_order().first().copied()
         {
@@ -459,6 +462,7 @@ impl State {
         let proxy_port = self.proxy_port;
         let client_settings = self.client_settings.clone();
         let client_auth = self.client_auth;
+        let claude_model_names_enabled = self.claude_model_names_enabled;
         let language_selected = match self.language.as_str() {
             LANGUAGE_EN_US => 1,
             LANGUAGE_ZH_CN => 2,
@@ -900,7 +904,8 @@ impl State {
                         *selected = selected.saturating_sub(1);
                     }
                     KeyCode::Down | KeyCode::Char('k') => {
-                        *selected = (*selected + 1).min(1);
+                        let last = if *client == ClientKind::Claude { 2 } else { 1 };
+                        *selected = (*selected + 1).min(last);
                     }
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l' | ' ') => {
                         self.pending_effect = Some(if *selected == 0 {
@@ -908,6 +913,8 @@ impl State {
                                 client: *client,
                                 disable_custom_auth: !client_auth.disable_custom_auth(*client),
                             }
+                        } else if *client == ClientKind::Claude && *selected == 1 {
+                            Effect::SetClaudeModelNames(!claude_model_names_enabled)
                         } else {
                             Effect::ImportCurrent(*client)
                         });

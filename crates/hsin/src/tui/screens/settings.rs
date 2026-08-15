@@ -199,8 +199,9 @@ pub(super) fn draw_settings_screen(
         }
         SettingsPage::ClientConfig { client, selected } => {
             let disabled = state.client_auth.disable_custom_auth(*client);
-            let (detail_title, description, current) = if *selected == 0 {
-                (
+            let model_names = state.claude_model_names_enabled;
+            let (detail_title, description, current) = match (*client, *selected) {
+                (_, 0) => (
                     i18n.text("disable_custom_auth"),
                     i18n.text("settings_disable_custom_auth_description"),
                     Some(if disabled {
@@ -208,27 +209,45 @@ pub(super) fn draw_settings_screen(
                     } else {
                         i18n.text("off")
                     }),
-                )
-            } else {
-                (
+                ),
+                (ClientKind::Claude, 1) => (
+                    i18n.text("model_name_mapping"),
+                    i18n.text("settings_model_name_mapping_description"),
+                    Some(if model_names {
+                        i18n.text("on")
+                    } else {
+                        i18n.text("off")
+                    }),
+                ),
+                _ => (
                     i18n.text("import_current"),
                     i18n.text("settings_import_current_description"),
                     None,
-                )
+                ),
             };
+            let mut items = vec![settings_option_item(
+                i18n.text("disable_custom_auth"),
+                if disabled {
+                    i18n.text("on")
+                } else {
+                    i18n.text("off")
+                },
+                option_width,
+            )];
+            if *client == ClientKind::Claude {
+                items.push(settings_option_item(
+                    i18n.text("model_name_mapping"),
+                    if model_names {
+                        i18n.text("on")
+                    } else {
+                        i18n.text("off")
+                    },
+                    option_width,
+                ));
+            }
+            items.push(ListItem::new(i18n.text("import_current")));
             (
-                vec![
-                    settings_option_item(
-                        i18n.text("disable_custom_auth"),
-                        if disabled {
-                            i18n.text("on")
-                        } else {
-                            i18n.text("off")
-                        },
-                        option_width,
-                    ),
-                    ListItem::new(i18n.text("import_current")),
-                ],
+                items,
                 *selected,
                 client_config_label(*client, i18n),
                 detail_title,

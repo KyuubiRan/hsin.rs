@@ -131,6 +131,10 @@ pub struct ClientAuthSettings {
     pub claude_disable_custom_auth: bool,
 }
 
+const fn default_true() -> bool {
+    true
+}
+
 impl ClientAuthSettings {
     #[must_use]
     pub const fn disable_custom_auth(self, client: ClientKind) -> bool {
@@ -495,6 +499,18 @@ pub const CLAUDE_MODEL_ENV_KEYS: [&str; 13] = [
     CLAUDE_TIER_ENV[3].description,
 ];
 
+/// Claude Code picker labels and descriptions controlled by the client-level name-mapping switch.
+pub const CLAUDE_MODEL_NAME_ENV_KEYS: [&str; 8] = [
+    "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL_DESCRIPTION",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION",
+];
+
 /// Public provider metadata. Credentials are deliberately stored separately.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Provider {
@@ -771,6 +787,8 @@ pub struct Settings {
     pub clients: ClientSettings,
     #[serde(default)]
     pub client_auth: ClientAuthSettings,
+    #[serde(default = "default_true")]
+    pub claude_model_names_enabled: bool,
 }
 
 pub const LANGUAGE_SYSTEM: &str = "system";
@@ -786,6 +804,7 @@ impl Default for Settings {
             proxy_enabled: false,
             clients: ClientSettings::default(),
             client_auth: ClientAuthSettings::default(),
+            claude_model_names_enabled: true,
         }
     }
 }
@@ -804,6 +823,8 @@ pub struct SettingsPatch {
     pub clients: Option<ClientSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_auth: Option<ClientAuthUpdate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_model_names_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1065,6 +1086,18 @@ mod tests {
     }
 
     #[test]
+    fn claude_model_name_mapping_defaults_on_for_older_settings() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "language": "system",
+            "proxy_host": "127.0.0.1",
+            "proxy_port": 9999
+        }))
+        .unwrap();
+        assert!(settings.claude_model_names_enabled);
+        assert!(Settings::default().claude_model_names_enabled);
+    }
+
+    #[test]
     fn provider_validation_rejects_unsafe_urls() {
         let valid = ProviderDraft {
             client: ClientKind::Codex,
@@ -1311,6 +1344,12 @@ mod claude_model_mapping_tests {
         // Every key the writer iterates has to be one some tier can claim.
         assert!(CLAUDE_MODEL_ENV_KEYS.contains(&"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"));
         assert!(CLAUDE_MODEL_ENV_KEYS.contains(&CLAUDE_MODEL_ENV));
+        assert_eq!(CLAUDE_MODEL_NAME_ENV_KEYS.len(), 8);
+        assert!(
+            CLAUDE_MODEL_NAME_ENV_KEYS
+                .iter()
+                .all(|key| CLAUDE_MODEL_ENV_KEYS.contains(key))
+        );
     }
 
     #[test]

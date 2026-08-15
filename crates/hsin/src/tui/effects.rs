@@ -30,6 +30,7 @@ pub(super) enum Effect {
         client: ClientKind,
         disable_custom_auth: bool,
     },
+    SetClaudeModelNames(bool),
     ImportCurrent(ClientKind),
     Add(FormSubmission),
     Edit(FormSubmission),
@@ -160,6 +161,7 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
             client: kind,
             disable_custom_auth,
         } => update_client_auth(client, kind, disable_custom_auth).await,
+        Effect::SetClaudeModelNames(enabled) => update_claude_model_names(client, enabled).await,
         Effect::ImportCurrent(kind) => {
             let imported = import_current(client, kind).await?;
             Ok(Some(if imported {
@@ -305,6 +307,7 @@ async fn update_proxy_enabled(
                 proxy_enabled: Some(enabled),
                 clients: None,
                 client_auth: None,
+                claude_model_names_enabled: None,
             },
         )
         .await?;
@@ -326,6 +329,7 @@ async fn update_proxy_host(client: &DaemonClient, host: String) -> Result<Option
                 proxy_enabled: None,
                 clients: None,
                 client_auth: None,
+                claude_model_names_enabled: None,
             },
         )
         .await?;
@@ -343,6 +347,7 @@ async fn update_proxy_port(client: &DaemonClient, port: u16) -> Result<Option<&'
                 proxy_enabled: None,
                 clients: None,
                 client_auth: None,
+                claude_model_names_enabled: None,
             },
         )
         .await?;
@@ -360,6 +365,7 @@ async fn update_language(client: &DaemonClient, language: String) -> Result<Opti
                 proxy_enabled: None,
                 clients: None,
                 client_auth: None,
+                claude_model_names_enabled: None,
             },
         )
         .await?;
@@ -380,6 +386,7 @@ async fn update_clients(
                 proxy_enabled: None,
                 clients: Some(clients),
                 client_auth: None,
+                claude_model_names_enabled: None,
             },
         )
         .await?;
@@ -404,10 +411,32 @@ async fn update_client_auth(
                     client: kind,
                     disable_custom_auth,
                 }),
+                claude_model_names_enabled: None,
             },
         )
         .await?;
     Ok(Some("client_auth_changed"))
+}
+
+async fn update_claude_model_names(
+    client: &DaemonClient,
+    enabled: bool,
+) -> Result<Option<&'static str>> {
+    let _: Value = client
+        .call(
+            "settings.set",
+            &SettingsPatch {
+                language: None,
+                proxy_host: None,
+                proxy_port: None,
+                proxy_enabled: None,
+                clients: None,
+                client_auth: None,
+                claude_model_names_enabled: Some(enabled),
+            },
+        )
+        .await?;
+    Ok(Some("claude_model_names_changed"))
 }
 
 async fn load(client: &DaemonClient) -> Result<(Vec<Provider>, StatusSnapshot, Settings)> {
