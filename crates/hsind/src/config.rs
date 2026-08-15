@@ -1959,6 +1959,7 @@ mod tests {
         claude.provider.claude_model_mapping = Some(hsin_core::ClaudeModelMapping {
             enabled: true,
             default_model: Some("deepseek-v4-pro".into()),
+            default_context_1m: true,
             fable: Some(mapped("claude-fable-5", false)),
             opus: Some(mapped("claude-opus-5", true)),
             sonnet: None,
@@ -1973,7 +1974,7 @@ mod tests {
 
         // The session default outranks whatever selection Claude Code persisted, so it is the key
         // that keeps a stale first-party model ID from reaching an upstream that has never seen it.
-        assert!(output.contains("\"ANTHROPIC_MODEL\": \"deepseek-v4-pro\""));
+        assert!(output.contains("\"ANTHROPIC_MODEL\": \"deepseek-v4-pro[1m]\""));
         // Each mapped tier also names itself in the picker; without these the picker lists the raw
         // ID and the mapping is invisible to the user.
         assert!(output.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"claude-opus-5\""));

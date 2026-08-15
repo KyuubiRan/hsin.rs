@@ -233,6 +233,7 @@ pub(super) struct ModelMappingForm {
     pub(super) enabled: bool,
     /// `ANTHROPIC_MODEL` — the session default, independent of the four tiers.
     pub(super) default_model: String,
+    pub(super) default_context_1m: bool,
     pub(super) rows: [MappingRow; 4],
     /// `0` is the master toggle, `1` the default model, `2..=5` the tier rows.
     pub(super) field: usize,
@@ -248,11 +249,12 @@ impl ModelMappingForm {
                 context_1m: slot.context_1m,
             })
         };
-        let (enabled, default_model, rows) = existing.map_or_else(
+        let (enabled, default_model, default_context_1m, rows) = existing.map_or_else(
             || {
                 (
                     false,
                     String::new(),
+                    false,
                     [(); 4].map(|()| MappingRow::default()),
                 )
             },
@@ -260,6 +262,7 @@ impl ModelMappingForm {
                 (
                     mapping.enabled,
                     mapping.default_model.clone().unwrap_or_default(),
+                    mapping.default_context_1m,
                     [
                         slot(mapping.fable.as_ref()),
                         slot(mapping.opus.as_ref()),
@@ -273,6 +276,7 @@ impl ModelMappingForm {
             form,
             enabled,
             default_model,
+            default_context_1m,
             rows,
             field: 0,
             cursor: 0,
@@ -293,6 +297,7 @@ impl ModelMappingForm {
         let mapping = ClaudeModelMapping {
             enabled: self.enabled,
             default_model: (!default_model.is_empty()).then(|| default_model.to_owned()),
+            default_context_1m: !default_model.is_empty() && self.default_context_1m,
             fable: slot(0),
             opus: slot(1),
             sonnet: slot(2),
@@ -595,13 +600,12 @@ impl State {
                     mapping.enabled = !mapping.enabled;
                 }
                 KeyCode::Char(' ') => {
-                    if let Some(row) = mapping.field.checked_sub(2)
+                    if mapping.field == 1 {
+                        mapping.default_context_1m = !mapping.default_context_1m;
+                    } else if let Some(row) = mapping.field.checked_sub(2)
                         && MAPPING_TIERS[row].context_1m
                     {
                         mapping.rows[row].context_1m = !mapping.rows[row].context_1m;
-                    } else if mapping.field == 1 {
-                        // The default model is a plain text box; a space belongs in the value.
-                        edit_text(&mut mapping.default_model, &mut mapping.cursor, key);
                     }
                 }
                 KeyCode::Enter => {

@@ -325,10 +325,11 @@ pub struct ClaudeModelMapping {
     /// Claude Code resolves the startup model as `--model` > `ANTHROPIC_MODEL` > the selection
     /// persisted in `settings.json`. Without this key a stale persisted selection — a first-party
     /// model ID the upstream provider has never heard of — outranks the tier mapping and the
-    /// session fails before the mapping is ever consulted. No `[1m]` suffix: this value is the
-    /// model itself, not a tier alias.
+    /// session fails before the mapping is ever consulted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    #[serde(default)]
+    pub default_context_1m: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fable: Option<ModelSlot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -366,6 +367,18 @@ impl ClaudeModelMapping {
             .filter(|model| !model.is_empty())
     }
 
+    /// The session default written to `ANTHROPIC_MODEL`, including its optional 1M suffix.
+    #[must_use]
+    pub fn resolved_default_model(&self) -> Option<String> {
+        self.trimmed_default_model().map(|model| {
+            if self.default_context_1m {
+                format!("{model}[1m]")
+            } else {
+                model.to_owned()
+            }
+        })
+    }
+
     /// The value to write for one of the [`CLAUDE_MODEL_ENV_KEYS`], or `None` when this mapping
     /// does not own it.
     ///
@@ -375,7 +388,7 @@ impl ClaudeModelMapping {
     #[must_use]
     pub fn env_value(&self, key: &str) -> Option<String> {
         if key == CLAUDE_MODEL_ENV {
-            return self.trimmed_default_model().map(ToOwned::to_owned);
+            return self.resolved_default_model();
         }
         CLAUDE_TIER_ENV
             .iter()
@@ -419,6 +432,12 @@ impl ClaudeModelMapping {
             if default_model.chars().count() > 256 {
                 return Err(ValidationError::new(CLAUDE_MODEL_ENV, "too_long"));
             }
+        }
+        if self.default_context_1m && self.trimmed_default_model().is_none() {
+            return Err(ValidationError::new(
+                CLAUDE_MODEL_ENV,
+                "context_without_model",
+            ));
         }
         for (field, slot) in self.slots() {
             let Some(slot) = slot else { continue };
@@ -1292,18 +1311,19 @@ mod claude_model_mapping_tests {
     }
 
     #[test]
-    fn a_default_model_alone_is_worth_writing() {
+    fn a_default_model_supports_the_1m_suffix() {
         // ANTHROPIC_MODEL is useful with no tier mapped at all: on its own it stops a stale
         // persisted selection from being sent to a provider that never had that model.
         let mapping = ClaudeModelMapping {
             enabled: true,
             default_model: Some("deepseek-v4-pro".into()),
+            default_context_1m: true,
             ..ClaudeModelMapping::default()
         };
         assert!(!mapping.is_inert());
         assert_eq!(
             mapping.env_value(CLAUDE_MODEL_ENV).as_deref(),
-            Some("deepseek-v4-pro")
+            Some("deepseek-v4-pro[1m]")
         );
     }
 
@@ -1377,6 +1397,18 @@ mod claude_model_mapping_tests {
             ..ClaudeModelMapping::default()
         };
         assert!(haiku_1m.validate(ClientKind::Claude).is_err());
+
+        let default_1m_without_model = ClaudeModelMapping {
+            enabled: true,
+            default_context_1m: true,
+            opus: Some(slot("claude-opus-5", false)),
+            ..ClaudeModelMapping::default()
+        };
+        assert!(
+            default_1m_without_model
+                .validate(ClientKind::Claude)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1385,5 +1417,10 @@ mod claude_model_mapping_tests {
             "auth_scheme":"x_api_key","revision":1}"#;
         let provider: Provider = serde_json::from_str(legacy).expect("legacy provider");
         assert_eq!(provider.claude_model_mapping, None);
+
+        let older_mapping: ClaudeModelMapping =
+            serde_json::from_str(r#"{"enabled":true,"default_model":"claude-opus-5"}"#)
+                .expect("mapping saved before the default 1M option");
+        assert!(!older_mapping.default_context_1m);
     }
 }

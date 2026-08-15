@@ -199,8 +199,7 @@ fn model_mapping_summary(
     let mapping = provider.claude_model_mapping.as_ref()?;
     // The session default leads: it is what a fresh Claude Code run actually starts on.
     let default_model = mapping
-        .default_model
-        .as_deref()
+        .resolved_default_model()
         .map(|model| format!("{}: {model}", i18n.text("model_mapping_default")));
     let tiers = default_model
         .into_iter()

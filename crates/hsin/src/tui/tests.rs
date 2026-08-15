@@ -2179,6 +2179,8 @@ fn a_disabled_master_toggle_writes_no_mapping_at_all() {
 fn editing_a_claude_provider_prefills_the_existing_mapping() {
     let mut state = mapping_state(Some(ClaudeModelMapping {
         enabled: true,
+        default_model: Some("my-default".into()),
+        default_context_1m: true,
         sonnet: Some(ModelSlot {
             model: "my-sonnet".into(),
             context_1m: true,
@@ -2189,6 +2191,8 @@ fn editing_a_claude_provider_prefills_the_existing_mapping() {
         panic!("expected the mapping dialog");
     };
     assert!(mapping.enabled);
+    assert_eq!(mapping.default_model, "my-default");
+    assert!(mapping.default_context_1m);
     assert_eq!(mapping.rows[2].model, "my-sonnet");
     assert!(mapping.rows[2].context_1m);
 
@@ -2235,7 +2239,7 @@ fn popup_row(rendered: &str, title: &str) -> usize {
 fn the_default_model_reaches_the_daemon_and_takes_the_caret() {
     // ANTHROPIC_MODEL is what a fresh Claude Code run starts on: it outranks the selection Claude
     // Code persisted, so a stale first-party model ID never reaches an upstream that lacks it.
-    // It is also a plain text box, unlike the toggle above it and the checkboxes beside the tiers.
+    // The text keeps its own caret while space toggles the adjacent 1M checkbox.
     let mut state = mapping_state(None);
     state.reduce(key(KeyCode::Char(' '))); // enable the mapping
     state.reduce(key(KeyCode::Down)); // the default model row
@@ -2244,11 +2248,13 @@ fn the_default_model_reaches_the_daemon_and_takes_the_caret() {
         state.reduce(key(KeyCode::Left));
     }
     type_query(&mut state, "-v4");
+    state.reduce(key(KeyCode::Char(' ')));
 
     let InputMode::ModelMapping(mapping) = &state.input else {
         panic!("expected the mapping dialog");
     };
     assert_eq!(mapping.default_model, "deepseek-v4-pro");
+    assert!(mapping.default_context_1m);
     assert!(
         mapping.rows.iter().all(|row| row.model.is_empty()),
         "typing on the default row must not spill into a tier"
@@ -2263,6 +2269,11 @@ fn the_default_model_reaches_the_daemon_and_takes_the_caret() {
         .claude_model_mapping
         .expect("the add request should carry the mapping");
     assert_eq!(mapping.default_model.as_deref(), Some("deepseek-v4-pro"));
+    assert!(mapping.default_context_1m);
+    assert_eq!(
+        mapping.env_value(hsin_core::CLAUDE_MODEL_ENV).as_deref(),
+        Some("deepseek-v4-pro[1m]")
+    );
 }
 
 #[test]
