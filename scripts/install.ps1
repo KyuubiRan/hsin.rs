@@ -147,10 +147,24 @@ try {
     }
 
     $user = [Environment]::GetEnvironmentVariable("Path", "User")
-    if ($user -notlike "*$destination*") {
-        [Environment]::SetEnvironmentVariable("Path", "$user;$destination", "User")
+    if (($user -split ";") -notcontains $destination) {
+        $updatedUserPath = if ([string]::IsNullOrWhiteSpace($user)) {
+            $destination
+        } else {
+            "$user;$destination"
+        }
+        [Environment]::SetEnvironmentVariable("Path", $updatedUserPath, "User")
         Write-Host ""
-        Write-Host "Added $destination to your PATH. Open a new terminal for it to apply."
+        Write-Host "Added $destination to your user PATH."
+    }
+
+    if (($env:Path -split ";") -notcontains $destination) {
+        $env:Path = if ([string]::IsNullOrWhiteSpace($env:Path)) {
+            $destination
+        } else {
+            "$env:Path;$destination"
+        }
+        Write-Host "hsin is now available in this PowerShell session."
     }
 
     if (-not $serviceInstalled) {

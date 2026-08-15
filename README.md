@@ -38,10 +38,10 @@ anything is installed.
 irm https://raw.githubusercontent.com/KyuubiRan/hsin.rs/main/scripts/install.ps1 | iex
 ```
 
-Installs into `%LOCALAPPDATA%\Programs\hsin` and adds it to your user `PATH`, so
-open a new terminal afterwards. It takes the same `HSIN_INSTALL_DIR` and
-`HSIN_VERSION` overrides and performs the same checksum check. Nothing here
-needs an elevated prompt.
+Installs into `%LOCALAPPDATA%\Programs\hsin`, adds it to your user `PATH`, and
+makes `hsin` available in the current PowerShell session immediately. It takes
+the same `HSIN_INSTALL_DIR` and `HSIN_VERSION` overrides and performs the same
+checksum check. Nothing here needs an elevated prompt.
 
 ### Update
 
