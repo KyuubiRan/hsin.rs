@@ -424,6 +424,7 @@ fn copy_binary(source: &Path, destination: &Path) -> io::Result<()> {
 }
 
 #[cfg(windows)]
+#[allow(clippy::permissions_set_readonly_false)]
 fn clear_readonly(path: &Path) -> io::Result<()> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -432,6 +433,8 @@ fn clear_readonly(path: &Path) -> io::Result<()> {
     };
     let mut permissions = metadata.permissions();
     if permissions.readonly() {
+        // On Windows this clears only FILE_ATTRIBUTE_READONLY; the Unix mode-bit warning does not
+        // apply because this function is compiled exclusively for Windows.
         permissions.set_readonly(false);
         fs::set_permissions(path, permissions)?;
     }
