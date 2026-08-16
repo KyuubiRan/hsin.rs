@@ -113,7 +113,7 @@ pub fn doctor_findings() -> Vec<DoctorFinding> {
             Ok(_) => TaskInspection::Missing,
             Err(error) => TaskInspection::Failed(error.to_string()),
         };
-        return windows_installation_findings(&WindowsInstallationState {
+        windows_installation_findings(&WindowsInstallationState {
             marker_exists: home.join(hsin_ipc::INSTALL_HOME_MARKER).is_file(),
             installed_daemon_exists: installed_daemon.is_file(),
             installed_daemon,
@@ -121,7 +121,7 @@ pub fn doctor_findings() -> Vec<DoctorFinding> {
             source_daemon,
             task_label,
             task,
-        });
+        })
     }
 
     #[cfg(not(windows))]
