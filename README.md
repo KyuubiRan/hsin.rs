@@ -106,6 +106,12 @@ None of the three needs administrator or root rights. Two platform notes:
   The daemon is the task's own process, so Task Scheduler starts and stops it
   directly.
 
+`hsin doctor` is read-only and never installs or restarts the daemon. On
+Windows it can still report a missing release or installed `hsind.exe`, an
+incomplete logon-task registration, and a possible security-software quarantine
+when the daemon cannot be reached. It never restores quarantined files or adds
+Windows Defender exclusions.
+
 Debug builds use a `hsin-debug` data home, so a development daemon never shares
 storage, keyring entries, the IPC endpoint, or the service identity with an
 installed release build.

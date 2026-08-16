@@ -942,6 +942,18 @@ pub struct DoctorReport {
     pub findings: Vec<DoctorFinding>,
 }
 
+impl DoctorReport {
+    #[must_use]
+    pub fn from_findings(findings: Vec<DoctorFinding>) -> Self {
+        Self {
+            healthy: !findings
+                .iter()
+                .any(|item| item.severity == DoctorSeverity::Error),
+            findings,
+        }
+    }
+}
+
 /// Stable, localizable application error codes shared by all frontends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1346,6 +1358,23 @@ mod tests {
                 "retryable": true
             })
         );
+    }
+
+    #[test]
+    fn doctor_health_is_derived_from_error_findings() {
+        let warning = DoctorFinding {
+            code: "warning".into(),
+            severity: DoctorSeverity::Warning,
+            args: BTreeMap::new(),
+        };
+        assert!(DoctorReport::from_findings(vec![warning.clone()]).healthy);
+
+        let error = DoctorFinding {
+            code: "error".into(),
+            severity: DoctorSeverity::Error,
+            args: BTreeMap::new(),
+        };
+        assert!(!DoctorReport::from_findings(vec![warning, error]).healthy);
     }
 }
 

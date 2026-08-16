@@ -2,9 +2,10 @@ use std::io::{self, Read, Write};
 
 use anyhow::{Context, Result, bail};
 use hsin_core::{
-    ClaudeModelMappingUpdate, ClientKind, CodexConfigNameUpdate, ImportCurrentParams,
-    ModeSetParams, ModelUpdate, Provider, ProviderAddParams, ProviderDraft, ProviderEditParams,
-    ProviderPatch, ProviderRemoveParams, ProviderSwitchParams, SecretInput,
+    ClaudeModelMappingUpdate, ClientKind, CodexConfigNameUpdate, DoctorFinding, DoctorReport,
+    DoctorSeverity, ImportCurrentParams, ModeSetParams, ModelUpdate, Provider, ProviderAddParams,
+    ProviderDraft, ProviderEditParams, ProviderPatch, ProviderRemoveParams, ProviderSwitchParams,
+    SecretInput,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -33,6 +34,9 @@ pub async fn run(cli: Cli, i18n: &mut I18n) -> Result<()> {
     if let Command::Update = command {
         return updater::run().await;
     }
+    if let Command::Doctor = command {
+        return run_doctor(cli.json, i18n).await;
+    }
 
     let client = DaemonClient::connect_or_bootstrap().await?;
     synchronize_language(&client, i18n, language_overridden).await;
@@ -43,10 +47,7 @@ pub async fn run(cli: Cli, i18n: &mut I18n) -> Result<()> {
             let value: Value = client.call("status", &json!({})).await?;
             print_value(&value, cli.json)
         }
-        Command::Doctor => {
-            let value: Value = client.call("doctor", &json!({})).await?;
-            print_value(&value, cli.json)
-        }
+        Command::Doctor => unreachable!("doctor handled before bootstrapping"),
         Command::Update => unreachable!("update command handled before connecting"),
         Command::Security { command } => run_security(command, &client, cli.json).await,
         Command::Settings { command } => run_settings(command, &client, cli.json).await,
@@ -77,6 +78,91 @@ pub async fn run(cli: Cli, i18n: &mut I18n) -> Result<()> {
         }
         Command::Daemon { .. } => unreachable!("daemon command handled before connecting"),
     }
+}
+
+async fn run_doctor(json: bool, i18n: &I18n) -> Result<()> {
+    let mut findings = bootstrap::doctor_findings();
+    match DaemonClient::connect().await {
+        Ok(client) => match client.call::<_, DoctorReport>("doctor", &json!({})).await {
+            Ok(remote) => findings.extend(remote.findings),
+            Err(error) => findings.push(local_finding(
+                "daemon_diagnostic_failed",
+                DoctorSeverity::Error,
+                [("message", format!("{error:#}"))],
+            )),
+        },
+        Err(error) => findings.push(local_finding(
+            "daemon_unavailable",
+            DoctorSeverity::Error,
+            [
+                ("message", format!("{error:#}")),
+                (
+                    "log",
+                    hsin_ipc::data_home()
+                        .join("logs")
+                        .join("hsind.stderr.log")
+                        .display()
+                        .to_string(),
+                ),
+            ],
+        )),
+    }
+    print_doctor_report(&DoctorReport::from_findings(findings), i18n, json)
+}
+
+fn local_finding<const N: usize>(
+    code: &str,
+    severity: DoctorSeverity,
+    args: [(&str, String); N],
+) -> DoctorFinding {
+    DoctorFinding {
+        code: code.into(),
+        severity,
+        args: args
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect(),
+    }
+}
+
+fn print_doctor_report(report: &DoctorReport, i18n: &I18n, json: bool) -> Result<()> {
+    if json {
+        return print_json(report);
+    }
+    println!(
+        "{}: {}",
+        i18n.text("doctor.health"),
+        i18n.text(if report.healthy {
+            "doctor.healthy"
+        } else {
+            "doctor.unhealthy"
+        })
+    );
+    if report.findings.is_empty() {
+        println!("{}", i18n.text("doctor.no_findings"));
+        return Ok(());
+    }
+    for item in &report.findings {
+        let severity = match item.severity {
+            DoctorSeverity::Info => i18n.text("doctor.severity.info"),
+            DoctorSeverity::Warning => i18n.text("doctor.severity.warning"),
+            DoctorSeverity::Error => i18n.text("doctor.severity.error"),
+        };
+        let key = format!("doctor.finding.{}", item.code);
+        let message = i18n.get(&key).unwrap_or(&item.code);
+        if item.args.is_empty() {
+            println!("[{severity}] {message}");
+        } else {
+            let args = item
+                .args
+                .iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("[{severity}] {message} ({args})");
+        }
+    }
+    Ok(())
 }
 
 async fn synchronize_language(client: &DaemonClient, i18n: &mut I18n, overridden: bool) {

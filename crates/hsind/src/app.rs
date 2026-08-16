@@ -1809,12 +1809,7 @@ impl App {
                 findings.push(item);
             }
         }
-        Ok(DoctorReport {
-            healthy: !findings
-                .iter()
-                .any(|item| item.severity == DoctorSeverity::Error),
-            findings,
-        })
+        Ok(DoctorReport::from_findings(findings))
     }
 
     fn config_path(&self, client: ClientKind) -> Result<PathBuf> {
