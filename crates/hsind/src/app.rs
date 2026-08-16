@@ -12,11 +12,11 @@ use std::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hsin_core::{
     AppError, AuthScheme, ClaudeModelMappingUpdate, ClientAuthSettings, ClientKind, ClientSettings,
-    ConnectionMode, DaemonStatus, DoctorFinding, DoctorReport, DoctorSeverity, ErrorCode,
-    ImportCurrentParams, ImportCurrentResult, KeyStoreState, ModelDiscoverParams, ModelDiscovery,
-    ModelUpdate, Provider, ProviderAddParams, ProviderEditParams, ProviderListParams,
-    ProviderRemoveParams, ProviderSwitchParams, SecretInput, SecurityStatus, Settings,
-    SettingsPatch,
+    CodexConfigNameUpdate, ConnectionMode, DaemonStatus, DoctorFinding, DoctorReport,
+    DoctorSeverity, ErrorCode, ImportCurrentParams, ImportCurrentResult, KeyStoreState,
+    ModelDiscoverParams, ModelDiscovery, ModelUpdate, Provider, ProviderAddParams,
+    ProviderEditParams, ProviderListParams, ProviderRemoveParams, ProviderSwitchParams,
+    SecretInput, SecurityStatus, Settings, SettingsPatch,
 };
 use parking_lot::RwLock;
 use secrecy::{ExposeSecret, SecretString};
@@ -308,6 +308,7 @@ impl App {
             credential_configured: false,
             credential_preview: None,
             model: None,
+            codex_config_name: detected.codex_config_name,
             claude_model_mapping: None,
             revision: 1,
         };
@@ -341,6 +342,7 @@ impl App {
             base_url: detected.base_url,
             auth_scheme: detected.auth_scheme,
             model: None,
+            codex_config_name: detected.codex_config_name,
             claude_model_mapping: None,
         };
         let mut provider = Database::new_provider(&input)?;
@@ -369,6 +371,7 @@ impl App {
         for provider in self.db.list_providers(Some(client))? {
             if provider.official
                 || provider.auth_scheme != detected.auth_scheme
+                || provider.codex_config_name != detected.codex_config_name
                 || !provider
                     .base_url
                     .trim_end_matches('/')
@@ -448,6 +451,7 @@ impl App {
             base_url: params.provider.base_url,
             auth_scheme: params.provider.auth_scheme,
             model: params.provider.model,
+            codex_config_name: params.provider.codex_config_name,
             claude_model_mapping: params.provider.claude_model_mapping,
         };
         let mut provider = Database::new_provider(&input)?;
@@ -476,18 +480,31 @@ impl App {
             ClaudeModelMappingUpdate::Set(mapping) => Some(mapping),
             ClaudeModelMappingUpdate::Clear => None,
         };
+        let codex_config_name = match params.patch.codex_config_name {
+            CodexConfigNameUpdate::Preserve => current.codex_config_name.clone(),
+            CodexConfigNameUpdate::Set(name) => Some(name),
+        };
         // The mapping env keys live in `settings.json` in both connection modes, so changing them on
         // the active provider has to be written out even while the proxy owns the base URL.
         let mapping_changed = current.client == ClientKind::Claude
             && claude_model_mapping != current.claude_model_mapping;
-        let name = params.patch.name.unwrap_or(current.name);
+        let config_name_changed =
+            current.client == ClientKind::Codex && codex_config_name != current.codex_config_name;
+        let name = params.patch.name.unwrap_or_else(|| current.name.clone());
         let input = ProviderInput {
             client: current.client,
             name,
-            description: params.patch.description.unwrap_or(current.description),
-            base_url: params.patch.base_url.unwrap_or(current.base_url),
+            description: params
+                .patch
+                .description
+                .unwrap_or_else(|| current.description.clone()),
+            base_url: params
+                .patch
+                .base_url
+                .unwrap_or_else(|| current.base_url.clone()),
             auth_scheme: params.patch.auth_scheme.unwrap_or(current.auth_scheme),
             model,
+            codex_config_name,
             claude_model_mapping,
         };
         input.validate()?;
@@ -502,6 +519,7 @@ impl App {
             credential_configured: current.credential_configured,
             credential_preview: None,
             model: input.model.as_ref().map(|model| model.trim().to_owned()),
+            codex_config_name: input.normalized_codex_config_name()?,
             claude_model_mapping: input.claude_model_mapping.clone(),
             revision: current.revision.saturating_add(1),
         };
@@ -511,6 +529,7 @@ impl App {
         let update_active_config = active
             && (active_direct
                 || mapping_changed
+                || config_name_changed
                 || (provider.client == ClientKind::Codex && provider.model.is_some()));
         if active_direct
             && !matches!(
@@ -638,6 +657,7 @@ impl App {
             base_url: params.base_url.clone(),
             auth_scheme: params.auth_scheme,
             model: None,
+            codex_config_name: None,
             claude_model_mapping: None,
         };
         input.validate()?;
@@ -1318,6 +1338,10 @@ impl App {
             .provider
             .claude_model_mapping
             .clone_from(&persisted.claude_model_mapping);
+        target
+            .provider
+            .codex_config_name
+            .clone_from(&persisted.codex_config_name);
         if persisted != target.provider {
             return Err(DaemonError::Conflict(
                 "official provider state diverged during import recovery".into(),
@@ -1345,6 +1369,10 @@ impl App {
             .provider
             .claude_model_mapping
             .clone_from(&persisted.claude_model_mapping);
+        target
+            .provider
+            .codex_config_name
+            .clone_from(&persisted.codex_config_name);
         if persisted != target.provider {
             if persisted.id == target.provider.id && persisted.revision < target.provider.revision {
                 return Ok(RecoveryOutcome::Aborted);
@@ -1939,6 +1967,35 @@ mod tests {
         .unwrap();
     }
 
+    fn leave_legacy_pending_configuration_operation(
+        app: &App,
+        path: &std::path::Path,
+        target: &ConfigTarget,
+    ) {
+        let before_hash = config::file_hash(path).unwrap();
+        let mut legacy = serde_json::to_value(target).unwrap();
+        legacy["provider"]
+            .as_object_mut()
+            .unwrap()
+            .remove("codex_config_name");
+        app.db
+            .begin_operation(
+                "apply_config",
+                target.client,
+                before_hash.as_deref(),
+                &serde_json::to_string(&legacy).unwrap(),
+            )
+            .unwrap();
+        let credential = app.config_credential(target).unwrap();
+        config::apply_with_credential(
+            path,
+            before_hash.as_deref(),
+            target,
+            credential.as_ref().map(ExposeSecret::expose_secret),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn model_ids_are_sorted_descending() {
         let models = parse_model_ids(&json!({
@@ -2051,6 +2108,7 @@ mod tests {
                 base_url: "https://preview.example.test/v1".into(),
                 auth_scheme: AuthScheme::Bearer,
                 model: None,
+                codex_config_name: None,
                 claude_model_mapping: None,
             },
             secret: SecretInput::Replace(secret.into()),
@@ -2066,6 +2124,109 @@ mod tests {
         let preview = providers[0].credential_preview.as_deref().unwrap();
         assert_eq!(preview, "sk-abc***yz");
         assert!(!serde_json::to_string(&providers).unwrap().contains(secret));
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_codex_config_name_edits_rewrite_direct_and_proxy_configuration() {
+        let root =
+            std::env::temp_dir().join(format!("hsind-codex-config-name-{}", uuid::Uuid::new_v4()));
+        let paths = Paths {
+            database: root.join("hsin.sqlite3"),
+            lock: root.join("hsind.lock"),
+            logs: root.join("logs"),
+            backups: root.join("backups"),
+            home: root.clone(),
+        };
+        let codex_config = root.join("codex/config.toml");
+        fs::create_dir_all(codex_config.parent().unwrap()).unwrap();
+        let app = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
+        *app.config_paths.write() = HashMap::from([
+            (ClientKind::Codex, codex_config.clone()),
+            (ClientKind::Claude, root.join("claude/settings.json")),
+        ]);
+        let provider = app
+            .add_provider(ProviderAddParams {
+                provider: hsin_core::ProviderDraft {
+                    client: ClientKind::Codex,
+                    name: "Remote compaction".into(),
+                    description: String::new(),
+                    base_url: "https://router.example.test/v1".into(),
+                    auth_scheme: AuthScheme::Bearer,
+                    model: None,
+                    codex_config_name: None,
+                    claude_model_mapping: None,
+                },
+                secret: SecretInput::Replace("router-secret".into()),
+            })
+            .await
+            .unwrap();
+        app.switch_provider(ProviderSwitchParams {
+            client: ClientKind::Codex,
+            provider_id: provider.id.clone(),
+        })
+        .await
+        .unwrap();
+
+        let direct = app
+            .edit_provider(ProviderEditParams {
+                id: provider.id.clone(),
+                expected_revision: provider.revision,
+                patch: hsin_core::ProviderPatch {
+                    codex_config_name: CodexConfigNameUpdate::Set(
+                        hsin_core::OPENAI_CODEX_CONFIG_NAME.into(),
+                    ),
+                    ..hsin_core::ProviderPatch::default()
+                },
+                secret: SecretInput::Preserve,
+            })
+            .await
+            .unwrap();
+        let direct_config = fs::read_to_string(&codex_config).unwrap();
+        assert!(direct_config.contains("model_provider = \"hsin\""));
+        assert!(direct_config.contains("[model_providers.hsin]"));
+        assert!(direct_config.contains("name = \"OpenAI\""));
+        assert!(direct_config.contains("base_url = \"https://router.example.test/v1\""));
+
+        app.db
+            .set_mode(ClientKind::Codex, ConnectionMode::Proxy)
+            .unwrap();
+        let proxy = app
+            .edit_provider(ProviderEditParams {
+                id: direct.id.clone(),
+                expected_revision: direct.revision,
+                patch: hsin_core::ProviderPatch {
+                    codex_config_name: CodexConfigNameUpdate::Set(
+                        hsin_core::HSIN_CODEX_CONFIG_NAME.into(),
+                    ),
+                    ..hsin_core::ProviderPatch::default()
+                },
+                secret: SecretInput::Preserve,
+            })
+            .await
+            .unwrap();
+        let proxy_config = fs::read_to_string(&codex_config).unwrap();
+        assert!(proxy_config.contains("name = \"hsin\""));
+        assert!(proxy_config.contains("base_url = \"http://127.0.0.1:9999/codex/v1\""));
+
+        app.edit_provider(ProviderEditParams {
+            id: proxy.id,
+            expected_revision: proxy.revision,
+            patch: hsin_core::ProviderPatch {
+                codex_config_name: CodexConfigNameUpdate::Set(
+                    hsin_core::OPENAI_CODEX_CONFIG_NAME.into(),
+                ),
+                ..hsin_core::ProviderPatch::default()
+            },
+            secret: SecretInput::Preserve,
+        })
+        .await
+        .unwrap();
+        let proxy_config = fs::read_to_string(&codex_config).unwrap();
+        assert!(proxy_config.contains("name = \"OpenAI\""));
+        assert!(proxy_config.contains("[model_providers.hsin]"));
+
         drop(app);
         fs::remove_dir_all(root).unwrap();
     }
@@ -2150,6 +2311,7 @@ mod tests {
                     base_url: "https://codex.example.test/v1".into(),
                     auth_scheme: AuthScheme::Bearer,
                     model: None,
+                    codex_config_name: None,
                     claude_model_mapping: None,
                 },
                 secret: SecretInput::Replace("sk-client-auth-secret".into()),
@@ -2330,6 +2492,7 @@ mod tests {
                     base_url: "https://recovery.example.test/v1".into(),
                     auth_scheme: AuthScheme::Bearer,
                     model: None,
+                    codex_config_name: None,
                     claude_model_mapping: None,
                 },
                 secret: SecretInput::Replace("recovery-secret".into()),
@@ -2341,7 +2504,7 @@ mod tests {
             .config_target(&provider, ConnectionMode::Direct, Some(true))
             .unwrap();
         app.ensure_codex_auth_backup(&codex_auth).unwrap();
-        leave_pending_configuration_operation(&app, &codex_config, &enable);
+        leave_legacy_pending_configuration_operation(&app, &codex_config, &enable);
         app.recover_operations().unwrap();
         assert!(
             fs::read_to_string(&codex_auth)
@@ -2433,6 +2596,7 @@ mod tests {
                     base_url: "https://upgrade.example.test/v1".into(),
                     auth_scheme: AuthScheme::Bearer,
                     model: None,
+                    codex_config_name: None,
                     claude_model_mapping: None,
                 },
                 secret: SecretInput::Replace("upgrade-secret".into()),
@@ -2500,6 +2664,7 @@ mod tests {
                     base_url: "https://helper.example.test/v1".into(),
                     auth_scheme: AuthScheme::Bearer,
                     model: None,
+                    codex_config_name: None,
                     claude_model_mapping: None,
                 },
                 secret: SecretInput::Replace("helper-secret".into()),
@@ -2631,6 +2796,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_import_keeps_the_config_name_separate_from_the_display_name() {
+        let root = std::env::temp_dir().join(format!(
+            "hsind-import-codex-config-name-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = Paths {
+            database: root.join("hsin.sqlite3"),
+            lock: root.join("hsind.lock"),
+            logs: root.join("logs"),
+            backups: root.join("backups"),
+            home: root.clone(),
+        };
+        let codex = root.join("codex/config.toml");
+        fs::create_dir_all(codex.parent().unwrap()).unwrap();
+        fs::write(
+            &codex,
+            "model_provider = \"vendor\"\n[model_providers.vendor]\nname = \"OpenAI\"\nbase_url = \"https://router.example.test/v1\"\nexperimental_bearer_token = \"router-secret\"\n",
+        )
+        .unwrap();
+        let app = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
+        *app.config_paths.write() = HashMap::from([
+            (ClientKind::Codex, codex),
+            (ClientKind::Claude, root.join("claude/settings.json")),
+        ]);
+
+        let imported = app
+            .import_current(ImportCurrentParams {
+                client: ClientKind::Codex,
+                name: "My Router".into(),
+            })
+            .await
+            .unwrap();
+        assert!(imported.imported);
+        assert_eq!(imported.provider.name, "My Router");
+        assert_eq!(
+            imported.provider.codex_config_name.as_deref(),
+            Some(hsin_core::OPENAI_CODEX_CONFIG_NAME)
+        );
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn importing_official_codex_restores_auth_without_rewriting_config() {
         let root =
             std::env::temp_dir().join(format!("hsind-import-oauth-{}", uuid::Uuid::new_v4()));
@@ -2661,6 +2870,7 @@ mod tests {
                     base_url: "https://oauth-import.example.test/v1".into(),
                     auth_scheme: AuthScheme::Bearer,
                     model: None,
+                    codex_config_name: None,
                     claude_model_mapping: None,
                 },
                 secret: SecretInput::Replace("import-secret".into()),
@@ -2733,6 +2943,7 @@ mod tests {
                     base_url: "https://oauth-recovery.example.test/v1".into(),
                     auth_scheme: AuthScheme::Bearer,
                     model: None,
+                    codex_config_name: None,
                     claude_model_mapping: None,
                 },
                 secret: SecretInput::Replace("recovery-secret".into()),
@@ -3030,6 +3241,7 @@ mod tests {
                     base_url: "https://codex.example.test/v1".into(),
                     auth_scheme: AuthScheme::Bearer,
                     model: None,
+                    codex_config_name: None,
                     claude_model_mapping: None,
                 },
                 secret: SecretInput::Replace("codex-secret".into()),
@@ -3045,6 +3257,7 @@ mod tests {
                     base_url: "https://claude.example.test".into(),
                     auth_scheme: AuthScheme::XApiKey,
                     model: None,
+                    codex_config_name: None,
                     claude_model_mapping: None,
                 },
                 secret: SecretInput::Replace("claude-secret".into()),
@@ -3203,6 +3416,7 @@ mod tests {
                     base_url: "https://claude.example.test".into(),
                     auth_scheme: AuthScheme::XApiKey,
                     model: None,
+                    codex_config_name: None,
                     claude_model_mapping: None,
                 },
                 secret: SecretInput::Replace("claude-secret".into()),
@@ -3379,6 +3593,7 @@ mod tests {
                     base_url: "https://mapped.example.test".into(),
                     auth_scheme: AuthScheme::XApiKey,
                     model: None,
+                    codex_config_name: None,
                     claude_model_mapping: Some(hsin_core::ClaudeModelMapping {
                         enabled: true,
                         default_model: Some("mapped-default".into()),
@@ -3402,6 +3617,7 @@ mod tests {
                     base_url: "https://unmapped.example.test".into(),
                     auth_scheme: AuthScheme::XApiKey,
                     model: None,
+                    codex_config_name: None,
                     claude_model_mapping: None,
                 },
                 secret: SecretInput::Replace("unmapped-secret".into()),

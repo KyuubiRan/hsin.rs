@@ -2,7 +2,7 @@ pub use hsin_core::{
     AuthScheme, ClaudeModelMapping, ClientKind, ClientState, ConfigStatus, ConnectionMode, Provider,
 };
 
-use hsin_core::{ProviderDraft, provider_name_from_url};
+use hsin_core::{ProviderDraft, normalize_codex_config_name, provider_name_from_url};
 
 use crate::error::{DaemonError, Result};
 
@@ -14,6 +14,7 @@ pub struct ProviderInput {
     pub base_url: String,
     pub auth_scheme: AuthScheme,
     pub model: Option<String>,
+    pub codex_config_name: Option<String>,
     pub claude_model_mapping: Option<ClaudeModelMapping>,
 }
 
@@ -35,6 +36,7 @@ impl ProviderInput {
             base_url: self.base_url.clone(),
             auth_scheme: self.auth_scheme,
             model: self.model.clone(),
+            codex_config_name: self.codex_config_name.clone(),
             claude_model_mapping: self.claude_model_mapping.clone(),
         };
         draft
@@ -55,6 +57,11 @@ impl ProviderInput {
         }
         Ok(())
     }
+
+    pub fn normalized_codex_config_name(&self) -> Result<Option<String>> {
+        normalize_codex_config_name(self.client, self.codex_config_name.as_deref())
+            .map_err(|error| DaemonError::Invalid(error.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -69,6 +76,7 @@ mod tests {
             base_url: url.into(),
             auth_scheme: AuthScheme::Bearer,
             model: None,
+            codex_config_name: None,
             claude_model_mapping: None,
         }
     }

@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use hsin_core::{
-    ClaudeModelMappingUpdate, ClientAuthUpdate, ClientKind, ClientSettings, ConnectionMode,
-    ImportCurrentParams, ImportCurrentResult, ModeSetParams, ModelDiscoverParams, ModelUpdate,
-    Provider, ProviderAddParams, ProviderDraft, ProviderEditParams, ProviderPatch,
+    ClaudeModelMappingUpdate, ClientAuthUpdate, ClientKind, ClientSettings, CodexConfigNameUpdate,
+    ConnectionMode, ImportCurrentParams, ImportCurrentResult, ModeSetParams, ModelDiscoverParams,
+    ModelUpdate, Provider, ProviderAddParams, ProviderDraft, ProviderEditParams, ProviderPatch,
     ProviderRemoveParams, ProviderSwitchParams, SecretInput, Settings, SettingsPatch,
 };
 use serde_json::{Value, json};
@@ -216,6 +216,10 @@ pub(super) fn provider_add_params(form: FormSubmission) -> ProviderAddParams {
         ClaudeModelMappingUpdate::Set(mapping) => Some(mapping),
         ClaudeModelMappingUpdate::Preserve | ClaudeModelMappingUpdate::Clear => None,
     };
+    let codex_config_name = match form.codex_config_name {
+        CodexConfigNameUpdate::Set(name) => Some(name),
+        CodexConfigNameUpdate::Preserve => None,
+    };
     ProviderAddParams {
         provider: ProviderDraft {
             client: form.client,
@@ -224,6 +228,7 @@ pub(super) fn provider_add_params(form: FormSubmission) -> ProviderAddParams {
             base_url: form.base_url,
             auth_scheme: form.auth_scheme,
             model,
+            codex_config_name,
             claude_model_mapping,
         },
         secret: if form.secret.is_empty() {
@@ -246,6 +251,7 @@ pub(super) fn provider_edit_params(form: FormSubmission) -> Result<ProviderEditP
             auth_scheme: Some(form.auth_scheme),
             description: Some(form.description),
             model: form.model,
+            codex_config_name: form.codex_config_name,
             claude_model_mapping: form.claude_model_mapping,
         },
         secret: if form.secret.is_empty() {

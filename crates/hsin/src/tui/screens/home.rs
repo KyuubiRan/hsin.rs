@@ -1,4 +1,6 @@
-use hsin_core::{AuthScheme, ConnectionMode};
+use hsin_core::{
+    AuthScheme, ClientKind, ConnectionMode, DEFAULT_CODEX_CONFIG_NAME, OPENAI_CODEX_CONFIG_NAME,
+};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -138,6 +140,21 @@ pub(super) fn draw_details(frame: &mut Frame<'_>, area: Rect, state: &State, i18
         detail_line(i18n.text("auth_type"), auth),
         detail_line(i18n.text("tool_proxy"), proxy),
     ];
+    if provider.client == ClientKind::Codex {
+        let config_name = provider
+            .codex_config_name
+            .as_deref()
+            .unwrap_or(DEFAULT_CODEX_CONFIG_NAME);
+        lines.push(detail_line(i18n.text("config_name"), config_name));
+        lines.push(detail_line(
+            i18n.text("remote_compaction"),
+            if config_name == OPENAI_CODEX_CONFIG_NAME {
+                i18n.text("enabled")
+            } else {
+                i18n.text("disabled")
+            },
+        ));
+    }
     let mapping = model_mapping_summary(provider, i18n);
     if let Some(mapping) = &mapping {
         lines.push(detail_line(i18n.text("model_mapping"), &mapping.state));

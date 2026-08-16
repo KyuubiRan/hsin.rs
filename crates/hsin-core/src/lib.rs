@@ -13,7 +13,11 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Monotonic CLI/daemon release compatibility code. Every published workspace
 /// version must be exactly one greater than the preceding release so a new CLI
 /// always replaces an older daemon.
-pub const VERSION_CODE: u32 = 24;
+pub const VERSION_CODE: u32 = 25;
+
+pub const HSIN_CODEX_CONFIG_NAME: &str = "hsin";
+pub const OPENAI_CODEX_CONFIG_NAME: &str = "OpenAI";
+pub const DEFAULT_CODEX_CONFIG_NAME: &str = OPENAI_CODEX_CONFIG_NAME;
 
 #[must_use]
 pub fn provider_name_from_url(value: &str) -> Option<String> {
@@ -542,6 +546,8 @@ pub struct Provider {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_config_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_model_mapping: Option<ClaudeModelMapping>,
     pub revision: u64,
 }
@@ -563,6 +569,7 @@ impl Provider {
             base_url: self.base_url.clone(),
             auth_scheme: self.auth_scheme,
             model: self.model.clone(),
+            codex_config_name: self.codex_config_name.clone(),
             claude_model_mapping: self.claude_model_mapping.clone(),
         }
         .validate()
@@ -579,6 +586,8 @@ pub struct ProviderDraft {
     pub auth_scheme: AuthScheme,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_config_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_model_mapping: Option<ClaudeModelMapping>,
 }
@@ -610,6 +619,8 @@ impl ProviderDraft {
             }
         }
 
+        normalize_codex_config_name(self.client, self.codex_config_name.as_deref())?;
+
         if let Some(mapping) = &self.claude_model_mapping {
             mapping.validate(self.client)?;
         }
@@ -635,6 +646,44 @@ impl ProviderDraft {
     }
 }
 
+/// Normalize the provider name written inside `[model_providers.hsin]`.
+///
+/// Codex currently uses the exact display name `OpenAI` as a provider capability signal. Claude
+/// Code has no equivalent field, so carrying a value for Claude is rejected instead of silently
+/// ignoring a configuration mistake.
+///
+/// # Errors
+///
+/// Returns a validation error when a Codex name is empty or too long, or when a name is supplied
+/// for Claude Code.
+pub fn normalize_codex_config_name(
+    client: ClientKind,
+    name: Option<&str>,
+) -> Result<Option<String>, ValidationError> {
+    match client {
+        ClientKind::Claude => {
+            if name.is_some() {
+                Err(ValidationError::new(
+                    "codex_config_name",
+                    "unsupported_client",
+                ))
+            } else {
+                Ok(None)
+            }
+        }
+        ClientKind::Codex => {
+            let name = name.unwrap_or(DEFAULT_CODEX_CONFIG_NAME).trim();
+            if name.is_empty() {
+                return Err(ValidationError::new("codex_config_name", "empty"));
+            }
+            if name.chars().count() > 128 {
+                return Err(ValidationError::new("codex_config_name", "too_long"));
+            }
+            Ok(Some(name.to_owned()))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -647,8 +696,25 @@ pub struct ProviderPatch {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "ModelUpdate::is_preserve")]
     pub model: ModelUpdate,
+    #[serde(default, skip_serializing_if = "CodexConfigNameUpdate::is_preserve")]
+    pub codex_config_name: CodexConfigNameUpdate,
     #[serde(default, skip_serializing_if = "ClaudeModelMappingUpdate::is_preserve")]
     pub claude_model_mapping: ClaudeModelMappingUpdate,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum CodexConfigNameUpdate {
+    #[default]
+    Preserve,
+    Set(String),
+}
+
+impl CodexConfigNameUpdate {
+    #[must_use]
+    pub const fn is_preserve(&self) -> bool {
+        matches!(self, Self::Preserve)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1118,6 +1184,7 @@ mod tests {
             base_url: "https://api.example.com/v1".into(),
             auth_scheme: AuthScheme::Bearer,
             model: None,
+            codex_config_name: None,
             claude_model_mapping: None,
         };
         assert!(valid.validate().is_ok());
@@ -1140,6 +1207,28 @@ mod tests {
             invalid.validate(),
             Err(ValidationError::new("base_url", "query_not_allowed"))
         );
+    }
+
+    #[test]
+    fn codex_config_names_are_client_scoped_and_normalized() {
+        assert_eq!(
+            normalize_codex_config_name(ClientKind::Codex, None).unwrap(),
+            Some(DEFAULT_CODEX_CONFIG_NAME.into())
+        );
+        assert_eq!(
+            normalize_codex_config_name(ClientKind::Codex, Some(" OpenAI ")).unwrap(),
+            Some(OPENAI_CODEX_CONFIG_NAME.into())
+        );
+        assert_eq!(
+            normalize_codex_config_name(ClientKind::Codex, Some(" hsin ")).unwrap(),
+            Some(HSIN_CODEX_CONFIG_NAME.into())
+        );
+        assert_eq!(
+            normalize_codex_config_name(ClientKind::Claude, None).unwrap(),
+            None
+        );
+        assert!(normalize_codex_config_name(ClientKind::Codex, Some(" ")).is_err());
+        assert!(normalize_codex_config_name(ClientKind::Claude, Some("OpenAI")).is_err());
     }
 
     #[test]
@@ -1415,6 +1504,17 @@ mod claude_model_mapping_tests {
             "auth_scheme":"x_api_key","revision":1}"#;
         let provider: Provider = serde_json::from_str(legacy).expect("legacy provider");
         assert_eq!(provider.claude_model_mapping, None);
+
+        let legacy_codex = r#"{"id":"p","client":"codex","name":"n","base_url":"https://a.test/v1",
+            "auth_scheme":"bearer","revision":1}"#;
+        let provider: Provider = serde_json::from_str(legacy_codex).expect("legacy Codex provider");
+        assert_eq!(provider.codex_config_name, None);
+
+        let draft: ProviderDraft = serde_json::from_str(
+            r#"{"client":"codex","name":"n","base_url":"https://a.test/v1","auth_scheme":"bearer"}"#,
+        )
+        .expect("legacy provider draft");
+        assert_eq!(draft.codex_config_name, None);
 
         let older_mapping: ClaudeModelMapping =
             serde_json::from_str(r#"{"enabled":true,"default_model":"claude-opus-5"}"#)

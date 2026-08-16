@@ -357,6 +357,7 @@ mod tests {
                         base_url,
                         auth_scheme,
                         model: None,
+                        codex_config_name: None,
                         claude_model_mapping: None,
                     },
                     secret: SecretInput::Replace(secret.to_owned()),

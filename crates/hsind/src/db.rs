@@ -13,9 +13,9 @@ use crate::{
     model::{AuthScheme, ClientKind, ClientState, ConnectionMode, Provider, ProviderInput},
 };
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
-const PROVIDER_COLUMNS: &str = "p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,EXISTS(SELECT 1 FROM provider_secrets configured WHERE configured.provider_id=p.id),p.claude_model_mapping";
+const PROVIDER_COLUMNS: &str = "p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,EXISTS(SELECT 1 FROM provider_secrets configured WHERE configured.provider_id=p.id),p.claude_model_mapping,p.codex_config_name";
 
 pub struct Database {
     connection: Mutex<Connection>,
@@ -114,6 +114,7 @@ impl Database {
             credential_configured: false,
             credential_preview: None,
             model: input.model.as_ref().map(|model| model.trim().to_owned()),
+            codex_config_name: input.normalized_codex_config_name()?,
             claude_model_mapping: input.claude_model_mapping.clone(),
             revision: 1,
         })
@@ -128,8 +129,8 @@ impl Database {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = unix_time()?;
         transaction.execute(
-            "INSERT INTO providers(id,client,name,description,base_url,auth_scheme,model,revision,official,claude_model_mapping,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)",
-            params![provider.id, provider.client.to_string(), provider.name, provider.description, provider.base_url, provider.auth_scheme.to_string(), provider.model, provider.revision, provider.official, encode_model_mapping(provider)?, now],
+            "INSERT INTO providers(id,client,name,description,base_url,auth_scheme,model,revision,official,claude_model_mapping,codex_config_name,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?12)",
+            params![provider.id, provider.client.to_string(), provider.name, provider.description, provider.base_url, provider.auth_scheme.to_string(), provider.model, provider.revision, provider.official, encode_model_mapping(provider)?, provider.codex_config_name, now],
         ).map_err(map_constraint)?;
         if let Some(secret) = secret {
             upsert_secret(&transaction, secret, now)?;
@@ -148,8 +149,8 @@ impl Database {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = unix_time()?;
         let changed = transaction.execute(
-            "UPDATE providers SET name=?1,description=?2,base_url=?3,auth_scheme=?4,model=?5,claude_model_mapping=?6,revision=revision+1,updated_at=?7 WHERE id=?8 AND client=?9 AND revision=?10",
-            params![provider.name, provider.description, provider.base_url, provider.auth_scheme.to_string(), provider.model, encode_model_mapping(provider)?, now, provider.id, provider.client.to_string(), expected_revision],
+            "UPDATE providers SET name=?1,description=?2,base_url=?3,auth_scheme=?4,model=?5,claude_model_mapping=?6,codex_config_name=?7,revision=revision+1,updated_at=?8 WHERE id=?9 AND client=?10 AND revision=?11",
+            params![provider.name, provider.description, provider.base_url, provider.auth_scheme.to_string(), provider.model, encode_model_mapping(provider)?, provider.codex_config_name, now, provider.id, provider.client.to_string(), expected_revision],
         ).map_err(map_constraint)?;
         if changed == 0 {
             return Err(DaemonError::Conflict(
@@ -263,7 +264,7 @@ impl Database {
         self.connection
             .lock()
             .query_row(
-                "SELECT p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,1,p.claude_model_mapping,s.provider_id,s.key_version,s.nonce,s.ciphertext FROM providers p JOIN provider_secrets s ON s.provider_id=p.id WHERE p.id=?1 AND p.client=?2 AND p.revision=?3",
+                "SELECT p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,1,p.claude_model_mapping,p.codex_config_name,s.provider_id,s.key_version,s.nonce,s.ciphertext FROM providers p JOIN provider_secrets s ON s.provider_id=p.id WHERE p.id=?1 AND p.client=?2 AND p.revision=?3",
                 params![provider_id, client.to_string(), revision],
                 provider_secret_from_row,
             )
@@ -275,7 +276,7 @@ impl Database {
         self.connection
             .lock()
             .query_row(
-                "SELECT p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,1,p.claude_model_mapping,s.provider_id,s.key_version,s.nonce,s.ciphertext FROM client_state c JOIN providers p ON p.id=c.active_provider_id JOIN provider_secrets s ON s.provider_id=p.id WHERE c.client=?1 AND p.client=?1",
+                "SELECT p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,1,p.claude_model_mapping,p.codex_config_name,s.provider_id,s.key_version,s.nonce,s.ciphertext FROM client_state c JOIN providers p ON p.id=c.active_provider_id JOIN provider_secrets s ON s.provider_id=p.id WHERE c.client=?1 AND p.client=?1",
                 [client.to_string()],
                 provider_secret_from_row,
             )
@@ -477,7 +478,7 @@ fn migrate(connection: &Connection) -> Result<()> {
     if version == 0 {
         connection.execute_batch(
             "BEGIN IMMEDIATE;
-         CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY,client TEXT NOT NULL CHECK(client IN ('codex','claude')),name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',base_url TEXT NOT NULL,auth_scheme TEXT NOT NULL CHECK(auth_scheme IN ('bearer','x_api_key','oauth')),model TEXT,revision INTEGER NOT NULL,official INTEGER NOT NULL DEFAULT 0,claude_model_mapping TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(client,name));
+         CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY,client TEXT NOT NULL CHECK(client IN ('codex','claude')),name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',base_url TEXT NOT NULL,auth_scheme TEXT NOT NULL CHECK(auth_scheme IN ('bearer','x_api_key','oauth')),model TEXT,revision INTEGER NOT NULL,official INTEGER NOT NULL DEFAULT 0,claude_model_mapping TEXT,codex_config_name TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(client,name));
          CREATE TABLE IF NOT EXISTS provider_secrets(provider_id TEXT PRIMARY KEY REFERENCES providers(id) ON DELETE CASCADE,key_version INTEGER NOT NULL,nonce BLOB NOT NULL,ciphertext BLOB NOT NULL,updated_at INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS client_state(client TEXT PRIMARY KEY CHECK(client IN ('codex','claude')),active_provider_id TEXT REFERENCES providers(id),mode TEXT NOT NULL CHECK(mode IN ('direct','proxy')),config_status TEXT NOT NULL,updated_at INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL);
@@ -486,7 +487,7 @@ fn migrate(connection: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS protected_values(key TEXT PRIMARY KEY,key_version INTEGER NOT NULL,nonce BLOB NOT NULL,ciphertext BLOB NOT NULL,updated_at INTEGER NOT NULL);
          INSERT OR IGNORE INTO client_state(client,mode,config_status,updated_at) VALUES('codex','direct','unmanaged',0),('claude','direct','unmanaged',0);
          INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES('language','system',0),('proxy_host','127.0.0.1',0),('proxy_port','9999',0),('proxy_enabled','false',0);
-         PRAGMA user_version=5;
+         PRAGMA user_version=6;
          COMMIT;"
         )?;
     } else {
@@ -529,6 +530,16 @@ fn migrate(connection: &Connection) -> Result<()> {
                 "BEGIN IMMEDIATE;
                  ALTER TABLE providers ADD COLUMN claude_model_mapping TEXT;
                  PRAGMA user_version=5;
+                 COMMIT;",
+            )?;
+            version = 5;
+        }
+        if version == 5 {
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE providers ADD COLUMN codex_config_name TEXT;
+                 UPDATE providers SET codex_config_name=CASE WHEN client='codex' THEN 'OpenAI' ELSE NULL END;
+                 PRAGMA user_version=6;
                  COMMIT;",
             )?;
         }
@@ -603,6 +614,7 @@ fn provider_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Provider> {
         official: row.get(8)?,
         credential_configured: row.get(9)?,
         credential_preview: None,
+        codex_config_name: row.get(11)?,
         claude_model_mapping: mapping
             .as_deref()
             .map(serde_json::from_str)
@@ -634,10 +646,10 @@ fn provider_secret_from_row(
 ) -> rusqlite::Result<(Provider, EncryptedSecret)> {
     let provider = provider_from_row(row)?;
     let secret = EncryptedSecret {
-        provider_id: row.get(11)?,
-        key_version: row.get(12)?,
-        nonce: row.get(13)?,
-        ciphertext: row.get(14)?,
+        provider_id: row.get(12)?,
+        key_version: row.get(13)?,
+        nonce: row.get(14)?,
+        ciphertext: row.get(15)?,
     };
     Ok((provider, secret))
 }
@@ -697,10 +709,27 @@ mod tests {
                 base_url: "https://example.test/v1".into(),
                 auth_scheme: AuthScheme::Bearer,
                 model: Some("gpt-test".into()),
+                codex_config_name: Some(hsin_core::OPENAI_CODEX_CONFIG_NAME.into()),
                 claude_model_mapping: None,
             })
             .unwrap();
         assert_eq!(provider.revision, 1);
+        assert_eq!(
+            provider.codex_config_name.as_deref(),
+            Some(hsin_core::OPENAI_CODEX_CONFIG_NAME)
+        );
+        let duplicate_config_name = Database::new_provider(&ProviderInput {
+            client: ClientKind::Codex,
+            name: "Another Codex Provider".into(),
+            description: String::new(),
+            base_url: "https://another.example.test/v1".into(),
+            auth_scheme: AuthScheme::Bearer,
+            model: None,
+            codex_config_name: Some(hsin_core::OPENAI_CODEX_CONFIG_NAME.into()),
+            claude_model_mapping: None,
+        })
+        .unwrap();
+        db.insert_provider(&duplicate_config_name, None).unwrap();
         let second = Database::new_provider(&ProviderInput {
             client: ClientKind::Claude,
             name: "Atomic".into(),
@@ -708,6 +737,7 @@ mod tests {
             base_url: "https://example.test".into(),
             auth_scheme: AuthScheme::XApiKey,
             model: None,
+            codex_config_name: None,
             claude_model_mapping: None,
         })
         .unwrap();
@@ -807,7 +837,11 @@ mod tests {
         assert_eq!(provider.model, None);
         assert!(!provider.official);
         assert!(!provider.credential_configured);
-        assert_eq!(database_version(&path).unwrap(), 5);
+        assert_eq!(database_version(&path).unwrap(), 6);
+        assert_eq!(
+            provider.codex_config_name.as_deref(),
+            Some(hsin_core::DEFAULT_CODEX_CONFIG_NAME)
+        );
         assert_eq!(fs::read_dir(backups).unwrap().count(), 1);
         drop(db);
         fs::remove_dir_all(root).unwrap();
@@ -845,7 +879,11 @@ mod tests {
             db.setting("proxy_enabled").unwrap().as_deref(),
             Some("true")
         );
-        assert_eq!(database_version(&path).unwrap(), 5);
+        assert_eq!(database_version(&path).unwrap(), 6);
+        assert_eq!(
+            provider.codex_config_name.as_deref(),
+            Some(hsin_core::DEFAULT_CODEX_CONFIG_NAME)
+        );
         drop(db);
         fs::remove_dir_all(root).unwrap();
     }
@@ -873,7 +911,7 @@ mod tests {
             ciphertext: vec![1],
         })
         .unwrap();
-        assert_eq!(database_version(&path).unwrap(), 5);
+        assert_eq!(database_version(&path).unwrap(), 6);
         assert!(db.protected_value("backup").unwrap().is_some());
         drop(db);
         fs::remove_dir_all(root).unwrap();
@@ -901,10 +939,11 @@ mod tests {
         drop(connection);
 
         let db = Database::open(&path, &root.join("backups")).unwrap();
-        assert_eq!(database_version(&path).unwrap(), 5);
+        assert_eq!(database_version(&path).unwrap(), 6);
         // Rows written before the column existed read back as "no mapping", not as an error.
         let provider = db.get_provider("p").unwrap();
         assert_eq!(provider.claude_model_mapping, None);
+        assert_eq!(provider.codex_config_name, None);
 
         let mapping = crate::model::ClaudeModelMapping {
             enabled: true,
@@ -923,6 +962,45 @@ mod tests {
             db.get_provider("p").unwrap().claude_model_mapping,
             Some(mapping)
         );
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn version_five_migration_sets_client_appropriate_codex_config_names() {
+        let root = std::env::temp_dir().join(format!("hsind-v5-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("db.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE providers(id TEXT PRIMARY KEY,client TEXT NOT NULL,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',base_url TEXT NOT NULL,auth_scheme TEXT NOT NULL,model TEXT,revision INTEGER NOT NULL,official INTEGER NOT NULL DEFAULT 0,claude_model_mapping TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(client,name));
+                 CREATE TABLE provider_secrets(provider_id TEXT PRIMARY KEY REFERENCES providers(id) ON DELETE CASCADE,key_version INTEGER NOT NULL,nonce BLOB NOT NULL,ciphertext BLOB NOT NULL,updated_at INTEGER NOT NULL);
+                 INSERT INTO providers VALUES('custom','codex','Custom','','https://custom.example.test/v1','bearer',NULL,1,0,NULL,0,0);
+                 INSERT INTO providers VALUES('official','codex','Official','','https://api.openai.com/v1','oauth',NULL,1,1,NULL,0,0);
+                 INSERT INTO providers VALUES('claude','claude','Claude','','https://claude.example.test','x_api_key',NULL,1,0,NULL,0,0);
+                 PRAGMA user_version=5;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let db = Database::open(&path, &root.join("backups")).unwrap();
+        assert_eq!(database_version(&path).unwrap(), 6);
+        assert_eq!(
+            db.get_provider("custom")
+                .unwrap()
+                .codex_config_name
+                .as_deref(),
+            Some(hsin_core::DEFAULT_CODEX_CONFIG_NAME)
+        );
+        assert_eq!(
+            db.get_provider("official")
+                .unwrap()
+                .codex_config_name
+                .as_deref(),
+            Some(hsin_core::OPENAI_CODEX_CONFIG_NAME)
+        );
+        assert_eq!(db.get_provider("claude").unwrap().codex_config_name, None);
         drop(db);
         fs::remove_dir_all(root).unwrap();
     }

@@ -138,6 +138,12 @@ process arguments or shell history. Add `--json` to any command for
 machine-readable output, and `--language system|en-US|zh-CN` (or
 `HSIN_LANGUAGE`) to override the interface language.
 
+Codex providers default their configuration name to `OpenAI`, enabling Codex's
+remote-compaction path. The TUI switch can disable it by writing `hsin`, and the
+same value can be set explicitly with `--config-name`. This changes only
+`[model_providers.hsin].name`; the active selector and provider table key remain
+`hsin`.
+
 Set `HSIN_HOME` to run isolated instances; each one keeps its own storage, IPC
 endpoint, keyring entries and service identity. `CODEX_HOME` and
 `CLAUDE_CONFIG_DIR` redirect the managed client configuration in the same way.

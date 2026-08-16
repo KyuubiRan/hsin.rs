@@ -7,9 +7,10 @@ use std::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hsin_core::{
     AuthScheme, ClaudeModelMapping, ClaudeModelMappingUpdate, ClientAuthSettings, ClientKind,
-    ClientSettings, ConnectionMode, LANGUAGE_EN_US, LANGUAGE_SYSTEM, LANGUAGE_ZH_CN,
-    ModelDiscovery, ModelSlot, ModelUpdate, Provider, Settings, convert_provider_base_url,
-    normalize_generated_provider_name, provider_name_from_url,
+    ClientSettings, CodexConfigNameUpdate, ConnectionMode, DEFAULT_CODEX_CONFIG_NAME,
+    HSIN_CODEX_CONFIG_NAME, LANGUAGE_EN_US, LANGUAGE_SYSTEM, LANGUAGE_ZH_CN, ModelDiscovery,
+    ModelSlot, ModelUpdate, OPENAI_CODEX_CONFIG_NAME, Provider, Settings,
+    convert_provider_base_url, normalize_generated_provider_name, provider_name_from_url,
 };
 use zeroize::Zeroizing;
 
@@ -156,6 +157,7 @@ pub(super) struct ProviderForm {
     pub(super) revision: Option<u64>,
     pub(super) client: ClientKind,
     pub(super) name: String,
+    pub(super) codex_config_name: String,
     pub(super) description: String,
     pub(super) base_url: String,
     pub(super) auth_scheme: AuthScheme,
@@ -186,6 +188,7 @@ pub(super) struct FormSubmission {
     pub(super) auth_scheme: AuthScheme,
     pub(super) secret: Zeroizing<String>,
     pub(super) model: ModelUpdate,
+    pub(super) codex_config_name: CodexConfigNameUpdate,
     pub(super) claude_model_mapping: ClaudeModelMappingUpdate,
 }
 
@@ -506,22 +509,34 @@ impl State {
                 }
                 KeyCode::Esc => self.input = InputMode::Normal,
                 KeyCode::Tab | KeyCode::Down => {
-                    form.field = (form.field + 1) % 5;
+                    form.field = (form.field + 1) % form_field_count(form);
                     form.cursor = caret_end(form_field_text(form));
                     form.error = None;
                 }
                 KeyCode::BackTab | KeyCode::Up => {
-                    form.field = (form.field + 4) % 5;
+                    let count = form_field_count(form);
+                    form.field = (form.field + count - 1) % count;
                     form.cursor = caret_end(form_field_text(form));
                     form.error = None;
                 }
                 KeyCode::Left | KeyCode::Right | KeyCode::Char('j' | 'l' | ' ')
-                    if form.field == 4 =>
+                    if form.field == form_auth_field(form) =>
                 {
                     form.auth_scheme = match form.auth_scheme {
                         AuthScheme::Bearer => AuthScheme::XApiKey,
                         AuthScheme::XApiKey | AuthScheme::OAuth => AuthScheme::Bearer,
                     };
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('j' | 'l' | ' ')
+                    if form.client == ClientKind::Codex && form.field == 4 =>
+                {
+                    form.codex_config_name =
+                        if form.codex_config_name.trim() == OPENAI_CODEX_CONFIG_NAME {
+                            HSIN_CODEX_CONFIG_NAME
+                        } else {
+                            OPENAI_CODEX_CONFIG_NAME
+                        }
+                        .into();
                 }
                 KeyCode::Enter => match take_form_submission(form) {
                     Ok(submission) => {
@@ -545,12 +560,18 @@ impl State {
                     Err(error) => form.error = Some(error),
                 },
                 _ => {
+                    let description_field = form_description_field(form);
                     let cursor = &mut form.cursor;
                     match form.field {
                         0 => edit_text(&mut form.base_url, cursor, key),
                         1 => edit_text(&mut form.secret, cursor, key),
                         2 => edit_text(&mut form.name, cursor, key),
-                        3 => edit_text(&mut form.description, cursor, key),
+                        3 if form.client == ClientKind::Codex => {
+                            edit_text(&mut form.codex_config_name, cursor, key)
+                        }
+                        field if field == description_field => {
+                            edit_text(&mut form.description, cursor, key)
+                        }
                         _ => false,
                     };
                 }
@@ -1056,6 +1077,10 @@ impl State {
                         revision: None,
                         client: self.client,
                         name: String::new(),
+                        codex_config_name: match self.client {
+                            ClientKind::Codex => DEFAULT_CODEX_CONFIG_NAME.into(),
+                            ClientKind::Claude => String::new(),
+                        },
                         description: String::new(),
                         base_url: String::new(),
                         auth_scheme: match self.client {
@@ -1086,6 +1111,12 @@ impl State {
                             revision: Some(provider.revision),
                             client: provider.client,
                             name,
+                            codex_config_name: match provider.client {
+                                ClientKind::Codex => provider
+                                    .codex_config_name
+                                    .unwrap_or_else(|| DEFAULT_CODEX_CONFIG_NAME.into()),
+                                ClientKind::Claude => String::new(),
+                            },
                             description: provider.description,
                             base_url: provider.base_url,
                             auth_scheme: provider.auth_scheme,
@@ -1126,6 +1157,14 @@ impl State {
                         revision: None,
                         client: self.client,
                         name: copied_provider_name(&self.providers, self.client, &source.name),
+                        codex_config_name: match (source.client == self.client, self.client) {
+                            (true, ClientKind::Codex) => source
+                                .codex_config_name
+                                .clone()
+                                .unwrap_or_else(|| DEFAULT_CODEX_CONFIG_NAME.into()),
+                            (false, ClientKind::Codex) => DEFAULT_CODEX_CONFIG_NAME.into(),
+                            (_, ClientKind::Claude) => String::new(),
+                        },
                         description: source.description.clone(),
                         cursor: caret_end(&base_url),
                         base_url,
@@ -1302,7 +1341,8 @@ fn clear_form_field(form: &mut ProviderForm) {
         0 => form.base_url.clear(),
         1 => form.secret.clear(),
         2 => form.name.clear(),
-        3 => form.description.clear(),
+        3 if form.client == ClientKind::Codex => form.codex_config_name.clear(),
+        field if field == form_description_field(form) => form.description.clear(),
         _ => {}
     }
 }
@@ -1326,6 +1366,19 @@ pub(super) fn take_form_submission(
     if name.chars().count() > 128 {
         return Err("validation_name_too_long");
     }
+    let codex_config_name = match form.client {
+        ClientKind::Codex => {
+            let name = form.codex_config_name.trim();
+            if name.is_empty() {
+                return Err("validation_config_name_required");
+            }
+            if name.chars().count() > 128 {
+                return Err("validation_config_name_too_long");
+            }
+            CodexConfigNameUpdate::Set(name.to_owned())
+        }
+        ClientKind::Claude => CodexConfigNameUpdate::Preserve,
+    };
     if form.description.chars().count() > 1024 {
         return Err("validation_description_too_long");
     }
@@ -1347,6 +1400,7 @@ pub(super) fn take_form_submission(
         auth_scheme: form.auth_scheme,
         secret,
         model: ModelUpdate::Preserve,
+        codex_config_name,
         claude_model_mapping: ClaudeModelMappingUpdate::Preserve,
     })
 }
@@ -1424,8 +1478,30 @@ fn form_field_text(form: &ProviderForm) -> &str {
         0 => &form.base_url,
         1 => &form.secret,
         2 => &form.name,
-        3 => &form.description,
+        3 if form.client == ClientKind::Codex => &form.codex_config_name,
+        field if field == form_description_field(form) => &form.description,
         _ => "",
+    }
+}
+
+pub(super) const fn form_field_count(form: &ProviderForm) -> usize {
+    match form.client {
+        ClientKind::Codex => 7,
+        ClientKind::Claude => 5,
+    }
+}
+
+pub(super) const fn form_description_field(form: &ProviderForm) -> usize {
+    match form.client {
+        ClientKind::Codex => 5,
+        ClientKind::Claude => 3,
+    }
+}
+
+pub(super) const fn form_auth_field(form: &ProviderForm) -> usize {
+    match form.client {
+        ClientKind::Codex => 6,
+        ClientKind::Claude => 4,
     }
 }
 
@@ -1440,6 +1516,7 @@ fn take_submission(form: &mut FormSubmission) -> FormSubmission {
         auth_scheme: form.auth_scheme,
         secret: std::mem::take(&mut form.secret),
         model: std::mem::take(&mut form.model),
+        codex_config_name: std::mem::take(&mut form.codex_config_name),
         claude_model_mapping: std::mem::take(&mut form.claude_model_mapping),
     }
 }

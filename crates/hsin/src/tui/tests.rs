@@ -2,7 +2,9 @@ use super::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hsin_core::{
     AuthScheme, ClaudeModelMapping, ClaudeModelMappingUpdate, ClientKind, ClientSettings,
-    LANGUAGE_EN_US, LANGUAGE_SYSTEM, LANGUAGE_ZH_CN, ModelSlot, ModelUpdate, Provider, Settings,
+    CodexConfigNameUpdate, DEFAULT_CODEX_CONFIG_NAME, HSIN_CODEX_CONFIG_NAME, LANGUAGE_EN_US,
+    LANGUAGE_SYSTEM, LANGUAGE_ZH_CN, ModelSlot, ModelUpdate, OPENAI_CODEX_CONFIG_NAME, Provider,
+    Settings,
 };
 use ratatui::{
     backend::TestBackend,
@@ -58,6 +60,7 @@ fn submission() -> FormSubmission {
         auth_scheme: AuthScheme::Bearer,
         secret: Zeroizing::new("secret".into()),
         model: ModelUpdate::Preserve,
+        codex_config_name: CodexConfigNameUpdate::Set(DEFAULT_CODEX_CONFIG_NAME.into()),
         claude_model_mapping: ClaudeModelMappingUpdate::Preserve,
     }
 }
@@ -74,9 +77,29 @@ fn example_provider() -> Provider {
         credential_configured: true,
         credential_preview: Some(String::from("sk-abc***de")),
         model: Some(String::from("gpt-5")),
+        codex_config_name: Some(DEFAULT_CODEX_CONFIG_NAME.into()),
         claude_model_mapping: None,
         revision: 1,
     }
+}
+
+#[test]
+fn provider_requests_carry_the_codex_config_name() {
+    let add = provider_add_params(submission());
+    assert_eq!(
+        add.provider.codex_config_name.as_deref(),
+        Some(DEFAULT_CODEX_CONFIG_NAME)
+    );
+
+    let mut edit = submission();
+    edit.id = Some("provider-1".into());
+    edit.revision = Some(4);
+    edit.codex_config_name = CodexConfigNameUpdate::Set(OPENAI_CODEX_CONFIG_NAME.into());
+    let request = provider_edit_params(edit).expect("edit request");
+    assert_eq!(
+        request.patch.codex_config_name,
+        CodexConfigNameUpdate::Set(OPENAI_CODEX_CONFIG_NAME.into())
+    );
 }
 
 #[test]
@@ -426,7 +449,8 @@ fn home_c_queues_a_revision_bound_provider_copy() {
 
 #[test]
 fn home_v_pastes_a_same_client_copy_as_an_editable_add_form() {
-    let provider = example_provider();
+    let mut provider = example_provider();
+    provider.codex_config_name = Some(OPENAI_CODEX_CONFIG_NAME.into());
     let mut state = State {
         providers: vec![provider.clone()],
         loading: false,
@@ -446,6 +470,7 @@ fn home_v_pastes_a_same_client_copy_as_an_editable_add_form() {
         assert_eq!(form.name, "Example copy");
         assert_eq!(form.base_url, "https://api.example.test/v1");
         assert_eq!(form.auth_scheme, AuthScheme::Bearer);
+        assert_eq!(form.codex_config_name, OPENAI_CODEX_CONFIG_NAME);
         assert!(form.secret.is_empty());
         assert_eq!(
             form.copied_secret.as_deref().map(String::as_str),
@@ -503,6 +528,7 @@ fn home_v_converts_a_codex_provider_for_claude() {
 fn home_v_converts_a_claude_provider_for_codex() {
     let mut provider = example_provider();
     provider.client = ClientKind::Claude;
+    provider.codex_config_name = None;
     provider.base_url = "https://api.example.test".into();
     provider.auth_scheme = AuthScheme::XApiKey;
     let mut state = State {
@@ -521,6 +547,7 @@ fn home_v_converts_a_claude_provider_for_codex() {
             if form.client == ClientKind::Codex
                 && form.base_url == "https://api.example.test/v1"
                 && form.auth_scheme == AuthScheme::Bearer
+                && form.codex_config_name == DEFAULT_CODEX_CONFIG_NAME
     ));
 }
 
@@ -773,6 +800,7 @@ fn add_form_defaults_empty_name_to_base_url_host() {
         revision: None,
         client: ClientKind::Codex,
         name: String::new(),
+        codex_config_name: DEFAULT_CODEX_CONFIG_NAME.into(),
         description: "note".into(),
         base_url: "https://api.example.test/v1".into(),
         auth_scheme: AuthScheme::Bearer,
@@ -795,6 +823,42 @@ fn add_form_defaults_empty_name_to_base_url_host() {
 }
 
 #[test]
+fn codex_form_edits_the_config_name_and_remote_compaction_shortcut() {
+    let mut state = State {
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Char('a')));
+    assert!(matches!(
+        &state.input,
+        InputMode::Form(form) if form.codex_config_name == DEFAULT_CODEX_CONFIG_NAME
+    ));
+
+    for _ in 0..4 {
+        state.reduce(key(KeyCode::Down));
+    }
+    state.reduce(key(KeyCode::Char(' ')));
+    assert!(matches!(
+        &state.input,
+        InputMode::Form(form) if form.codex_config_name == HSIN_CODEX_CONFIG_NAME
+    ));
+
+    state.reduce(key(KeyCode::Up));
+    state.reduce(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    for character in "Gateway".chars() {
+        state.reduce(key(KeyCode::Char(character)));
+    }
+    assert!(matches!(
+        &state.input,
+        InputMode::Form(form) if form.codex_config_name == "Gateway"
+    ));
+    let rendered = render(&mut state, 100, 32);
+    assert!(rendered.contains("Remote compaction"));
+    assert!(rendered.contains("‹ disabled ›"));
+    assert!(!rendered.contains("‹ enabled ›"));
+}
+
+#[test]
 fn edit_form_shortens_only_generated_host_names() {
     let mut generated = example_provider();
     generated.name = "ai.router.team".into();
@@ -814,6 +878,22 @@ fn edit_form_shortens_only_generated_host_names() {
     state.input = InputMode::Normal;
     state.reduce(key(KeyCode::Char('e')));
     assert!(matches!(&state.input, InputMode::Form(form) if form.name == "My Router"));
+}
+
+#[test]
+fn edit_form_prefills_the_codex_config_name() {
+    let mut provider = example_provider();
+    provider.codex_config_name = Some(OPENAI_CODEX_CONFIG_NAME.into());
+    let mut state = State {
+        providers: vec![provider],
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Char('e')));
+    assert!(matches!(
+        &state.input,
+        InputMode::Form(form) if form.codex_config_name == OPENAI_CODEX_CONFIG_NAME
+    ));
 }
 
 #[test]
@@ -878,7 +958,7 @@ fn control_h_toggles_api_key_visibility() {
 fn form_fields_keep_equal_content_height() {
     let popup = centered_fixed(Rect::new(0, 0, 100, 20), 80, 17);
     let inner = Block::default().borders(Borders::ALL).inner(popup);
-    let fields = form_field_areas(inner, 0);
+    let fields = form_field_areas(inner, 0, 5);
     assert_eq!(fields.len(), 5);
     assert!(fields.iter().all(|(_, field)| field.height == 3));
     // The dialog is centered, so the gap above it matches the gap below.
@@ -910,14 +990,14 @@ fn dialogs_stay_centered_as_the_terminal_grows() {
 
 #[test]
 fn short_form_scrolls_without_compressing_fields() {
-    let first = form_field_areas(Rect::new(0, 0, 80, 8), 0);
+    let first = form_field_areas(Rect::new(0, 0, 80, 8), 0, 5);
     assert_eq!(
         first.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
         [0, 1]
     );
     assert!(first.iter().all(|(_, field)| field.height == 3));
 
-    let last = form_field_areas(Rect::new(0, 0, 80, 8), 4);
+    let last = form_field_areas(Rect::new(0, 0, 80, 8), 4, 5);
     assert_eq!(
         last.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
         [3, 4]
@@ -947,7 +1027,7 @@ fn short_terminal_scrolls_the_form_to_the_selected_field() {
     assert!(rendered.contains("Base URL"));
     assert!(!rendered.contains("Auth"));
 
-    for _ in 0..4 {
+    for _ in 0..6 {
         state.reduce(key(KeyCode::Down));
     }
     terminal
@@ -1153,7 +1233,7 @@ fn form_renders_fields_in_requested_order() {
     };
     state.reduce(key(KeyCode::Char('a')));
     let locale = I18n::new(Some("en-US"));
-    let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+    let mut terminal = Terminal::new(TestBackend::new(80, 32)).expect("test terminal");
     terminal
         .draw(|frame| draw(frame, &mut state, &locale))
         .expect("draw form");
@@ -1164,8 +1244,16 @@ fn form_renders_fields_in_requested_order() {
         .iter()
         .map(ratatui::buffer::Cell::symbol)
         .collect::<String>();
-    let positions = ["Base URL", "API key", "Name", "Description", "Auth"]
-        .map(|label| rendered.find(label).expect("field label must render"));
+    let positions = [
+        "Base URL",
+        "API key",
+        "Name",
+        "Config name",
+        "Remote compaction",
+        "Description",
+        "Auth",
+    ]
+    .map(|label| rendered.find(label).expect("field label must render"));
     assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
 }
 
@@ -1425,6 +1513,20 @@ fn official_provider_details_are_localized_and_show_oauth() {
     assert!(compact.contains("官方"));
     assert!(compact.contains("OpenAI官方服务"));
     assert!(rendered.contains("OAuth"));
+}
+
+#[test]
+fn codex_provider_details_show_config_name_and_remote_compaction_state() {
+    let mut provider = example_provider();
+    provider.codex_config_name = Some(OPENAI_CODEX_CONFIG_NAME.into());
+    let mut state = State {
+        providers: vec![provider],
+        loading: false,
+        ..State::default()
+    };
+    let rendered = render(&mut state, 100, 32);
+    assert!(rendered.contains("Config name: OpenAI"));
+    assert!(rendered.contains("Remote compaction: enabled"));
 }
 
 fn text_has_background(
@@ -1999,6 +2101,7 @@ fn claude_form(mapping: Option<ClaudeModelMapping>) -> ProviderForm {
         revision: None,
         client: ClientKind::Claude,
         name: "Claude".into(),
+        codex_config_name: String::new(),
         description: String::new(),
         base_url: "https://api.example.test".into(),
         auth_scheme: AuthScheme::XApiKey,

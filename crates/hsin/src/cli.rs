@@ -132,6 +132,9 @@ pub struct ProviderAdd {
     /// Codex model to write when this provider is selected.
     #[arg(long)]
     pub model: Option<String>,
+    /// Name written to `[model_providers.hsin].name` for Codex.
+    #[arg(long)]
+    pub config_name: Option<String>,
     /// Upstream authentication scheme.
     #[arg(long, value_enum)]
     pub auth_scheme: Option<AuthArg>,
@@ -156,6 +159,9 @@ pub struct ProviderEdit {
     /// New Codex model; omit to preserve the current value.
     #[arg(long)]
     pub model: Option<String>,
+    /// New name written to `[model_providers.hsin].name` for Codex.
+    #[arg(long)]
+    pub config_name: Option<String>,
     /// New upstream authentication scheme.
     #[arg(long, value_enum)]
     pub auth_scheme: Option<AuthArg>,
@@ -410,6 +416,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_codex_provider_config_name() {
+        let cli = Cli::try_parse_from([
+            "hsin",
+            "provider",
+            "add",
+            "codex",
+            "--base-url",
+            "https://router.example.test/v1",
+            "--config-name",
+            "OpenAI",
+        ])
+        .expect("valid command");
+        let Some(Command::Provider {
+            command: ProviderCommand::Add(args),
+        }) = cli.command
+        else {
+            panic!("expected a provider add command");
+        };
+        assert_eq!(args.config_name.as_deref(), Some("OpenAI"));
+    }
+
+    #[test]
     fn parses_settings_set_for_a_remote_listener() {
         // Reaching the proxy from another host needs a wildcard bind and a free
         // port. Neither was reachable from the CLI before, only from the TUI.
@@ -497,6 +525,7 @@ mod tests {
         for expected in [
             "Client that will use the provider",
             "Provider API base URL",
+            "Name written to [model_providers.hsin].name for Codex",
             "Upstream authentication scheme",
             "Read the API key from standard input instead of process arguments",
         ] {

@@ -17,7 +17,10 @@ use sha2::{Digest, Sha256};
 use toml_edit::{DocumentMut, ImDocument, Item, Table, value};
 use zeroize::{Zeroize, Zeroizing};
 
-use hsin_core::{CLAUDE_MODEL_ENV_KEYS, CLAUDE_MODEL_NAME_ENV_KEYS};
+use hsin_core::{
+    CLAUDE_MODEL_ENV_KEYS, CLAUDE_MODEL_NAME_ENV_KEYS, DEFAULT_CODEX_CONFIG_NAME,
+    OPENAI_CODEX_CONFIG_NAME,
+};
 
 use crate::{
     error::{DaemonError, Result},
@@ -30,6 +33,7 @@ pub const HSIN_MANAGED_KEY: &str = "HSIN_MANAGED_KEY";
 
 pub struct DetectedProvider {
     pub name: String,
+    pub codex_config_name: Option<String>,
     pub base_url: String,
     pub auth_scheme: AuthScheme,
     pub secret: Option<Zeroizing<String>>,
@@ -258,6 +262,7 @@ fn detect_codex(text: &str, auth_text: &str) -> Result<DetectedProvider> {
         }
         return Ok(DetectedProvider {
             name: imported_name("OpenAI", &base_url),
+            codex_config_name: Some(OPENAI_CODEX_CONFIG_NAME.into()),
             base_url,
             auth_scheme: AuthScheme::Bearer,
             secret: std::env::var("OPENAI_API_KEY")
@@ -320,6 +325,7 @@ fn detect_codex(text: &str, auth_text: &str) -> Result<DetectedProvider> {
         })
         .or(auth_secret);
     Ok(DetectedProvider {
+        codex_config_name: Some(name.clone()),
         name,
         base_url,
         auth_scheme: AuthScheme::Bearer,
@@ -366,6 +372,7 @@ fn detect_claude(text: &str) -> Result<DetectedProvider> {
     let api_key = api_key_value.filter(|value| is_importable_secret(value));
     Ok(DetectedProvider {
         name: imported_name("Claude", &base_url),
+        codex_config_name: None,
         base_url,
         auth_scheme: if auth_token_value.is_some() {
             AuthScheme::Bearer
@@ -386,6 +393,7 @@ pub fn official_provider(client: ClientKind) -> DetectedProvider {
     };
     DetectedProvider {
         name: "Official".into(),
+        codex_config_name: (client == ClientKind::Codex).then(|| OPENAI_CODEX_CONFIG_NAME.into()),
         base_url: base_url.into(),
         auth_scheme: AuthScheme::OAuth,
         secret: None,
@@ -596,7 +604,13 @@ fn codex_provider_table(target: &ConfigTarget, credential: Option<&str>) -> Resu
     };
     let mut provider = Table::new();
     provider.set_implicit(false);
-    provider["name"] = value("hsin");
+    provider["name"] = value(
+        target
+            .provider
+            .codex_config_name
+            .as_deref()
+            .unwrap_or(DEFAULT_CODEX_CONFIG_NAME),
+    );
     provider["base_url"] = value(base_url);
     provider["wire_api"] = value("responses");
     if target.provider.official {
@@ -1517,6 +1531,8 @@ mod tests {
                 credential_configured: true,
                 credential_preview: None,
                 model: None,
+                codex_config_name: (client == ClientKind::Codex)
+                    .then(|| DEFAULT_CODEX_CONFIG_NAME.into()),
                 revision: 1,
                 claude_model_mapping: None,
             },
@@ -1560,6 +1576,7 @@ mod tests {
         .unwrap();
         assert!(!custom.official);
         assert_eq!(custom.name, "Acme");
+        assert_eq!(custom.codex_config_name.as_deref(), Some("Acme"));
         assert_eq!(custom.auth_scheme, AuthScheme::Bearer);
         assert!(custom.secret.is_some());
 
@@ -1647,6 +1664,7 @@ mod tests {
             credential_configured: false,
             credential_preview: None,
             model: None,
+            codex_config_name: Some(OPENAI_CODEX_CONFIG_NAME.into()),
             revision: 1,
             claude_model_mapping: None,
         };
@@ -1673,6 +1691,7 @@ mod tests {
             credential_configured: false,
             credential_preview: None,
             model: None,
+            codex_config_name: None,
             revision: 1,
             claude_model_mapping: None,
         };
@@ -1771,6 +1790,23 @@ mod tests {
         );
         assert_crlf_only(&output);
         assert!(output.contains("[model_providers.hsin.auth]"));
+    }
+
+    #[test]
+    fn codex_config_name_does_not_change_the_selector_or_table_key() {
+        for mode in [ConnectionMode::Direct, ConnectionMode::Proxy] {
+            let mut codex = target(ClientKind::Codex);
+            codex.mode = mode;
+            codex.provider.codex_config_name = Some(OPENAI_CODEX_CONFIG_NAME.into());
+            let output = patch_codex("", &codex).unwrap();
+            let document = output.parse::<DocumentMut>().unwrap();
+            assert_eq!(document["model_provider"].as_str(), Some("hsin"));
+            assert_eq!(
+                document["model_providers"]["hsin"]["name"].as_str(),
+                Some(OPENAI_CODEX_CONFIG_NAME)
+            );
+            assert!(document["model_providers"].get("OpenAI").is_none());
+        }
     }
 
     #[test]
@@ -1937,6 +1973,7 @@ mod tests {
             credential_configured: false,
             credential_preview: None,
             model: None,
+            codex_config_name: None,
             revision: 1,
             claude_model_mapping: None,
         };
@@ -2186,7 +2223,7 @@ mod tests {
             &output,
             &[
                 "model = \"gpt-test\"\nmodel_provider = \"hsin\" # selector comment\n",
-                "[model_providers.hsin]\nname = \"hsin\"\nbase_url = \"https://example.test/v1\"\nwire_api = \"responses\"\n",
+                "[model_providers.hsin]\nname = \"OpenAI\"\nbase_url = \"https://example.test/v1\"\nwire_api = \"responses\"\n",
                 "[model_providers.hsin.auth]\ncommand = \"/opt/hsin\"\n",
                 "# keep-table comment\n[model_providers.keep]\nbase_url = \"https://keep.example\"\n\n[profiles.\"心\"]\nmodel = \"不可修改\"\n",
             ],

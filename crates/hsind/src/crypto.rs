@@ -505,6 +505,7 @@ fn make_verifier(key: &[u8; KEY_BYTES], version: u32) -> Result<(Vec<u8>, Vec<u8
         credential_configured: false,
         credential_preview: None,
         model: None,
+        codex_config_name: None,
         claude_model_mapping: None,
         revision: 0,
     };
@@ -525,6 +526,7 @@ fn verify_key(key: &[u8; KEY_BYTES], version: u32, nonce: &[u8], verifier: &[u8]
         credential_configured: false,
         credential_preview: None,
         model: None,
+        codex_config_name: None,
         claude_model_mapping: None,
         revision: 0,
     };
@@ -693,6 +695,7 @@ mod tests {
                 base_url: "https://example.test".into(),
                 auth_scheme: AuthScheme::Bearer,
                 model: None,
+                codex_config_name: None,
                 claude_model_mapping: None,
             })
             .unwrap();
