@@ -58,7 +58,7 @@ function Get-Sha256 {
 }
 
 function Get-ServiceRegistrationState {
-    param([string]$Cli, [string]$Home)
+    param([string]$Cli, [string]$ServiceHome)
 
     if (-not (Test-Path -LiteralPath $Cli -PathType Leaf -ErrorAction SilentlyContinue)) {
         return $null
@@ -83,7 +83,7 @@ function Get-ServiceRegistrationState {
     if ($codes -contains "service_check_failed") { return $null }
     if ($codes -contains "service_definition_missing") { return $false }
     if ($codes -contains "service_definition_orphaned") { return $true }
-    return Test-Path -LiteralPath (Join-Path $Home ".hsin-home") -PathType Leaf
+    return Test-Path -LiteralPath (Join-Path $ServiceHome ".hsin-home") -PathType Leaf
 }
 
 function Invoke-DaemonUpdate {
