@@ -43,13 +43,12 @@ fn short_dialog_scroll_indicators(state: &mut State) -> (bool, bool) {
         .expect("draw short dialog");
     let buffer = terminal.backend().buffer();
     let center_column = 39;
-    let has_above = buffer
-        .content()
-        .chunks_exact(80)
+    let rows = buffer.content().as_chunks::<80>().0;
+    let has_above = rows
+        .iter()
         .any(|row| row[center_column].symbol() == "^" && row[center_column].fg == WHITE);
-    let has_below = buffer
-        .content()
-        .chunks_exact(80)
+    let has_below = rows
+        .iter()
         .any(|row| row[center_column].symbol() == "v" && row[center_column].fg == WHITE);
     (has_above, has_below)
 }
@@ -1480,12 +1479,7 @@ fn short_terminal_scrolls_the_form_to_the_selected_field() {
         .collect::<String>();
     assert!(rendered.contains("Base URL"));
     assert!(!rendered.contains("Auth"));
-    let rows = terminal
-        .backend()
-        .buffer()
-        .content()
-        .chunks_exact(80)
-        .collect::<Vec<_>>();
+    let rows = terminal.backend().buffer().content().as_chunks::<80>().0;
     assert!(
         !rows[0]
             .iter()
@@ -1503,12 +1497,7 @@ fn short_terminal_scrolls_the_form_to_the_selected_field() {
     terminal
         .draw(|frame| draw(frame, &mut state, &locale))
         .expect("draw middle of short form");
-    let rows = terminal
-        .backend()
-        .buffer()
-        .content()
-        .chunks_exact(80)
-        .collect::<Vec<_>>();
+    let rows = terminal.backend().buffer().content().as_chunks::<80>().0;
     assert!(
         rows[0]
             .iter()
@@ -1535,12 +1524,7 @@ fn short_terminal_scrolls_the_form_to_the_selected_field() {
         .collect::<String>();
     assert!(!rendered.contains("Base URL"));
     assert!(rendered.contains("Auth"));
-    let rows = terminal
-        .backend()
-        .buffer()
-        .content()
-        .chunks_exact(80)
-        .collect::<Vec<_>>();
+    let rows = terminal.backend().buffer().content().as_chunks::<80>().0;
     assert!(
         rows[0]
             .iter()

@@ -1374,8 +1374,10 @@ mod tests {
             "schtasks needs the byte order mark to stop decoding the file as ANSI"
         );
         let units: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect();
         assert!(String::from_utf16(&units).unwrap().contains(daemon));
 

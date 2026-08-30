@@ -215,7 +215,7 @@ async fn forward(
     let outgoing_body = if image_request {
         match rewrite_image_body(body, declared_content_length, &provider).await {
             Ok(body) => body,
-            Err(response) => return response,
+            Err(response) => return *response,
         }
     } else {
         reqwest::Body::wrap_stream(body.into_data_stream())
@@ -268,26 +268,30 @@ async fn rewrite_image_body(
     body: Body,
     declared_content_length: Option<usize>,
     provider: &Provider,
-) -> std::result::Result<reqwest::Body, Response<Body>> {
+) -> std::result::Result<reqwest::Body, Box<Response<Body>>> {
     if declared_content_length.is_some_and(|length| length > MAX_IMAGE_REQUEST_BYTES) {
-        return Err(text_response(
+        return Err(Box::new(text_response(
             StatusCode::PAYLOAD_TOO_LARGE,
             "image request body exceeds 256 MiB",
-        ));
+        )));
     }
     let Ok(body) = to_bytes(body, MAX_IMAGE_REQUEST_BYTES).await else {
-        return Err(text_response(
+        return Err(Box::new(text_response(
             StatusCode::PAYLOAD_TOO_LARGE,
             "image request body exceeds 256 MiB",
-        ));
+        )));
     };
-    let mut value: serde_json::Value = serde_json::from_slice(&body)
-        .map_err(|_| text_response(StatusCode::BAD_REQUEST, "invalid image request JSON"))?;
+    let mut value: serde_json::Value = serde_json::from_slice(&body).map_err(|_| {
+        Box::new(text_response(
+            StatusCode::BAD_REQUEST,
+            "invalid image request JSON",
+        ))
+    })?;
     let Some(object) = value.as_object_mut() else {
-        return Err(text_response(
+        return Err(Box::new(text_response(
             StatusCode::BAD_REQUEST,
             "image request must be a JSON object",
-        ));
+        )));
     };
     let requested = object.get("model").and_then(serde_json::Value::as_str);
     let selected = requested
@@ -300,10 +304,10 @@ async fn rewrite_image_body(
         })
         .or(provider.codex_image.preferred_model.as_deref());
     let Some(selected) = selected else {
-        return Err(text_response(
+        return Err(Box::new(text_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "active Codex image provider has no preferred model",
-        ));
+        )));
     };
     object.insert(
         "model".into(),
@@ -312,10 +316,10 @@ async fn rewrite_image_body(
     serde_json::to_vec(&value)
         .map(reqwest::Body::from)
         .map_err(|_| {
-            text_response(
+            Box::new(text_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "failed to encode image request",
-            )
+            ))
         })
 }
 
