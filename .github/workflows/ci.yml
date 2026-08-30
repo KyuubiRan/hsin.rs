@@ -20,3 +20,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - if: runner.os == 'Windows'
+        name: Test Windows installer
+        shell: powershell
+        run: ./scripts/test-install.ps1

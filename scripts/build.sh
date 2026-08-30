@@ -191,6 +191,16 @@ if [ "$clean" = true ]; then
 fi
 mkdir -p -- "$output"
 
+# Replacing a previously executed Mach-O in place can leave macOS with cached
+# code-signing pages for the old inode, causing the new binary to be killed as
+# "Code Signature Invalid". Stage each output on a fresh inode, then rename it
+# into place atomically.
+stage_dir=$(mktemp -d "$output/.hsin-build.XXXXXX")
+cleanup_stage() {
+  rm -rf -- "$stage_dir"
+}
+trap cleanup_stage EXIT
+
 suffix=
 case "$target" in
   *-windows-*) suffix=.exe ;;
@@ -202,7 +212,8 @@ for binary in hsin hsind; do
     echo "missing build output: $source" >&2
     exit 1
   fi
-  cp -f -- "$source" "$output/$binary$suffix"
+  cp -- "$source" "$stage_dir/$binary$suffix"
+  mv -f -- "$stage_dir/$binary$suffix" "$output/$binary$suffix"
 done
 
 cp -f -- "$repo_root/README.md" "$output/README.md"
