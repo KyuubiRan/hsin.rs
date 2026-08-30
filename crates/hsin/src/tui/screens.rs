@@ -12,6 +12,7 @@ use super::{
 
 mod header;
 mod home;
+mod image_picker;
 mod model_mapping;
 mod model_picker;
 mod provider_form;
@@ -21,6 +22,7 @@ use header::draw_header;
 #[cfg(test)]
 pub(super) use header::{TITLE, VERSION_LABEL};
 use home::{draw_details, draw_provider_list, draw_search};
+use image_picker::{draw_image_import, draw_image_models, draw_image_source};
 use model_mapping::draw_model_mapping;
 use model_picker::draw_models;
 use provider_form::draw_form;
@@ -95,6 +97,13 @@ pub(super) fn draw(frame: &mut Frame<'_>, state: &mut State, i18n: &I18n) {
         InputMode::Search { .. } | InputMode::Normal | InputMode::DeleteConfirm { .. } => {}
         InputMode::Form(_) => unreachable!("provider form is drawn over the footer"),
         InputMode::Models(picker) => draw_models(frame, rows[2], picker, i18n),
+        InputMode::ImageModels(picker) => draw_image_models(frame, rows[2], picker, i18n),
+        InputMode::ImageSource { selected } => {
+            draw_image_source(frame, rows[2], *selected, i18n);
+        }
+        InputMode::ImageImport { selected } => {
+            draw_image_import(frame, rows[2], state, *selected, i18n);
+        }
         InputMode::ModelMapping(mapping) => draw_model_mapping(frame, overlay, mapping, i18n),
         InputMode::Settings(_) => unreachable!("settings screen is drawn before the home page"),
     }

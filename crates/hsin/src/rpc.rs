@@ -21,6 +21,8 @@ pub struct StatusSnapshot {
     pub codex_active_provider: Option<String>,
     #[serde(default)]
     pub claude_active_provider: Option<String>,
+    #[serde(default)]
+    pub codex_image_active_provider: Option<String>,
     #[serde(default = "direct")]
     pub codex_mode: ConnectionMode,
     #[serde(default = "direct")]
@@ -41,6 +43,7 @@ impl Default for StatusSnapshot {
             providers: Vec::new(),
             codex_active_provider: None,
             claude_active_provider: None,
+            codex_image_active_provider: None,
             codex_mode: ConnectionMode::Direct,
             claude_mode: ConnectionMode::Direct,
             proxy_enabled: false,
@@ -218,6 +221,7 @@ fn decode_status(value: &Value) -> Result<StatusSnapshot> {
         let mut status = StatusSnapshot {
             security_locked: daemon.locked,
             proxy_enabled: daemon.proxy_enabled,
+            codex_image_active_provider: daemon.codex_image_active_provider_id,
             ..StatusSnapshot::default()
         };
         for client in daemon.clients {
@@ -249,6 +253,10 @@ fn decode_status(value: &Value) -> Result<StatusSnapshot> {
         .get("proxy_enabled")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    status.codex_image_active_provider = value
+        .get("codex_image_active_provider_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     Ok(status)
 }
 

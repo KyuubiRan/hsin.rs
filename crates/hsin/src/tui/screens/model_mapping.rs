@@ -10,13 +10,13 @@ use crate::i18n::I18n;
 use super::super::{
     state::{MAPPING_TIERS, ModelMappingForm},
     theme::{INPUT_BG, MUTED, RED, WHITE},
-    widgets::{centered_fixed, content_width, draw_input_field},
+    widgets::{
+        centered_fixed, content_width, draw_input_field, draw_row_scroll_indicators, scrolling_rows,
+    },
 };
 
 const ROW_HEIGHT: u16 = 3;
-const TIER_COUNT: u16 = 4;
-/// Master toggle, default model, and one row per tier, inside the popup border.
-const POPUP_HEIGHT: u16 = ROW_HEIGHT * (TIER_COUNT + 2) + 2;
+const FIELD_COUNT: usize = MAPPING_TIERS.len() + 2;
 /// Reserved on a model row for the trailing 1M checkbox: `[x]` plus its borders.
 const CHECKBOX_WIDTH: u16 = 5;
 
@@ -30,7 +30,12 @@ pub(super) fn draw_model_mapping(
     let width = content_width(area, 64, 64, 100)
         .max(proportional_width)
         .min(area.width);
-    let popup = centered_fixed(area, width, POPUP_HEIGHT.min(area.height));
+    // Master toggle, default model, and one row per tier, inside the popup border.
+    let popup_height = u16::try_from(FIELD_COUNT)
+        .unwrap_or(u16::MAX)
+        .saturating_mul(ROW_HEIGHT)
+        .saturating_add(2);
+    let popup = centered_fixed(area, width, popup_height.min(area.height));
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .title(i18n.text("model_mapping"))
@@ -39,76 +44,64 @@ pub(super) fn draw_model_mapping(
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let row = |index: u16| Rect {
-        x: inner.x,
-        y: inner.y.saturating_add(index * ROW_HEIGHT),
-        width: inner.width,
-        height: ROW_HEIGHT,
-    };
-    let rows = usize::from(inner.height / ROW_HEIGHT);
-    if rows == 0 {
-        return;
-    }
-
-    draw_toggle(
-        frame,
-        row(0),
-        i18n.text("model_mapping_enabled"),
-        mapping.enabled,
-        mapping.field == 0,
-    );
-
-    if rows > 1 {
-        let (field_area, checkbox_area) = model_row_areas(row(1));
-        let selected = mapping.enabled && mapping.field == 1;
-        draw_input_field(
-            frame,
-            field_area,
-            i18n.text("model_mapping_default"),
-            &mapping.default_model,
-            None,
-            selected.then_some(mapping.cursor),
-            mapping.enabled,
-        );
-        draw_checkbox(
-            frame,
-            checkbox_area,
-            mapping.default_context_1m,
-            selected,
-            mapping.enabled,
-            i18n,
-        );
-    }
-
-    for (index, tier) in MAPPING_TIERS.iter().enumerate() {
-        let Ok(offset) = u16::try_from(index + 2) else {
-            break;
-        };
-        if usize::from(offset) >= rows {
-            break;
+    let rows = scrolling_rows(inner, mapping.field, FIELD_COUNT, ROW_HEIGHT);
+    for &(index, area) in &rows {
+        match index {
+            0 => draw_toggle(
+                frame,
+                area,
+                i18n.text("model_mapping_enabled"),
+                mapping.enabled,
+                mapping.field == 0,
+            ),
+            1 => {
+                let (field_area, checkbox_area) = model_row_areas(area);
+                let selected = mapping.enabled && mapping.field == 1;
+                draw_input_field(
+                    frame,
+                    field_area,
+                    i18n.text("model_mapping_default"),
+                    &mapping.default_model,
+                    None,
+                    selected.then_some(mapping.cursor),
+                    mapping.enabled,
+                );
+                draw_checkbox(
+                    frame,
+                    checkbox_area,
+                    mapping.default_context_1m,
+                    selected,
+                    mapping.enabled,
+                    i18n,
+                );
+            }
+            _ => {
+                let tier_index = index - 2;
+                let tier = &MAPPING_TIERS[tier_index];
+                let value = &mapping.rows[tier_index];
+                let selected = mapping.enabled && mapping.field == index;
+                let (field_area, checkbox_area) = model_row_areas(area);
+                draw_input_field(
+                    frame,
+                    field_area,
+                    tier.label,
+                    &value.model,
+                    Some(tier.default_model),
+                    selected.then_some(mapping.cursor),
+                    mapping.enabled,
+                );
+                draw_checkbox(
+                    frame,
+                    checkbox_area,
+                    value.context_1m,
+                    selected,
+                    mapping.enabled,
+                    i18n,
+                );
+            }
         }
-        let area = row(offset);
-        let selected = mapping.enabled && mapping.field == index + 2;
-        let value = &mapping.rows[index];
-        let (field_area, checkbox_area) = model_row_areas(area);
-        draw_input_field(
-            frame,
-            field_area,
-            tier.label,
-            &value.model,
-            Some(tier.default_model),
-            selected.then_some(mapping.cursor),
-            mapping.enabled,
-        );
-        draw_checkbox(
-            frame,
-            checkbox_area,
-            value.context_1m,
-            selected,
-            mapping.enabled,
-            i18n,
-        );
     }
+    draw_row_scroll_indicators(frame, popup, &rows, FIELD_COUNT);
 }
 
 fn model_row_areas(area: Rect) -> (Rect, Rect) {

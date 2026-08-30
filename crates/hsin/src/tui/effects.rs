@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use hsin_core::{
     ClaudeModelMappingUpdate, ClientAuthUpdate, ClientKind, ClientSettings, CodexConfigNameUpdate,
-    ConnectionMode, ImportCurrentParams, ImportCurrentResult, ModeSetParams, ModelDiscoverParams,
-    ModelUpdate, Provider, ProviderAddParams, ProviderDraft, ProviderEditParams, ProviderPatch,
+    CodexImageConfigUpdate, CodexImageListParams, CodexImageSwitchParams, ConnectionMode,
+    ImportCurrentParams, ImportCurrentResult, ModeSetParams, ModelDiscoverParams, ModelUpdate,
+    Provider, ProviderAddParams, ProviderDraft, ProviderEditParams, ProviderPatch,
     ProviderRemoveParams, ProviderSwitchParams, SecretInput, Settings, SettingsPatch,
 };
 use serde_json::{Value, json};
@@ -18,6 +19,7 @@ pub(super) enum Effect {
         client: ClientKind,
         id: String,
     },
+    SwitchImage(String),
     SetMode {
         client: ClientKind,
         mode: ConnectionMode,
@@ -41,6 +43,10 @@ pub(super) enum Effect {
         expected_revision: u64,
     },
     SetLanguage(String),
+    SetUpstreamProxy {
+        config: hsin_core::UpstreamProxyConfig,
+        password: SecretInput,
+    },
 }
 
 pub(super) async fn worker(
@@ -60,6 +66,12 @@ pub(super) async fn worker(
                 } else {
                     SecretInput::Replace(form.secret.to_string())
                 },
+                network_proxy: form.network_proxy.clone(),
+                proxy_password: proxy_password_input(
+                    &form.proxy_password,
+                    form.proxy_password_clear,
+                    form.id.is_some(),
+                ),
             };
             match client.call("provider.discover_models", &request).await {
                 Ok(discovery) => {
@@ -143,6 +155,15 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
                 .await?;
             Ok(Some("switched"))
         }
+        Effect::SwitchImage(provider_id) => {
+            let _: Value = client
+                .call(
+                    "codex_image.switch",
+                    &CodexImageSwitchParams { provider_id },
+                )
+                .await?;
+            Ok(Some("image_provider_switched"))
+        }
         Effect::SetMode { client: kind, mode } => {
             let _: Value = client
                 .call("mode.set", &ModeSetParams { client: kind, mode })
@@ -198,6 +219,9 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
             Ok(Some("provider_removed"))
         }
         Effect::SetLanguage(language) => update_language(client, language).await,
+        Effect::SetUpstreamProxy { config, password } => {
+            update_upstream_proxy(client, config, password).await
+        }
         Effect::DiscoverModels(_) => unreachable!("model discovery is handled by the worker"),
         Effect::CopyProvider(_) => unreachable!("provider copying is handled by the worker"),
     }
@@ -208,6 +232,11 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
 /// Split out from the call itself so the fields the form carries — the Claude model mapping in
 /// particular — can be checked without a running daemon.
 pub(super) fn provider_add_params(form: FormSubmission) -> ProviderAddParams {
+    let proxy_password = proxy_password_input(
+        &form.proxy_password,
+        form.proxy_password_clear,
+        form.id.is_some(),
+    );
     let model = match form.model {
         ModelUpdate::Set(model) => Some(model),
         ModelUpdate::Preserve | ModelUpdate::Clear => None,
@@ -230,7 +259,11 @@ pub(super) fn provider_add_params(form: FormSubmission) -> ProviderAddParams {
             model,
             codex_config_name,
             claude_model_mapping,
+            scope: form.scope,
+            codex_image: form.codex_image,
+            network_proxy: form.network_proxy,
         },
+        proxy_password,
         secret: if form.secret.is_empty() {
             SecretInput::Clear
         } else {
@@ -240,6 +273,11 @@ pub(super) fn provider_add_params(form: FormSubmission) -> ProviderAddParams {
 }
 
 pub(super) fn provider_edit_params(form: FormSubmission) -> Result<ProviderEditParams> {
+    let proxy_password = proxy_password_input(
+        &form.proxy_password,
+        form.proxy_password_clear,
+        form.id.is_some(),
+    );
     Ok(ProviderEditParams {
         id: form.id.context("edit form is missing provider ID")?,
         expected_revision: form
@@ -253,13 +291,30 @@ pub(super) fn provider_edit_params(form: FormSubmission) -> Result<ProviderEditP
             model: form.model,
             codex_config_name: form.codex_config_name,
             claude_model_mapping: form.claude_model_mapping,
+            codex_image: CodexImageConfigUpdate::Set(form.codex_image),
+            network_proxy: Some(form.network_proxy),
         },
         secret: if form.secret.is_empty() {
             SecretInput::Preserve
         } else {
             SecretInput::Replace(form.secret.to_string())
         },
+        proxy_password,
     })
+}
+
+fn proxy_password_input(password: &str, clear: bool, existing_provider: bool) -> SecretInput {
+    if clear {
+        SecretInput::Clear
+    } else if password.is_empty() {
+        if existing_provider {
+            SecretInput::Preserve
+        } else {
+            SecretInput::Clear
+        }
+    } else {
+        SecretInput::Replace(password.to_owned())
+    }
 }
 
 async fn resolve_provider_copy(
@@ -314,6 +369,7 @@ async fn update_proxy_enabled(
                 clients: None,
                 client_auth: None,
                 claude_model_names_enabled: None,
+                upstream_proxy: None,
             },
         )
         .await?;
@@ -336,6 +392,7 @@ async fn update_proxy_host(client: &DaemonClient, host: String) -> Result<Option
                 clients: None,
                 client_auth: None,
                 claude_model_names_enabled: None,
+                upstream_proxy: None,
             },
         )
         .await?;
@@ -354,6 +411,7 @@ async fn update_proxy_port(client: &DaemonClient, port: u16) -> Result<Option<&'
                 clients: None,
                 client_auth: None,
                 claude_model_names_enabled: None,
+                upstream_proxy: None,
             },
         )
         .await?;
@@ -372,10 +430,28 @@ async fn update_language(client: &DaemonClient, language: String) -> Result<Opti
                 clients: None,
                 client_auth: None,
                 claude_model_names_enabled: None,
+                upstream_proxy: None,
             },
         )
         .await?;
     Ok(Some("language_changed"))
+}
+
+async fn update_upstream_proxy(
+    client: &DaemonClient,
+    config: hsin_core::UpstreamProxyConfig,
+    password: SecretInput,
+) -> Result<Option<&'static str>> {
+    let _: Settings = client
+        .call(
+            "settings.set",
+            &SettingsPatch {
+                upstream_proxy: Some(hsin_core::UpstreamProxyUpdate { config, password }),
+                ..SettingsPatch::default()
+            },
+        )
+        .await?;
+    Ok(Some("upstream_proxy_changed"))
 }
 
 async fn update_clients(
@@ -393,6 +469,7 @@ async fn update_clients(
                 clients: Some(clients),
                 client_auth: None,
                 claude_model_names_enabled: None,
+                upstream_proxy: None,
             },
         )
         .await?;
@@ -418,6 +495,7 @@ async fn update_client_auth(
                     disable_custom_auth,
                 }),
                 claude_model_names_enabled: None,
+                upstream_proxy: None,
             },
         )
         .await?;
@@ -439,6 +517,7 @@ async fn update_claude_model_names(
                 clients: None,
                 client_auth: None,
                 claude_model_names_enabled: Some(enabled),
+                upstream_proxy: None,
             },
         )
         .await?;
@@ -446,7 +525,15 @@ async fn update_claude_model_names(
 }
 
 async fn load(client: &DaemonClient) -> Result<(Vec<Provider>, StatusSnapshot, Settings)> {
-    let providers = client.provider_list(None).await?;
+    let mut providers = client.provider_list(None).await?;
+    let image_providers: Vec<Provider> = client
+        .call("codex_image.list", &CodexImageListParams::default())
+        .await?;
+    providers.extend(
+        image_providers
+            .into_iter()
+            .filter(|provider| provider.scope == hsin_core::ProviderScope::ImageOnly),
+    );
     let mut status = client.status().await?;
     status.recovery_key_exported = client.security_status().await?.recovery_key_configured;
     let settings = client.call("settings.get", &serde_json::json!({})).await?;

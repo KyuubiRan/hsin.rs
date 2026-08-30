@@ -51,6 +51,8 @@ pub struct ConfigTarget {
     pub proxy_port: u16,
     #[serde(default)]
     pub disable_custom_auth: bool,
+    #[serde(default)]
+    pub codex_image_enabled: bool,
     #[serde(default = "default_true")]
     pub claude_model_names_enabled: bool,
     /// Present only when this operation also changes the persisted client-level switch.
@@ -617,28 +619,39 @@ fn codex_provider_table(target: &ConfigTarget, credential: Option<&str>) -> Resu
         provider["requires_openai_auth"] = value(true);
         return Ok(provider);
     }
-    if target.disable_custom_auth {
+    if target.disable_custom_auth
+        && !(target.mode == ConnectionMode::Proxy && target.codex_image_enabled)
+    {
         let _ = configured_key(target, credential)?;
         provider["requires_openai_auth"] = value(true);
         return Ok(provider);
     }
-    let mut auth = Table::new();
-    auth["command"] = value(target.credential_command.clone());
-    let args = match target.mode {
-        ConnectionMode::Direct => vec![
-            "credential".to_owned(),
-            "codex".to_owned(),
-            "--provider-id".to_owned(),
-            target.provider.id.clone(),
-            "--revision".to_owned(),
-            target.provider.revision.to_string(),
-        ],
-        ConnectionMode::Proxy => vec!["credential".to_owned(), "codex".to_owned()],
-    };
-    auth["args"] = toml_edit::value(toml_edit::Array::from_iter(args));
-    auth["timeout_ms"] = value(5000);
-    auth["refresh_interval_ms"] = value(0);
-    provider.insert("auth", Item::Table(auth));
+    if target.disable_custom_auth {
+        provider["experimental_bearer_token"] = value(HSIN_MANAGED_KEY);
+    } else {
+        let mut auth = Table::new();
+        auth["command"] = value(target.credential_command.clone());
+        let args = match target.mode {
+            ConnectionMode::Direct => vec![
+                "credential".to_owned(),
+                "codex".to_owned(),
+                "--provider-id".to_owned(),
+                target.provider.id.clone(),
+                "--revision".to_owned(),
+                target.provider.revision.to_string(),
+            ],
+            ConnectionMode::Proxy => vec!["credential".to_owned(), "codex".to_owned()],
+        };
+        auth["args"] = toml_edit::value(toml_edit::Array::from_iter(args));
+        auth["timeout_ms"] = value(5000);
+        auth["refresh_interval_ms"] = value(0);
+        provider.insert("auth", Item::Table(auth));
+    }
+    if target.mode == ConnectionMode::Proxy && target.codex_image_enabled {
+        let mut headers = Table::new();
+        headers["x-openai-actor-authorization"] = value("hsin-local-image-generation");
+        provider.insert("http_headers", Item::Table(headers));
+    }
     Ok(provider)
 }
 
@@ -1535,11 +1548,15 @@ mod tests {
                     .then(|| DEFAULT_CODEX_CONFIG_NAME.into()),
                 revision: 1,
                 claude_model_mapping: None,
+                scope: hsin_core::ProviderScope::Primary,
+                codex_image: hsin_core::CodexImageConfig::default(),
+                network_proxy: hsin_core::ProviderProxyConfig::default(),
             },
             credential_command: "/opt/hsin".into(),
             proxy_host: "127.0.0.1".into(),
             proxy_port: 9999,
             disable_custom_auth: false,
+            codex_image_enabled: false,
             claude_model_names_enabled: true,
             claude_model_names_update: None,
             codex_auth_before_hash: None,
@@ -1560,6 +1577,39 @@ mod tests {
         claude.proxy_host = "::1".into();
         let claude_output = patch_claude("", &claude).unwrap();
         assert!(claude_output.contains("http://[::1]:9999/claude"));
+    }
+
+    #[test]
+    fn image_actor_header_is_written_only_for_an_active_proxy_route() {
+        let original = "# keep\n[features]\nweb_search = true\n";
+        let mut image = target(ClientKind::Codex);
+        image.mode = ConnectionMode::Proxy;
+        image.codex_image_enabled = true;
+        let enabled = patch_codex(original, &image).unwrap();
+        assert!(enabled.contains("# keep"));
+        assert!(enabled.contains("[features]\nweb_search = true"));
+        assert!(enabled.contains("x-openai-actor-authorization = \"hsin-local-image-generation\""));
+        assert!(enabled.contains("[model_providers.hsin.auth]"));
+
+        image.codex_image_enabled = false;
+        let disabled = patch_codex(&enabled, &image).unwrap();
+        assert!(!disabled.contains("x-openai-actor-authorization"));
+        assert!(disabled.contains("[features]\nweb_search = true"));
+    }
+
+    #[test]
+    fn image_proxy_with_custom_auth_disabled_uses_the_managed_local_key() {
+        let mut image = target(ClientKind::Codex);
+        image.mode = ConnectionMode::Proxy;
+        image.codex_image_enabled = true;
+        image.disable_custom_auth = true;
+        let output = patch_codex("", &image).unwrap();
+        assert!(output.contains(&format!(
+            "experimental_bearer_token = \"{HSIN_MANAGED_KEY}\""
+        )));
+        assert!(!output.contains("requires_openai_auth"));
+        assert!(!output.contains("[model_providers.hsin.auth]"));
+        assert!(output.contains("x-openai-actor-authorization"));
     }
 
     #[test]
@@ -1667,6 +1717,9 @@ mod tests {
             codex_config_name: Some(OPENAI_CODEX_CONFIG_NAME.into()),
             revision: 1,
             claude_model_mapping: None,
+            scope: hsin_core::ProviderScope::Primary,
+            codex_image: hsin_core::CodexImageConfig::default(),
+            network_proxy: hsin_core::ProviderProxyConfig::default(),
         };
         let patched = patch_codex(
             "# keep\nmodel_provider = \"hsin\"\napproval_policy = \"never\"\n[model_providers.hsin]\nname = \"hsin\"\nbase_url = \"http://127.0.0.1:9999/codex/v1\"\n",
@@ -1694,6 +1747,9 @@ mod tests {
             codex_config_name: None,
             revision: 1,
             claude_model_mapping: None,
+            scope: hsin_core::ProviderScope::Primary,
+            codex_image: hsin_core::CodexImageConfig::default(),
+            network_proxy: hsin_core::ProviderProxyConfig::default(),
         };
         let patched = patch_claude(
             r#"{
@@ -1976,6 +2032,9 @@ mod tests {
             codex_config_name: None,
             revision: 1,
             claude_model_mapping: None,
+            scope: hsin_core::ProviderScope::Primary,
+            codex_image: hsin_core::CodexImageConfig::default(),
+            network_proxy: hsin_core::ProviderProxyConfig::default(),
         };
         assert_eq!(
             patch_claude_with_credential(&managed, &claude, None).unwrap(),

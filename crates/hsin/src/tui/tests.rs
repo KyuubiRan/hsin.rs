@@ -2,9 +2,10 @@ use super::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hsin_core::{
     AuthScheme, ClaudeModelMapping, ClaudeModelMappingUpdate, ClientKind, ClientSettings,
-    CodexConfigNameUpdate, DEFAULT_CODEX_CONFIG_NAME, HSIN_CODEX_CONFIG_NAME, LANGUAGE_EN_US,
-    LANGUAGE_SYSTEM, LANGUAGE_ZH_CN, ModelSlot, ModelUpdate, OPENAI_CODEX_CONFIG_NAME, Provider,
-    Settings,
+    CodexConfigNameUpdate, CodexImageConfig, ConnectionMode, DEFAULT_CODEX_CONFIG_NAME,
+    HSIN_CODEX_CONFIG_NAME, LANGUAGE_EN_US, LANGUAGE_SYSTEM, LANGUAGE_ZH_CN, ModelDiscovery,
+    ModelSlot, ModelUpdate, OPENAI_CODEX_CONFIG_NAME, Provider, ProviderProxyMode, ProviderScope,
+    ProxyProtocol, SecretInput, Settings, UpstreamProxyMode,
 };
 use ratatui::{
     backend::TestBackend,
@@ -17,8 +18,10 @@ use super::{
     effects::{provider_add_params, provider_edit_params},
     screens::{TITLE, VERSION_LABEL, form_field_areas},
     state::{
-        DELETE_CONFIRM_WINDOW, FormSubmission, InputMode, ModelPicker, ModelPickerMode,
-        ProviderClipboard, ProviderForm, SettingsPage, SettingsScreen, take_form_submission,
+        DELETE_CONFIRM_WINDOW, FormSubmission, HomeSection, ImageModelPicker, InputMode,
+        ModelPicker, ModelPickerMode, ProviderClipboard, ProviderForm, SettingsPage,
+        SettingsScreen, form_field_count, form_proxy_password_field, form_proxy_protocol_field,
+        take_form_submission,
     },
     theme::{INPUT_BG, RED, WHITE},
     widgets::centered_fixed,
@@ -30,6 +33,25 @@ fn key(code: KeyCode) -> Action {
 
 fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> Action {
     Action::Key(KeyEvent::new(code, modifiers))
+}
+
+fn short_dialog_scroll_indicators(state: &mut State) -> (bool, bool) {
+    let locale = I18n::new(Some(LANGUAGE_EN_US));
+    let mut terminal = Terminal::new(TestBackend::new(80, 16)).expect("short test terminal");
+    terminal
+        .draw(|frame| draw(frame, state, &locale))
+        .expect("draw short dialog");
+    let buffer = terminal.backend().buffer();
+    let center_column = 39;
+    let has_above = buffer
+        .content()
+        .chunks_exact(80)
+        .any(|row| row[center_column].symbol() == "^" && row[center_column].fg == WHITE);
+    let has_below = buffer
+        .content()
+        .chunks_exact(80)
+        .any(|row| row[center_column].symbol() == "v" && row[center_column].fg == WHITE);
+    (has_above, has_below)
 }
 
 #[test]
@@ -62,6 +84,12 @@ fn submission() -> FormSubmission {
         model: ModelUpdate::Preserve,
         codex_config_name: CodexConfigNameUpdate::Set(DEFAULT_CODEX_CONFIG_NAME.into()),
         claude_model_mapping: ClaudeModelMappingUpdate::Preserve,
+        scope: hsin_core::ProviderScope::Primary,
+        codex_image: hsin_core::CodexImageConfig::default(),
+        network_proxy: hsin_core::ProviderProxyConfig::default(),
+        proxy_password: Zeroizing::new(String::new()),
+        proxy_password_clear: false,
+        skip_primary_model: false,
     }
 }
 
@@ -79,6 +107,9 @@ fn example_provider() -> Provider {
         model: Some(String::from("gpt-5")),
         codex_config_name: Some(DEFAULT_CODEX_CONFIG_NAME.into()),
         claude_model_mapping: None,
+        scope: hsin_core::ProviderScope::Primary,
+        codex_image: hsin_core::CodexImageConfig::default(),
+        network_proxy: hsin_core::ProviderProxyConfig::default(),
         revision: 1,
     }
 }
@@ -107,12 +138,162 @@ fn reducer_switches_client_and_moves_selection() {
     let mut state = State::default();
     assert_eq!(state.language, LANGUAGE_SYSTEM);
     state.reduce(key(KeyCode::Tab));
+    assert!(state.image_section);
+    state.reduce(key(KeyCode::Tab));
     assert_eq!(state.client, ClientKind::Claude);
+    assert!(!state.image_section);
     assert_eq!(state.selected, 0);
     state.reduce(key(KeyCode::BackTab));
     assert_eq!(state.client, ClientKind::Codex);
+    assert!(state.image_section);
     state.reduce(modified_key(KeyCode::Tab, KeyModifiers::SHIFT));
-    assert_eq!(state.client, ClientKind::Claude);
+    assert_eq!(state.client, ClientKind::Codex);
+    assert!(!state.image_section);
+}
+
+#[test]
+fn codex_image_section_is_visible_by_default_and_follows_codex_visibility() {
+    let mut state = State::default();
+    assert_eq!(
+        state.visible_sections(),
+        [
+            HomeSection::Client(ClientKind::Codex),
+            HomeSection::CodexImage,
+            HomeSection::Client(ClientKind::Claude),
+        ]
+    );
+    state.reduce(key(KeyCode::Tab));
+    assert!(state.image_section);
+
+    state.client_settings.visible = vec![ClientKind::Claude];
+    assert!(!state.visible_sections().contains(&HomeSection::CodexImage));
+}
+
+#[test]
+fn codex_image_checkbox_flows_from_primary_model_to_ranked_multi_select() {
+    let mut state = State {
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Char('a')));
+    let InputMode::Form(form) = &mut state.input else {
+        panic!("add must open the form");
+    };
+    form.base_url = "https://images.example.test/v1".into();
+    form.secret = Zeroizing::new("secret".into());
+    form.name = "Images".into();
+    form.field = 5;
+    state.reduce(key(KeyCode::Char(' ')));
+    let InputMode::Form(form) = &mut state.input else {
+        panic!("checkbox must stay in the form");
+    };
+    assert!(form.codex_image.enabled);
+    form.field = 7;
+    state.reduce(key(KeyCode::Enter));
+    let Some(Effect::DiscoverModels(form)) = state.take_effect() else {
+        panic!("form must discover models");
+    };
+    state.reduce(Action::ModelsDiscovered {
+        form,
+        discovery: ModelDiscovery {
+            resolved_base_url: "https://images.example.test/v1".into(),
+            models: vec![
+                "text-model".into(),
+                "image-alpha".into(),
+                "gpt-image-1".into(),
+                "gpt-image-2".into(),
+            ],
+        },
+    });
+    assert!(matches!(state.input, InputMode::Models(_)));
+    state.reduce(key(KeyCode::Enter));
+    let InputMode::ImageModels(picker) = &state.input else {
+        panic!("primary model selection must continue to image models");
+    };
+    assert_eq!(
+        picker.models,
+        ["gpt-image-1", "gpt-image-2", "image-alpha", "text-model"]
+    );
+    assert!(picker.checked.contains("gpt-image-2"));
+    assert_eq!(picker.preferred.as_deref(), Some("gpt-image-2"));
+
+    state.reduce(key(KeyCode::Char(' ')));
+    state.reduce(key(KeyCode::Char('p')));
+    state.reduce(key(KeyCode::Enter));
+    let Some(Effect::Add(submission)) = state.take_effect() else {
+        panic!("image model selection must add the provider");
+    };
+    assert_eq!(
+        submission.codex_image.models,
+        ["gpt-image-1", "gpt-image-2"]
+    );
+    assert_eq!(
+        submission.codex_image.preferred_model.as_deref(),
+        Some("gpt-image-1")
+    );
+}
+
+#[test]
+fn codex_image_add_imports_an_existing_primary_provider_without_copying_it() {
+    let candidate = example_provider();
+    let mut active = example_provider();
+    active.id = "image-only".into();
+    active.name = "Image only".into();
+    active.scope = ProviderScope::ImageOnly;
+    active.codex_image = CodexImageConfig {
+        enabled: true,
+        models: vec!["gpt-image-2".into()],
+        preferred_model: Some("gpt-image-2".into()),
+    };
+    let mut state = State {
+        providers: vec![candidate.clone(), active],
+        image_section: true,
+        proxy_enabled: true,
+        loading: false,
+        ..State::default()
+    };
+    state.status.codex_mode = ConnectionMode::Proxy;
+    state.status.codex_image_active_provider = Some("image-only".into());
+    state.reduce(key(KeyCode::Char('a')));
+    assert!(matches!(
+        state.input,
+        InputMode::ImageSource { selected: 0 }
+    ));
+    state.reduce(key(KeyCode::Enter));
+    assert!(matches!(
+        state.input,
+        InputMode::ImageImport { selected: 0 }
+    ));
+    state.reduce(key(KeyCode::Enter));
+    let Some(Effect::DiscoverModels(form)) = state.take_effect() else {
+        panic!("import must discover the existing provider's models");
+    };
+    assert_eq!(form.id.as_deref(), Some(candidate.id.as_str()));
+    assert!(form.secret.is_empty());
+    assert!(form.skip_primary_model);
+    assert!(form.codex_image.enabled);
+}
+
+#[test]
+fn primary_provider_with_image_generation_must_be_disabled_before_delete() {
+    let mut provider = example_provider();
+    provider.codex_image = CodexImageConfig {
+        enabled: true,
+        models: vec!["gpt-image-2".into()],
+        preferred_model: Some("gpt-image-2".into()),
+    };
+    let mut state = State {
+        providers: vec![provider],
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Char('d')));
+    assert!(matches!(state.input, InputMode::Normal));
+    assert!(state.take_effect().is_none());
+    assert_eq!(
+        state.notice.as_deref(),
+        Some("@disable_image_before_delete")
+    );
 }
 
 #[test]
@@ -149,6 +330,8 @@ fn a_client_opens_on_its_active_provider_and_resumes_where_it_was_left() {
 
     state.reduce(key(KeyCode::Up));
     assert_eq!(state.selected, 0);
+    state.reduce(key(KeyCode::Tab));
+    assert!(state.image_section);
     state.reduce(key(KeyCode::Tab));
     assert_eq!(state.client, ClientKind::Claude);
     assert_eq!(state.selected, 1);
@@ -637,6 +820,7 @@ fn settings_menu_queues_proxy_and_language_changes() {
     state.reduce(key(KeyCode::Esc));
     state.reduce(key(KeyCode::Down));
     state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Down));
     state.reduce(key(KeyCode::Enter));
     state.reduce(key(KeyCode::Down));
     state.reduce(key(KeyCode::Down));
@@ -645,6 +829,196 @@ fn settings_menu_queues_proxy_and_language_changes() {
     assert!(matches!(
         state.take_effect(),
         Some(Effect::SetLanguage(language)) if language == LANGUAGE_ZH_CN
+    ));
+}
+
+#[test]
+fn upstream_proxy_settings_support_manual_socks5_authentication() {
+    let mut state = State::default();
+    state.reduce(key(KeyCode::Char('o')));
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Enter));
+    assert!(matches!(
+        &state.input,
+        InputMode::Settings(SettingsScreen {
+            page: SettingsPage::UpstreamProxy { config, .. },
+            ..
+        }) if config.mode == UpstreamProxyMode::Direct
+    ));
+
+    state.reduce(key(KeyCode::Char(' ')));
+    state.reduce(key(KeyCode::Char(' ')));
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Char(' ')));
+    state.reduce(key(KeyCode::Down));
+    state.reduce(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    for character in "proxy.example.test".chars() {
+        state.reduce(key(KeyCode::Char(character)));
+    }
+    state.reduce(key(KeyCode::Down));
+    state.reduce(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    for character in "1080".chars() {
+        state.reduce(key(KeyCode::Char(character)));
+    }
+    state.reduce(key(KeyCode::Down));
+    for character in "proxy-user".chars() {
+        state.reduce(key(KeyCode::Char(character)));
+    }
+    state.reduce(key(KeyCode::Down));
+    for character in "proxy-password".chars() {
+        state.reduce(key(KeyCode::Char(character)));
+    }
+    assert!(state.take_effect().is_none());
+    state.reduce(key(KeyCode::Esc));
+
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::SetUpstreamProxy { config, password })
+            if config.mode == UpstreamProxyMode::Manual
+                && config.manual.protocol == ProxyProtocol::Socks5
+                && config.manual.host == "proxy.example.test"
+                && config.manual.port == 1080
+                && config.manual.username == "proxy-user"
+                && matches!(&password, SecretInput::Replace(value) if value == "proxy-password")
+    ));
+}
+
+#[test]
+fn upstream_proxy_choices_follow_arrow_direction_and_save_on_back() {
+    let mut state = State::default();
+    state.reduce(key(KeyCode::Char('o')));
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Enter));
+
+    state.reduce(key(KeyCode::Left));
+    assert!(state.take_effect().is_none());
+
+    let rendered = render(&mut state, 100, 32);
+    assert!(!rendered.contains("Save"));
+
+    state.reduce(key(KeyCode::Esc));
+    let Some(Effect::SetUpstreamProxy { config, .. }) = state.take_effect() else {
+        panic!("returning from a changed proxy page must save it");
+    };
+    assert_eq!(config.mode, UpstreamProxyMode::Manual);
+    assert!(matches!(
+        &state.input,
+        InputMode::Settings(SettingsScreen {
+            page: SettingsPage::UpstreamProxy { saving: true, .. },
+            ..
+        })
+    ));
+    assert_eq!(state.upstream_proxy.mode, UpstreamProxyMode::Direct);
+
+    state.reduce(Action::Loaded {
+        providers: Vec::new(),
+        status: crate::rpc::StatusSnapshot::default(),
+        settings: Settings {
+            upstream_proxy: config,
+            ..Settings::default()
+        },
+    });
+    assert_eq!(state.upstream_proxy.mode, UpstreamProxyMode::Manual);
+    assert!(matches!(
+        &state.input,
+        InputMode::Settings(SettingsScreen {
+            selected: 1,
+            page: SettingsPage::Root,
+        })
+    ));
+}
+
+#[test]
+fn upstream_proxy_password_editing_does_not_block_caret_or_focus_movement() {
+    let mut state = State::default();
+    state.reduce(key(KeyCode::Char('o')));
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Enter));
+    state.reduce(key(KeyCode::Char(' ')));
+    state.reduce(key(KeyCode::Char(' ')));
+    for _ in 0..5 {
+        state.reduce(key(KeyCode::Down));
+    }
+    for character in "test".chars() {
+        state.reduce(key(KeyCode::Char(character)));
+    }
+
+    assert!(matches!(
+        &state.input,
+        InputMode::Settings(SettingsScreen {
+            page: SettingsPage::UpstreamProxy {
+                selected: 5,
+                cursor: 4,
+                ..
+            },
+            ..
+        })
+    ));
+    state.reduce(key(KeyCode::Left));
+    assert!(matches!(
+        &state.input,
+        InputMode::Settings(SettingsScreen {
+            page: SettingsPage::UpstreamProxy {
+                selected: 5,
+                cursor: 3,
+                ..
+            },
+            ..
+        })
+    ));
+    state.reduce(key(KeyCode::Up));
+    assert!(matches!(
+        &state.input,
+        InputMode::Settings(SettingsScreen {
+            page: SettingsPage::UpstreamProxy { selected: 4, .. },
+            ..
+        })
+    ));
+    assert!(state.take_effect().is_none());
+    assert!(state.notice.is_none());
+}
+
+#[test]
+fn provider_proxy_defaults_to_global_and_expands_manual_override_fields() {
+    let mut state = State {
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Char('a')));
+    for _ in 0..6 {
+        state.reduce(key(KeyCode::Down));
+    }
+    assert!(matches!(
+        &state.input,
+        InputMode::Form(form)
+            if form.network_proxy.mode == ProviderProxyMode::Inherit
+                && form.field == 6
+                && form_field_count(form) == 9
+    ));
+    state.reduce(key(KeyCode::Left));
+    assert!(matches!(
+        &state.input,
+        InputMode::Form(form)
+            if form.network_proxy.mode == ProviderProxyMode::Manual
+                && form.field == 6
+                && form_field_count(form) == 14
+                && form_proxy_protocol_field(form) == Some(7)
+                && form_proxy_password_field(form) == Some(11)
+    ));
+    state.reduce(key(KeyCode::Right));
+    assert!(matches!(
+        &state.input,
+        InputMode::Form(form) if form.network_proxy.mode == ProviderProxyMode::Inherit
+    ));
+    state.reduce(key(KeyCode::Right));
+    assert!(matches!(
+        &state.input,
+        InputMode::Form(form) if form.network_proxy.mode == ProviderProxyMode::Direct
+    ));
+    state.reduce(key(KeyCode::Char(' ')));
+    assert!(matches!(
+        &state.input,
+        InputMode::Form(form) if form.network_proxy.mode == ProviderProxyMode::System
     ));
 }
 
@@ -755,21 +1129,36 @@ fn loaded_language_is_applied_without_restarting_the_tui() {
 }
 
 #[test]
-fn hidden_ijkl_navigation_works_on_home_and_settings() {
+fn hidden_ijkl_navigation_only_switches_the_home_sections() {
     let mut state = State::default();
+    state.reduce(key(KeyCode::Char('l')));
+    assert!(state.image_section);
     state.reduce(key(KeyCode::Char('l')));
     assert_eq!(state.client, ClientKind::Claude);
     state.reduce(key(KeyCode::Char('j')));
     assert_eq!(state.client, ClientKind::Codex);
+    assert!(state.image_section);
+    state.reduce(key(KeyCode::Char('j')));
+    assert!(!state.image_section);
 
     state.reduce(key(KeyCode::Char('o')));
     state.reduce(key(KeyCode::Char('k')));
     state.reduce(key(KeyCode::Char('k')));
+    state.reduce(key(KeyCode::Char('k')));
     assert!(matches!(
         &state.input,
-        InputMode::Settings(SettingsScreen { selected: 2, .. })
+        InputMode::Settings(SettingsScreen { selected: 3, .. })
     ));
     state.reduce(key(KeyCode::Char('l')));
+    assert!(matches!(
+        &state.input,
+        InputMode::Settings(SettingsScreen {
+            selected: 3,
+            page: SettingsPage::Root,
+            ..
+        })
+    ));
+    state.reduce(key(KeyCode::Enter));
     assert!(matches!(
         &state.input,
         InputMode::Settings(SettingsScreen {
@@ -781,7 +1170,58 @@ fn hidden_ijkl_navigation_works_on_home_and_settings() {
     assert!(matches!(
         &state.input,
         InputMode::Settings(SettingsScreen {
+            page: SettingsPage::Language { .. },
+            ..
+        })
+    ));
+    state.reduce(key(KeyCode::Esc));
+    assert!(matches!(
+        &state.input,
+        InputMode::Settings(SettingsScreen {
             page: SettingsPage::Root,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn settings_arrow_keys_change_values_but_do_not_navigate_pages() {
+    let mut state = State::default();
+    state.reduce(key(KeyCode::Char('o')));
+    state.reduce(key(KeyCode::Left));
+    state.reduce(key(KeyCode::Right));
+    assert!(matches!(
+        &state.input,
+        InputMode::Settings(SettingsScreen {
+            selected: 0,
+            page: SettingsPage::Root,
+        })
+    ));
+
+    state.reduce(key(KeyCode::Enter));
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Left));
+    state.reduce(key(KeyCode::Right));
+    assert!(matches!(
+        &state.input,
+        InputMode::Settings(SettingsScreen {
+            page: SettingsPage::Proxy {
+                selected: 1,
+                editing_host: false,
+                ..
+            },
+            ..
+        })
+    ));
+    state.reduce(key(KeyCode::Enter));
+    assert!(matches!(
+        &state.input,
+        InputMode::Settings(SettingsScreen {
+            page: SettingsPage::Proxy {
+                selected: 1,
+                editing_host: true,
+                ..
+            },
             ..
         })
     ));
@@ -812,6 +1252,12 @@ fn add_form_defaults_empty_name_to_base_url_host() {
         discovering_models: false,
         cursor: 0,
         claude_model_mapping: None,
+        scope: hsin_core::ProviderScope::Primary,
+        codex_image: hsin_core::CodexImageConfig::default(),
+        network_proxy: hsin_core::ProviderProxyConfig::default(),
+        proxy_port: hsin_core::ManualProxyConfig::default().port.to_string(),
+        proxy_password: Zeroizing::new(String::new()),
+        proxy_password_clear: false,
     };
     let submission = take_form_submission(&mut form).unwrap();
     assert_eq!(submission.name, "example");
@@ -823,7 +1269,7 @@ fn add_form_defaults_empty_name_to_base_url_host() {
 }
 
 #[test]
-fn codex_form_edits_the_config_name_and_remote_compaction_shortcut() {
+fn codex_form_uses_choice_fields_for_remote_compaction_and_image_generation() {
     let mut state = State {
         loading: false,
         ..State::default()
@@ -856,6 +1302,14 @@ fn codex_form_edits_the_config_name_and_remote_compaction_shortcut() {
     assert!(rendered.contains("Remote compaction"));
     assert!(rendered.contains("‹ disabled ›"));
     assert!(!rendered.contains("‹ enabled ›"));
+
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Char(' ')));
+    let rendered = render(&mut state, 100, 32);
+    assert!(rendered.contains("Configure image generation"));
+    assert!(rendered.contains("‹ enabled ›"));
+    assert!(!rendered.contains("[x]"));
 }
 
 #[test]
@@ -1026,8 +1480,47 @@ fn short_terminal_scrolls_the_form_to_the_selected_field() {
         .collect::<String>();
     assert!(rendered.contains("Base URL"));
     assert!(!rendered.contains("Auth"));
+    let rows = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks_exact(80)
+        .collect::<Vec<_>>();
+    assert!(
+        !rows[0]
+            .iter()
+            .any(|cell| cell.symbol() == "^" && cell.fg == WHITE)
+    );
+    assert!(
+        rows[12]
+            .iter()
+            .any(|cell| cell.symbol() == "v" && cell.fg == WHITE)
+    );
 
-    for _ in 0..6 {
+    for _ in 0..4 {
+        state.reduce(key(KeyCode::Down));
+    }
+    terminal
+        .draw(|frame| draw(frame, &mut state, &locale))
+        .expect("draw middle of short form");
+    let rows = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks_exact(80)
+        .collect::<Vec<_>>();
+    assert!(
+        rows[0]
+            .iter()
+            .any(|cell| cell.symbol() == "^" && cell.fg == WHITE)
+    );
+    assert!(
+        rows[12]
+            .iter()
+            .any(|cell| cell.symbol() == "v" && cell.fg == WHITE)
+    );
+
+    for _ in 0..4 {
         state.reduce(key(KeyCode::Down));
     }
     terminal
@@ -1042,6 +1535,112 @@ fn short_terminal_scrolls_the_form_to_the_selected_field() {
         .collect::<String>();
     assert!(!rendered.contains("Base URL"));
     assert!(rendered.contains("Auth"));
+    let rows = terminal
+        .backend()
+        .buffer()
+        .content()
+        .chunks_exact(80)
+        .collect::<Vec<_>>();
+    assert!(
+        rows[0]
+            .iter()
+            .any(|cell| cell.symbol() == "^" && cell.fg == WHITE)
+    );
+    assert!(
+        !rows[12]
+            .iter()
+            .any(|cell| cell.symbol() == "v" && cell.fg == WHITE)
+    );
+}
+
+#[test]
+fn model_lists_show_scroll_indicators_for_the_visible_range() {
+    let models = (0..20)
+        .map(|index| format!("model-{index:02}"))
+        .collect::<Vec<_>>();
+    let mut state = State {
+        loading: false,
+        input: InputMode::Models(ModelPicker {
+            form: submission(),
+            models: models.clone(),
+            selected: 0,
+            query: String::new(),
+            mode: ModelPickerMode::Browse,
+            warning: None,
+            cursor: 0,
+        }),
+        ..State::default()
+    };
+    assert_eq!(short_dialog_scroll_indicators(&mut state), (false, true));
+    let InputMode::Models(picker) = &mut state.input else {
+        panic!("expected model picker");
+    };
+    picker.selected = 11;
+    assert_eq!(short_dialog_scroll_indicators(&mut state), (true, true));
+    let InputMode::Models(picker) = &mut state.input else {
+        panic!("expected model picker");
+    };
+    picker.selected = models.len();
+    assert_eq!(short_dialog_scroll_indicators(&mut state), (true, false));
+
+    state.input = InputMode::ImageModels(ImageModelPicker {
+        form: submission(),
+        models,
+        checked: std::collections::BTreeSet::new(),
+        preferred: None,
+        selected: 0,
+        query: String::new(),
+        mode: ModelPickerMode::Browse,
+        warning: None,
+        cursor: 0,
+    });
+    assert_eq!(short_dialog_scroll_indicators(&mut state), (false, true));
+    let InputMode::ImageModels(picker) = &mut state.input else {
+        panic!("expected image model picker");
+    };
+    picker.selected = 19;
+    assert_eq!(short_dialog_scroll_indicators(&mut state), (true, false));
+}
+
+#[test]
+fn other_scrollable_dialogs_share_the_same_indicators() {
+    let mut mapping = mapping_state(None);
+    mapping.reduce(key(KeyCode::Char(' ')));
+    assert_eq!(short_dialog_scroll_indicators(&mut mapping), (false, true));
+    for _ in 0..3 {
+        mapping.reduce(key(KeyCode::Down));
+    }
+    assert_eq!(short_dialog_scroll_indicators(&mut mapping), (true, true));
+    for _ in 0..2 {
+        mapping.reduce(key(KeyCode::Down));
+    }
+    assert_eq!(short_dialog_scroll_indicators(&mut mapping), (true, false));
+
+    let providers = (0..8)
+        .map(|index| {
+            let mut provider = example_provider();
+            provider.id = format!("provider-{index}");
+            provider.name = format!("Provider {index}");
+            provider.base_url = format!("https://provider-{index}.example.test/v1");
+            provider
+        })
+        .collect();
+    let mut image_import = State {
+        providers,
+        image_section: true,
+        loading: false,
+        input: InputMode::ImageImport { selected: 0 },
+        ..State::default()
+    };
+    assert_eq!(
+        short_dialog_scroll_indicators(&mut image_import),
+        (false, true)
+    );
+    image_import.input = InputMode::ImageImport { selected: 7 };
+    assert_eq!(
+        short_dialog_scroll_indicators(&mut image_import),
+        (true, false)
+    );
 }
 
 #[test]
@@ -1250,6 +1849,7 @@ fn form_renders_fields_in_requested_order() {
         "Name",
         "Config name",
         "Remote compaction",
+        "Configure image generation",
         "Description",
         "Auth",
     ]
@@ -1263,6 +1863,7 @@ fn claude_form_uses_a_base_url_without_v1() {
         loading: false,
         ..State::default()
     };
+    state.reduce(key(KeyCode::Tab));
     state.reduce(key(KeyCode::Tab));
     state.reduce(key(KeyCode::Char('a')));
     let locale = I18n::new(Some("en-US"));
@@ -1396,6 +1997,7 @@ fn header_client_switcher_uses_a_selected_background() {
         &[WHITE; 5]
     ));
     assert!(text_has_background(buffer, 80, "Claude Code", INPUT_BG));
+    assert!(text_has_background(buffer, 80, "Codex Image", INPUT_BG));
     let rendered = buffer
         .content()
         .iter()
@@ -1406,9 +2008,18 @@ fn header_client_switcher_uses_a_selected_background() {
     state.reduce(key(KeyCode::Tab));
     terminal
         .draw(|frame| draw(frame, &mut state, &locale))
-        .expect("draw Claude selection");
+        .expect("draw Codex Image selection");
     let buffer = terminal.backend().buffer();
     assert!(text_has_background(buffer, 80, "Codex", INPUT_BG));
+    assert!(text_has_background(buffer, 80, "Codex Image", RED));
+    assert!(text_has_background(buffer, 80, "Claude Code", INPUT_BG));
+
+    state.reduce(key(KeyCode::Tab));
+    terminal
+        .draw(|frame| draw(frame, &mut state, &locale))
+        .expect("draw Claude selection");
+    let buffer = terminal.backend().buffer();
+    assert!(text_has_background(buffer, 80, "Codex Image", INPUT_BG));
     assert!(text_has_background(buffer, 80, "Claude Code", RED));
     assert!(text_has_foreground_pattern(
         buffer,
@@ -1442,6 +2053,7 @@ fn header_respects_client_visibility_and_order() {
         .map(ratatui::buffer::Cell::symbol)
         .collect::<String>();
     assert!(rendered.find("Claude Code").unwrap() < rendered.find("Codex").unwrap());
+    assert!(rendered.find("Codex").unwrap() < rendered.find("Codex Image").unwrap());
 
     state.client_settings.visible = vec![ClientKind::Claude];
     terminal
@@ -1669,7 +2281,7 @@ fn renders_provider_and_compact_windows() {
         .map(ratatui::buffer::Cell::symbol)
         .collect::<String>();
     assert!(rendered.contains("Master switch"));
-    assert!(rendered.contains("enter change"));
+    assert!(rendered.contains("enter edit"));
 
     let mut compact = Terminal::new(TestBackend::new(30, 8)).expect("compact terminal");
     compact
@@ -2113,6 +2725,12 @@ fn claude_form(mapping: Option<ClaudeModelMapping>) -> ProviderForm {
         discovering_models: false,
         cursor: 0,
         claude_model_mapping: mapping,
+        scope: hsin_core::ProviderScope::Primary,
+        codex_image: hsin_core::CodexImageConfig::default(),
+        network_proxy: hsin_core::ProviderProxyConfig::default(),
+        proxy_port: hsin_core::ManualProxyConfig::default().port.to_string(),
+        proxy_password: Zeroizing::new(String::new()),
+        proxy_password_clear: false,
     }
 }
 

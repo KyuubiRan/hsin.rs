@@ -10,7 +10,9 @@ use crate::i18n::I18n;
 use super::super::{
     state::{ModelPicker, ModelPickerMode, visible_models},
     theme::RED,
-    widgets::{centered_fixed, content_width, display_width, draw_input_field},
+    widgets::{
+        centered_fixed, content_width, display_width, draw_input_field, draw_list_scroll_indicators,
+    },
 };
 
 pub(super) fn draw_models(frame: &mut Frame<'_>, area: Rect, picker: &ModelPicker, i18n: &I18n) {
@@ -76,6 +78,7 @@ pub(super) fn draw_models(frame: &mut Frame<'_>, area: Rect, picker: &ModelPicke
     let mut items = Vec::with_capacity(models.len() + 1);
     items.push(ListItem::new(i18n.text("model_no_change")));
     items.extend(models.into_iter().map(ListItem::new));
+    let item_count = items.len();
     let mut state = ListState::default().with_selected(Some(picker.selected.min(items.len() - 1)));
     frame.render_stateful_widget(
         List::new(items).highlight_symbol("› ").highlight_style(
@@ -87,4 +90,5 @@ pub(super) fn draw_models(frame: &mut Frame<'_>, area: Rect, picker: &ModelPicke
         rows[1],
         &mut state,
     );
+    draw_list_scroll_indicators(frame, popup, rows[1], &state, (0..item_count).map(|_| 1));
 }

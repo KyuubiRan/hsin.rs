@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     net::IpAddr,
     time::{Duration, Instant},
 };
@@ -7,10 +7,12 @@ use std::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hsin_core::{
     AuthScheme, ClaudeModelMapping, ClaudeModelMappingUpdate, ClientAuthSettings, ClientKind,
-    ClientSettings, CodexConfigNameUpdate, ConnectionMode, DEFAULT_CODEX_CONFIG_NAME,
-    HSIN_CODEX_CONFIG_NAME, LANGUAGE_EN_US, LANGUAGE_SYSTEM, LANGUAGE_ZH_CN, ModelDiscovery,
-    ModelSlot, ModelUpdate, OPENAI_CODEX_CONFIG_NAME, Provider, Settings,
-    convert_provider_base_url, normalize_generated_provider_name, provider_name_from_url,
+    ClientSettings, CodexConfigNameUpdate, CodexImageConfig, ConnectionMode,
+    DEFAULT_CODEX_CONFIG_NAME, HSIN_CODEX_CONFIG_NAME, LANGUAGE_EN_US, LANGUAGE_SYSTEM,
+    LANGUAGE_ZH_CN, ModelDiscovery, ModelSlot, ModelUpdate, OPENAI_CODEX_CONFIG_NAME, Provider,
+    ProviderProxyConfig, ProviderProxyMode, ProviderScope, ProxyProtocol, SecretInput, Settings,
+    UpstreamProxyConfig, UpstreamProxyMode, convert_provider_base_url,
+    normalize_generated_provider_name, provider_name_from_url,
 };
 use zeroize::Zeroizing;
 
@@ -50,10 +52,13 @@ pub(super) enum Transition {
     Quit,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub(super) struct State {
     pub(super) client: ClientKind,
+    pub(super) image_section: bool,
     pub(super) providers: Vec<Provider>,
     pub(super) selected: usize,
+    pub(super) image_selected: usize,
     pub(super) status: StatusSnapshot,
     pub(super) language: String,
     pub(super) proxy_enabled: bool,
@@ -62,6 +67,7 @@ pub(super) struct State {
     pub(super) client_settings: ClientSettings,
     pub(super) client_auth: ClientAuthSettings,
     pub(super) claude_model_names_enabled: bool,
+    pub(super) upstream_proxy: UpstreamProxyConfig,
     pub(super) clipboard: Option<ProviderClipboard>,
     pub(super) loading: bool,
     pub(super) notice: Option<String>,
@@ -78,8 +84,10 @@ impl Default for State {
     fn default() -> Self {
         Self {
             client: ClientKind::Codex,
+            image_section: false,
             providers: Vec::new(),
             selected: 0,
+            image_selected: 0,
             status: StatusSnapshot::default(),
             language: LANGUAGE_SYSTEM.into(),
             proxy_enabled: false,
@@ -88,6 +96,7 @@ impl Default for State {
             client_settings: ClientSettings::default(),
             client_auth: ClientAuthSettings::default(),
             claude_model_names_enabled: true,
+            upstream_proxy: UpstreamProxyConfig::default(),
             clipboard: None,
             loading: true,
             notice: None,
@@ -109,6 +118,13 @@ pub(super) enum InputMode {
     },
     Form(ProviderForm),
     Models(ModelPicker),
+    ImageModels(ImageModelPicker),
+    ImageSource {
+        selected: usize,
+    },
+    ImageImport {
+        selected: usize,
+    },
     ModelMapping(ModelMappingForm),
     DeleteConfirm {
         id: String,
@@ -131,6 +147,17 @@ pub(super) enum SettingsPage {
         port: String,
         editing_host: bool,
         editing_port: bool,
+    },
+    UpstreamProxy {
+        selected: usize,
+        config: UpstreamProxyConfig,
+        port: String,
+        password: Zeroizing<String>,
+        password_clear: bool,
+        password_visible: bool,
+        cursor: usize,
+        dirty: bool,
+        saving: bool,
     },
     Language {
         selected: usize,
@@ -171,6 +198,12 @@ pub(super) struct ProviderForm {
     pub(super) cursor: usize,
     /// Carried through the form so the mapping dialog can prefill an existing provider's tiers.
     pub(super) claude_model_mapping: Option<ClaudeModelMapping>,
+    pub(super) scope: ProviderScope,
+    pub(super) codex_image: CodexImageConfig,
+    pub(super) network_proxy: ProviderProxyConfig,
+    pub(super) proxy_port: String,
+    pub(super) proxy_password: Zeroizing<String>,
+    pub(super) proxy_password_clear: bool,
 }
 
 pub(super) struct ProviderClipboard {
@@ -190,6 +223,30 @@ pub(super) struct FormSubmission {
     pub(super) model: ModelUpdate,
     pub(super) codex_config_name: CodexConfigNameUpdate,
     pub(super) claude_model_mapping: ClaudeModelMappingUpdate,
+    pub(super) scope: ProviderScope,
+    pub(super) codex_image: CodexImageConfig,
+    pub(super) network_proxy: ProviderProxyConfig,
+    pub(super) proxy_password: Zeroizing<String>,
+    pub(super) proxy_password_clear: bool,
+    pub(super) skip_primary_model: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HomeSection {
+    Client(ClientKind),
+    CodexImage,
+}
+
+pub(super) struct ImageModelPicker {
+    pub(super) form: FormSubmission,
+    pub(super) models: Vec<String>,
+    pub(super) checked: BTreeSet<String>,
+    pub(super) preferred: Option<String>,
+    pub(super) selected: usize,
+    pub(super) query: String,
+    pub(super) mode: ModelPickerMode,
+    pub(super) warning: Option<String>,
+    pub(super) cursor: usize,
 }
 
 /// The Claude model tiers, in display order. The default is the ghost text shown in an empty box
@@ -352,6 +409,15 @@ impl State {
                 }
             }
             Action::Failed(message) => {
+                if let InputMode::Settings(SettingsScreen {
+                    page: SettingsPage::UpstreamProxy { dirty, saving, .. },
+                    ..
+                }) = &mut self.input
+                    && *saving
+                {
+                    *saving = false;
+                    *dirty = true;
+                }
                 self.notice = Some(message);
                 self.loading = false;
             }
@@ -360,28 +426,36 @@ impl State {
                 discovery,
             } => {
                 form.base_url = discovery.resolved_base_url;
-                self.input = InputMode::Models(ModelPicker {
-                    form,
-                    models: discovery.models,
-                    selected: 0,
-                    query: String::new(),
-                    mode: ModelPickerMode::Browse,
-                    cursor: 0,
-                    warning: None,
-                });
+                self.input = if form.scope == ProviderScope::ImageOnly || form.skip_primary_model {
+                    InputMode::ImageModels(image_model_picker(form, discovery.models, None))
+                } else {
+                    InputMode::Models(ModelPicker {
+                        form,
+                        models: discovery.models,
+                        selected: 0,
+                        query: String::new(),
+                        mode: ModelPickerMode::Browse,
+                        cursor: 0,
+                        warning: None,
+                    })
+                };
                 self.loading = false;
                 self.notice = None;
             }
             Action::ModelDiscoveryFailed { form, message } => {
-                self.input = InputMode::Models(ModelPicker {
-                    form,
-                    models: Vec::new(),
-                    selected: 0,
-                    query: String::new(),
-                    mode: ModelPickerMode::Browse,
-                    cursor: 0,
-                    warning: Some(message),
-                });
+                self.input = if form.scope == ProviderScope::ImageOnly || form.skip_primary_model {
+                    InputMode::ImageModels(image_model_picker(form, Vec::new(), Some(message)))
+                } else {
+                    InputMode::Models(ModelPicker {
+                        form,
+                        models: Vec::new(),
+                        selected: 0,
+                        query: String::new(),
+                        mode: ModelPickerMode::Browse,
+                        cursor: 0,
+                        warning: Some(message),
+                    })
+                };
                 self.loading = false;
                 self.notice = None;
             }
@@ -410,6 +484,20 @@ impl State {
         self.client_settings = settings.clients;
         self.client_auth = settings.client_auth;
         self.claude_model_names_enabled = settings.claude_model_names_enabled;
+        self.upstream_proxy = settings.upstream_proxy;
+        if let InputMode::Settings(screen) = &mut self.input
+            && matches!(
+                screen.page,
+                SettingsPage::UpstreamProxy { saving: true, .. }
+            )
+        {
+            screen.selected = 1;
+            screen.page = SettingsPage::Root;
+        }
+        if self.image_section && !self.codex_image_visible() {
+            self.image_section = false;
+            self.client = ClientKind::Codex;
+        }
         if !self.client_settings.visible.contains(&self.client)
             && let Some(client) = self.client_settings.visible_in_order().first().copied()
         {
@@ -462,6 +550,7 @@ impl State {
         let proxy_enabled = self.proxy_enabled;
         let proxy_host = self.proxy_host.clone();
         let proxy_port = self.proxy_port;
+        let upstream_proxy = self.upstream_proxy.clone();
         let client_settings = self.client_settings.clone();
         let client_auth = self.client_auth;
         let claude_model_names_enabled = self.claude_model_names_enabled;
@@ -470,10 +559,23 @@ impl State {
             LANGUAGE_ZH_CN => 2,
             _ => 0,
         };
+        let image_import_candidates = self
+            .providers
+            .iter()
+            .filter(|provider| {
+                provider.client == ClientKind::Codex
+                    && provider.scope == ProviderScope::Primary
+                    && !provider.official
+                    && provider.credential_configured
+                    && !provider.codex_image.enabled
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         self.notice = None;
         match &mut self.input {
             InputMode::Form(form) => form.error = None,
             InputMode::Models(picker) => picker.warning = None,
+            InputMode::ImageModels(picker) => picker.warning = None,
             _ => {}
         }
         match &mut self.input {
@@ -528,7 +630,7 @@ impl State {
                     };
                 }
                 KeyCode::Left | KeyCode::Right | KeyCode::Char('j' | 'l' | ' ')
-                    if form.client == ClientKind::Codex && form.field == 4 =>
+                    if primary_codex_form(form) && form.field == 4 =>
                 {
                     form.codex_config_name =
                         if form.codex_config_name.trim() == OPENAI_CODEX_CONFIG_NAME {
@@ -537,6 +639,37 @@ impl State {
                             OPENAI_CODEX_CONFIG_NAME
                         }
                         .into();
+                }
+                KeyCode::Left | KeyCode::Char('j')
+                    if form.field == form_network_proxy_field(form) =>
+                {
+                    form.network_proxy.mode = previous_provider_proxy_mode(form.network_proxy.mode);
+                    form.cursor = 0;
+                }
+                KeyCode::Right | KeyCode::Char('l' | ' ') | KeyCode::Enter
+                    if form.field == form_network_proxy_field(form) =>
+                {
+                    form.network_proxy.mode = next_provider_proxy_mode(form.network_proxy.mode);
+                    form.cursor = 0;
+                }
+                KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Char('j' | 'l' | ' ')
+                | KeyCode::Enter
+                    if form_proxy_protocol_field(form) == Some(form.field) =>
+                {
+                    form.network_proxy.manual.protocol = match form.network_proxy.manual.protocol {
+                        ProxyProtocol::Http => ProxyProtocol::Socks5,
+                        ProxyProtocol::Socks5 => ProxyProtocol::Http,
+                    };
+                }
+                KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Char('j' | 'l' | ' ')
+                | KeyCode::Enter
+                    if form_image_field(form) == Some(form.field) =>
+                {
+                    form.codex_image.enabled = !form.codex_image.enabled;
                 }
                 KeyCode::Enter => match take_form_submission(form) {
                     Ok(submission) => {
@@ -561,16 +694,32 @@ impl State {
                 },
                 _ => {
                     let description_field = form_description_field(form);
+                    let primary_codex = primary_codex_form(form);
+                    let proxy_host_field = form_proxy_host_field(form);
+                    let proxy_port_field = form_proxy_port_field(form);
+                    let proxy_username_field = form_proxy_username_field(form);
+                    let proxy_password_field = form_proxy_password_field(form);
                     let cursor = &mut form.cursor;
                     match form.field {
                         0 => edit_text(&mut form.base_url, cursor, key),
                         1 => edit_text(&mut form.secret, cursor, key),
                         2 => edit_text(&mut form.name, cursor, key),
-                        3 if form.client == ClientKind::Codex => {
-                            edit_text(&mut form.codex_config_name, cursor, key)
-                        }
+                        3 if primary_codex => edit_text(&mut form.codex_config_name, cursor, key),
                         field if field == description_field => {
                             edit_text(&mut form.description, cursor, key)
+                        }
+                        field if proxy_host_field == Some(field) => {
+                            edit_text(&mut form.network_proxy.manual.host, cursor, key)
+                        }
+                        field if proxy_port_field == Some(field) => {
+                            edit_text(&mut form.proxy_port, cursor, key)
+                        }
+                        field if proxy_username_field == Some(field) => {
+                            edit_text(&mut form.network_proxy.manual.username, cursor, key)
+                        }
+                        field if proxy_password_field == Some(field) => {
+                            form.proxy_password_clear = false;
+                            edit_text(&mut form.proxy_password, cursor, key)
                         }
                         _ => false,
                     };
@@ -674,6 +823,117 @@ impl State {
                             .map_or(ModelUpdate::Clear, |model| {
                                 ModelUpdate::Set(model.to_owned())
                             });
+                        if picker.form.codex_image.enabled {
+                            let models = std::mem::take(&mut picker.models);
+                            let form = take_submission(&mut picker.form);
+                            self.input =
+                                InputMode::ImageModels(image_model_picker(form, models, None));
+                        } else {
+                            let submission = take_submission(&mut picker.form);
+                            self.pending_effect = Some(if submission.id.is_some() {
+                                Effect::Edit(submission)
+                            } else {
+                                Effect::Add(submission)
+                            });
+                            self.loading = true;
+                            self.input = InputMode::Normal;
+                        }
+                    }
+                    _ => {}
+                },
+                ModelPickerMode::Search => match key.code {
+                    KeyCode::Esc | KeyCode::Enter => picker.mode = ModelPickerMode::Browse,
+                    _ => {
+                        if edit_text(&mut picker.query, &mut picker.cursor, key) {
+                            picker.selected = 0;
+                        }
+                    }
+                },
+                ModelPickerMode::Manual(value) => match key.code {
+                    KeyCode::Esc => picker.mode = ModelPickerMode::Browse,
+                    KeyCode::Enter if !value.trim().is_empty() => {
+                        picker.form.model = ModelUpdate::Set(value.trim().to_owned());
+                        if picker.form.codex_image.enabled {
+                            let models = std::mem::take(&mut picker.models);
+                            let form = take_submission(&mut picker.form);
+                            self.input =
+                                InputMode::ImageModels(image_model_picker(form, models, None));
+                        } else {
+                            let submission = take_submission(&mut picker.form);
+                            self.pending_effect = Some(if submission.id.is_some() {
+                                Effect::Edit(submission)
+                            } else {
+                                Effect::Add(submission)
+                            });
+                            self.loading = true;
+                            self.input = InputMode::Normal;
+                        }
+                    }
+                    _ => {
+                        edit_text(value, &mut picker.cursor, key);
+                    }
+                },
+            },
+            InputMode::ImageModels(picker) => match &mut picker.mode {
+                ModelPickerMode::Browse => match key.code {
+                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
+                        self.input = InputMode::Normal;
+                    }
+                    KeyCode::Char('s') => {
+                        picker.mode = ModelPickerMode::Search;
+                        picker.cursor = caret_end(&picker.query);
+                    }
+                    KeyCode::Char('m') => {
+                        picker.mode = ModelPickerMode::Manual(String::new());
+                        picker.cursor = 0;
+                    }
+                    KeyCode::Up | KeyCode::Char('i') => {
+                        picker.selected = picker.selected.saturating_sub(1);
+                    }
+                    KeyCode::Down | KeyCode::Char('k') => {
+                        picker.selected = (picker.selected + 1)
+                            .min(visible_image_models(picker).len().saturating_sub(1));
+                    }
+                    KeyCode::Char(' ') => {
+                        if let Some(model) = selected_image_model(picker).map(str::to_owned)
+                            && !picker.checked.insert(model.clone())
+                        {
+                            picker.checked.remove(&model);
+                            if picker.preferred.as_deref() == Some(model.as_str()) {
+                                picker.preferred = None;
+                            }
+                        }
+                    }
+                    KeyCode::Char('p') => {
+                        if let Some(model) = selected_image_model(picker).map(str::to_owned) {
+                            if picker.checked.contains(&model) {
+                                picker.preferred = Some(model);
+                            } else {
+                                picker.warning = Some("@image_preferred_must_be_checked".into());
+                            }
+                        }
+                    }
+                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                        if picker.checked.is_empty() {
+                            picker.warning = Some("@image_model_required".into());
+                            return Transition::Continue;
+                        }
+                        let models = picker
+                            .models
+                            .iter()
+                            .filter(|model| picker.checked.contains(*model))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let preferred = picker
+                            .preferred
+                            .clone()
+                            .filter(|model| picker.checked.contains(model))
+                            .or_else(|| models.first().cloned());
+                        picker.form.codex_image = CodexImageConfig {
+                            enabled: true,
+                            models,
+                            preferred_model: preferred,
+                        };
                         let submission = take_submission(&mut picker.form);
                         self.pending_effect = Some(if submission.id.is_some() {
                             Effect::Edit(submission)
@@ -696,20 +956,60 @@ impl State {
                 ModelPickerMode::Manual(value) => match key.code {
                     KeyCode::Esc => picker.mode = ModelPickerMode::Browse,
                     KeyCode::Enter if !value.trim().is_empty() => {
-                        picker.form.model = ModelUpdate::Set(value.trim().to_owned());
-                        let submission = take_submission(&mut picker.form);
-                        self.pending_effect = Some(if submission.id.is_some() {
-                            Effect::Edit(submission)
-                        } else {
-                            Effect::Add(submission)
-                        });
-                        self.loading = true;
-                        self.input = InputMode::Normal;
+                        let model = value.trim().to_owned();
+                        if !picker.models.contains(&model) {
+                            picker.models.push(model.clone());
+                        }
+                        picker.checked.insert(model.clone());
+                        picker.preferred.get_or_insert(model);
+                        picker.mode = ModelPickerMode::Browse;
                     }
                     _ => {
                         edit_text(value, &mut picker.cursor, key);
                     }
                 },
+            },
+            InputMode::ImageSource { selected } => match key.code {
+                KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
+                    self.input = InputMode::Normal;
+                }
+                KeyCode::Up | KeyCode::Down | KeyCode::Char('i' | 'k') => {
+                    *selected = usize::from(*selected == 0);
+                }
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                    self.input = if *selected == 0 {
+                        InputMode::ImageImport { selected: 0 }
+                    } else {
+                        InputMode::Form(new_provider_form(
+                            ClientKind::Codex,
+                            ProviderScope::ImageOnly,
+                        ))
+                    };
+                }
+                _ => {}
+            },
+            InputMode::ImageImport { selected } => match key.code {
+                KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
+                    self.input = InputMode::ImageSource { selected: 0 };
+                }
+                KeyCode::Up | KeyCode::Char('i') => {
+                    *selected = selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('k') => {
+                    *selected =
+                        (*selected + 1).min(image_import_candidates.len().saturating_sub(1));
+                }
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                    if let Some(provider) = image_import_candidates.get(*selected) {
+                        self.pending_effect = Some(Effect::DiscoverModels(image_edit_submission(
+                            provider, true,
+                        )));
+                        self.loading = true;
+                    } else {
+                        self.notice = Some("@codex_image_import_empty".into());
+                    }
+                }
+                _ => {}
             },
             InputMode::DeleteConfirm {
                 id,
@@ -729,16 +1029,16 @@ impl State {
             }
             InputMode::Settings(screen) => match &mut screen.page {
                 SettingsPage::Root => match key.code {
-                    KeyCode::Esc | KeyCode::Char('o' | 'j') | KeyCode::Left => {
+                    KeyCode::Esc | KeyCode::Char('o') => {
                         self.input = InputMode::Normal;
                     }
                     KeyCode::Up | KeyCode::Char('i') => {
                         screen.selected = screen.selected.saturating_sub(1);
                     }
                     KeyCode::Down | KeyCode::Char('k') => {
-                        screen.selected = (screen.selected + 1).min(2);
+                        screen.selected = (screen.selected + 1).min(3);
                     }
-                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => match screen.selected {
+                    KeyCode::Enter => match screen.selected {
                         0 => {
                             screen.page = SettingsPage::Proxy {
                                 selected: 0,
@@ -749,6 +1049,19 @@ impl State {
                             };
                         }
                         1 => {
+                            screen.page = SettingsPage::UpstreamProxy {
+                                selected: 0,
+                                port: upstream_proxy.manual.port.to_string(),
+                                config: upstream_proxy.clone(),
+                                password: Zeroizing::new(String::new()),
+                                password_clear: false,
+                                password_visible: false,
+                                cursor: 0,
+                                dirty: false,
+                                saving: false,
+                            };
+                        }
+                        2 => {
                             screen.page = SettingsPage::Clients { selected: 0 };
                         }
                         _ => {
@@ -824,7 +1137,7 @@ impl State {
                         }
                     } else {
                         match key.code {
-                            KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
+                            KeyCode::Esc => {
                                 screen.page = SettingsPage::Root;
                             }
                             KeyCode::Up | KeyCode::Char('i') => {
@@ -833,29 +1146,159 @@ impl State {
                             KeyCode::Down | KeyCode::Char('k') => {
                                 *selected = (*selected + 1).min(2);
                             }
-                            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l' | ' ') => {
-                                match *selected {
-                                    0 => {
-                                        self.pending_effect =
-                                            Some(Effect::SetProxyEnabled(!proxy_enabled));
-                                        self.loading = true;
-                                    }
-                                    1 => {
-                                        *editing_host = true;
-                                        host.clear();
-                                    }
-                                    _ => {
-                                        *editing_port = true;
-                                        port.clear();
-                                    }
-                                }
+                            KeyCode::Left
+                            | KeyCode::Right
+                            | KeyCode::Char(' ')
+                            | KeyCode::Enter
+                                if *selected == 0 =>
+                            {
+                                self.pending_effect = Some(Effect::SetProxyEnabled(!proxy_enabled));
+                                self.loading = true;
+                            }
+                            KeyCode::Enter if *selected == 1 => {
+                                *editing_host = true;
+                                host.clear();
+                            }
+                            KeyCode::Enter => {
+                                *editing_port = true;
+                                port.clear();
                             }
                             _ => {}
                         }
                     }
                 }
+                SettingsPage::UpstreamProxy {
+                    selected,
+                    config,
+                    port,
+                    password,
+                    password_clear,
+                    password_visible,
+                    cursor,
+                    dirty,
+                    saving,
+                } => {
+                    if *saving {
+                        return Transition::Continue;
+                    }
+                    let last = if config.mode == UpstreamProxyMode::Manual {
+                        5
+                    } else {
+                        0
+                    };
+                    let previous_selected = *selected;
+                    let mut commit = false;
+                    let mut leave = false;
+                    match key.code {
+                        KeyCode::Esc => {
+                            commit = *dirty;
+                            if !*dirty {
+                                leave = true;
+                            }
+                        }
+                        KeyCode::Char('h' | 'H')
+                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            *password_visible = !*password_visible;
+                        }
+                        KeyCode::Char('u' | 'U')
+                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            let changed = matches!(*selected, 2..=5);
+                            match *selected {
+                                2 => config.manual.host.clear(),
+                                3 => port.clear(),
+                                4 => config.manual.username.clear(),
+                                5 => {
+                                    password.clear();
+                                    *password_clear = true;
+                                }
+                                _ => {}
+                            }
+                            *dirty |= changed;
+                            *cursor = 0;
+                        }
+                        KeyCode::Up | KeyCode::BackTab => {
+                            *selected = selected.saturating_sub(1);
+                            *cursor = upstream_proxy_field_caret(config, port, password, *selected);
+                        }
+                        KeyCode::Left if *selected == 0 => {
+                            config.mode = previous_upstream_proxy_mode(config.mode);
+                            *dirty = true;
+                        }
+                        KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter if *selected == 0 => {
+                            config.mode = next_upstream_proxy_mode(config.mode);
+                            *dirty = true;
+                        }
+                        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
+                            if config.mode == UpstreamProxyMode::Manual && *selected == 1 =>
+                        {
+                            config.manual.protocol = match config.manual.protocol {
+                                ProxyProtocol::Http => ProxyProtocol::Socks5,
+                                ProxyProtocol::Socks5 => ProxyProtocol::Http,
+                            };
+                            *dirty = true;
+                        }
+                        KeyCode::Down | KeyCode::Tab | KeyCode::Enter => {
+                            *selected = (*selected + 1).min(last);
+                            *cursor = upstream_proxy_field_caret(config, port, password, *selected);
+                        }
+                        _ if config.mode == UpstreamProxyMode::Manual => match *selected {
+                            2 => {
+                                if text_key_mutates(key) {
+                                    *dirty = true;
+                                }
+                                edit_text(&mut config.manual.host, cursor, key);
+                            }
+                            3 => {
+                                if text_key_mutates(key) {
+                                    *dirty = true;
+                                }
+                                edit_text(port, cursor, key);
+                            }
+                            4 => {
+                                if text_key_mutates(key) {
+                                    *dirty = true;
+                                }
+                                edit_text(&mut config.manual.username, cursor, key);
+                            }
+                            5 => {
+                                if text_key_mutates(key) {
+                                    *dirty = true;
+                                    *password_clear = false;
+                                }
+                                edit_text(password, cursor, key);
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+
+                    if commit {
+                        match prepare_upstream_proxy_effect(config, port, password, *password_clear)
+                        {
+                            Ok(effect) => {
+                                self.pending_effect = Some(effect);
+                                self.loading = true;
+                                *dirty = false;
+                                *saving = true;
+                            }
+                            Err(error) => {
+                                *selected = previous_selected;
+                                *cursor =
+                                    upstream_proxy_field_caret(config, port, password, *selected);
+                                self.notice = Some(format!("@{error}"));
+                                return Transition::Continue;
+                            }
+                        }
+                    }
+                    if leave {
+                        screen.selected = 1;
+                        screen.page = SettingsPage::Root;
+                    }
+                }
                 SettingsPage::Language { selected } => match key.code {
-                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
+                    KeyCode::Esc => {
                         screen.page = SettingsPage::Root;
                     }
                     KeyCode::Up | KeyCode::Char('i') => {
@@ -864,7 +1307,7 @@ impl State {
                     KeyCode::Down | KeyCode::Char('k') => {
                         *selected = (*selected + 1).min(2);
                     }
-                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                    KeyCode::Enter => {
                         self.pending_effect = Some(Effect::SetLanguage(
                             match *selected {
                                 0 => LANGUAGE_SYSTEM,
@@ -879,7 +1322,7 @@ impl State {
                     _ => {}
                 },
                 SettingsPage::Clients { selected } => match key.code {
-                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
+                    KeyCode::Esc => {
                         screen.page = SettingsPage::Root;
                     }
                     KeyCode::Up | KeyCode::Char('i') => {
@@ -888,7 +1331,7 @@ impl State {
                     KeyCode::Down | KeyCode::Char('k') => {
                         *selected = (*selected + 1).min(3);
                     }
-                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                    KeyCode::Enter => {
                         screen.page = match *selected {
                             0 => SettingsPage::ClientConfig {
                                 client: ClientKind::Codex,
@@ -909,7 +1352,7 @@ impl State {
                     _ => {}
                 },
                 SettingsPage::ClientConfig { client, selected } => match key.code {
-                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
+                    KeyCode::Esc => {
                         screen.page = SettingsPage::Clients {
                             selected: match client {
                                 ClientKind::Codex => 0,
@@ -924,23 +1367,27 @@ impl State {
                         let last = if *client == ClientKind::Claude { 2 } else { 1 };
                         *selected = (*selected + 1).min(last);
                     }
-                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l' | ' ') => {
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
+                        if *selected == 0 || (*client == ClientKind::Claude && *selected == 1) =>
+                    {
                         self.pending_effect = Some(if *selected == 0 {
                             Effect::SetClientAuth {
                                 client: *client,
                                 disable_custom_auth: !client_auth.disable_custom_auth(*client),
                             }
-                        } else if *client == ClientKind::Claude && *selected == 1 {
-                            Effect::SetClaudeModelNames(!claude_model_names_enabled)
                         } else {
-                            Effect::ImportCurrent(*client)
+                            Effect::SetClaudeModelNames(!claude_model_names_enabled)
                         });
+                        self.loading = true;
+                    }
+                    KeyCode::Enter => {
+                        self.pending_effect = Some(Effect::ImportCurrent(*client));
                         self.loading = true;
                     }
                     _ => {}
                 },
                 SettingsPage::ClientVisibility { selected } => match key.code {
-                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
+                    KeyCode::Esc => {
                         screen.page = SettingsPage::Clients { selected: 2 };
                     }
                     KeyCode::Up | KeyCode::Char('i') => {
@@ -949,7 +1396,7 @@ impl State {
                     KeyCode::Down | KeyCode::Char('k') => {
                         *selected = (*selected + 1).min(ClientKind::ALL.len() - 1);
                     }
-                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l' | ' ') => {
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter => {
                         let client = client_settings.order[*selected];
                         let mut updated = client_settings.clone();
                         if updated.visible.contains(&client) {
@@ -1002,7 +1449,7 @@ impl State {
                         }
                     } else {
                         match key.code {
-                            KeyCode::Esc | KeyCode::Left | KeyCode::Char('j') => {
+                            KeyCode::Esc => {
                                 screen.page = SettingsPage::Clients { selected: 3 };
                             }
                             KeyCode::Up | KeyCode::Char('i') => {
@@ -1011,7 +1458,7 @@ impl State {
                             KeyCode::Down | KeyCode::Char('k') => {
                                 *selected = (*selected + 1).min(order.len().saturating_sub(1));
                             }
-                            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l' | ' ') => {
+                            KeyCode::Enter | KeyCode::Char(' ') => {
                                 *moving = true;
                             }
                             _ => {}
@@ -1029,13 +1476,13 @@ impl State {
                     self.selected = 0;
                 }
                 KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    self.switch_client(self.previous_visible_client());
+                    self.switch_section(self.previous_visible_section());
                 }
                 KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
-                    self.switch_client(self.next_visible_client());
+                    self.switch_section(self.next_visible_section());
                 }
                 KeyCode::BackTab | KeyCode::Left | KeyCode::Char('j') => {
-                    self.switch_client(self.previous_visible_client());
+                    self.switch_section(self.previous_visible_section());
                 }
                 KeyCode::Down | KeyCode::Char('k') => {
                     let len = self.visible_providers().len();
@@ -1046,7 +1493,9 @@ impl State {
                 KeyCode::Up | KeyCode::Char('i') => self.selected = self.selected.saturating_sub(1),
                 KeyCode::Char('r') => self.queue(Effect::Refresh),
                 KeyCode::Char('p') => {
-                    if self.active_id().is_none() {
+                    if self.image_section {
+                        self.notice = Some("@codex_image_proxy_managed".into());
+                    } else if self.active_id().is_none() {
                         self.notice = Some("@proxy_requires_provider".into());
                     } else {
                         self.queue(Effect::SetMode {
@@ -1072,30 +1521,11 @@ impl State {
                     };
                 }
                 KeyCode::Char('a') => {
-                    self.input = InputMode::Form(ProviderForm {
-                        id: None,
-                        revision: None,
-                        client: self.client,
-                        name: String::new(),
-                        codex_config_name: match self.client {
-                            ClientKind::Codex => DEFAULT_CODEX_CONFIG_NAME.into(),
-                            ClientKind::Claude => String::new(),
-                        },
-                        description: String::new(),
-                        base_url: String::new(),
-                        auth_scheme: match self.client {
-                            ClientKind::Codex => AuthScheme::Bearer,
-                            ClientKind::Claude => AuthScheme::XApiKey,
-                        },
-                        secret: Zeroizing::new(String::new()),
-                        copied_secret: None,
-                        field: 0,
-                        error: None,
-                        secret_visible: false,
-                        discovering_models: false,
-                        cursor: 0,
-                        claude_model_mapping: None,
-                    });
+                    self.input = if self.image_section {
+                        InputMode::ImageSource { selected: 0 }
+                    } else {
+                        InputMode::Form(new_provider_form(self.client, ProviderScope::Primary))
+                    };
                 }
                 KeyCode::Char('e') => {
                     if let Some(provider) = self.selected_provider().cloned() {
@@ -1103,35 +1533,20 @@ impl State {
                             self.notice = Some("@official_read_only".into());
                             return Transition::Continue;
                         }
-                        let name =
-                            normalize_generated_provider_name(&provider.name, &provider.base_url);
-                        let cursor = caret_end(&provider.base_url);
-                        self.input = InputMode::Form(ProviderForm {
-                            id: Some(provider.id),
-                            revision: Some(provider.revision),
-                            client: provider.client,
-                            name,
-                            codex_config_name: match provider.client {
-                                ClientKind::Codex => provider
-                                    .codex_config_name
-                                    .unwrap_or_else(|| DEFAULT_CODEX_CONFIG_NAME.into()),
-                                ClientKind::Claude => String::new(),
-                            },
-                            description: provider.description,
-                            base_url: provider.base_url,
-                            auth_scheme: provider.auth_scheme,
-                            secret: Zeroizing::new(String::new()),
-                            copied_secret: None,
-                            field: 0,
-                            error: None,
-                            secret_visible: false,
-                            discovering_models: false,
-                            cursor,
-                            claude_model_mapping: provider.claude_model_mapping,
-                        });
+                        if self.image_section && provider.scope == ProviderScope::Primary {
+                            self.queue(Effect::DiscoverModels(image_edit_submission(
+                                &provider, true,
+                            )));
+                        } else {
+                            self.input = InputMode::Form(provider_form(provider));
+                        }
                     }
                 }
                 KeyCode::Char('c') => {
+                    if self.image_section {
+                        self.notice = Some("@codex_image_copy_unsupported".into());
+                        return Transition::Continue;
+                    }
                     let Some(provider) = self.selected_provider().cloned() else {
                         self.notice = Some("@copy_provider_required".into());
                         return Transition::Continue;
@@ -1145,6 +1560,10 @@ impl State {
                     }
                 }
                 KeyCode::Char('v') => {
+                    if self.image_section {
+                        self.notice = Some("@codex_image_copy_unsupported".into());
+                        return Transition::Continue;
+                    }
                     let Some(clipboard) = &self.clipboard else {
                         self.notice = Some("@provider_clipboard_empty".into());
                         return Transition::Continue;
@@ -1186,12 +1605,29 @@ impl State {
                         claude_model_mapping: (source.client == self.client)
                             .then(|| source.claude_model_mapping.clone())
                             .flatten(),
+                        scope: ProviderScope::Primary,
+                        codex_image: CodexImageConfig::default(),
+                        network_proxy: source.network_proxy.clone(),
+                        proxy_port: source.network_proxy.manual.port.to_string(),
+                        proxy_password: Zeroizing::new(String::new()),
+                        proxy_password_clear: false,
                     });
                 }
                 KeyCode::Char('d') => {
-                    if let Some(provider) = self.selected_provider() {
+                    if let Some(provider) = self.selected_provider().cloned() {
                         if provider.official {
                             self.notice = Some("@official_read_only".into());
+                            return Transition::Continue;
+                        }
+                        if !self.image_section
+                            && provider.scope == ProviderScope::Primary
+                            && provider.codex_image.enabled
+                        {
+                            self.notice = Some("@disable_image_before_delete".into());
+                            return Transition::Continue;
+                        }
+                        if self.image_section && provider.scope == ProviderScope::Primary {
+                            self.queue(Effect::Edit(image_edit_submission(&provider, false)));
                             return Transition::Continue;
                         }
                         // The prompt lives in the footer now, so a leftover notice sitting in that
@@ -1207,9 +1643,13 @@ impl State {
                 }
                 KeyCode::Enter => {
                     if let Some(provider) = self.selected_provider() {
-                        self.queue(Effect::Switch {
-                            client: self.client,
-                            id: provider.id.clone(),
+                        self.queue(if self.image_section {
+                            Effect::SwitchImage(provider.id.clone())
+                        } else {
+                            Effect::Switch {
+                                client: self.client,
+                                id: provider.id.clone(),
+                            }
                         });
                     }
                 }
@@ -1245,7 +1685,13 @@ impl State {
         };
         self.providers
             .iter()
-            .filter(|provider| provider.client == self.client)
+            .filter(|provider| {
+                if self.image_section {
+                    provider.client == ClientKind::Codex && provider.codex_image.enabled
+                } else {
+                    provider.client == self.client && provider.scope == ProviderScope::Primary
+                }
+            })
             .filter(|provider| {
                 query.as_ref().is_none_or(|query| {
                     provider.name.to_ascii_lowercase().contains(query)
@@ -1263,34 +1709,57 @@ impl State {
         self.client_settings.visible_in_order()
     }
 
-    fn next_visible_client(&self) -> ClientKind {
-        let clients = self.visible_clients();
-        if clients.is_empty() {
-            return self.client;
+    pub(super) fn visible_sections(&self) -> Vec<HomeSection> {
+        let mut sections = Vec::new();
+        for client in self.visible_clients() {
+            sections.push(HomeSection::Client(client));
+            if client == ClientKind::Codex && self.codex_image_visible() {
+                sections.push(HomeSection::CodexImage);
+            }
         }
-        let index = clients
-            .iter()
-            .position(|client| *client == self.client)
-            .unwrap_or(0);
-        clients
-            .get((index + 1) % clients.len())
-            .copied()
-            .unwrap_or(self.client)
+        sections
     }
 
-    fn previous_visible_client(&self) -> ClientKind {
-        let clients = self.visible_clients();
-        if clients.is_empty() {
-            return self.client;
+    pub(super) const fn section(&self) -> HomeSection {
+        if self.image_section {
+            HomeSection::CodexImage
+        } else {
+            HomeSection::Client(self.client)
         }
-        let index = clients
+    }
+
+    fn codex_image_visible(&self) -> bool {
+        self.client_settings.visible.contains(&ClientKind::Codex)
+    }
+
+    fn next_visible_section(&self) -> HomeSection {
+        let sections = self.visible_sections();
+        if sections.is_empty() {
+            return self.section();
+        }
+        let index = sections
             .iter()
-            .position(|client| *client == self.client)
+            .position(|section| *section == self.section())
             .unwrap_or(0);
-        clients
-            .get((index + clients.len() - 1) % clients.len())
+        sections
+            .get((index + 1) % sections.len())
             .copied()
-            .unwrap_or(self.client)
+            .unwrap_or(self.section())
+    }
+
+    fn previous_visible_section(&self) -> HomeSection {
+        let sections = self.visible_sections();
+        if sections.is_empty() {
+            return self.section();
+        }
+        let index = sections
+            .iter()
+            .position(|section| *section == self.section())
+            .unwrap_or(0);
+        sections
+            .get((index + sections.len() - 1) % sections.len())
+            .copied()
+            .unwrap_or(self.section())
     }
 
     fn clamp_selection(&mut self) {
@@ -1301,15 +1770,32 @@ impl State {
 
     /// Move to `client`, resuming the cursor where it was left there. A client not visited yet
     /// starts on its active provider, which is more useful than the top of the list.
-    fn switch_client(&mut self, client: ClientKind) {
-        if client == self.client {
+    fn switch_section(&mut self, section: HomeSection) {
+        if section == self.section() {
             return;
         }
-        self.parked.insert(self.client, self.selected);
-        self.client = client;
-        let resumed = self.parked.get(&client).copied();
-        let selected = resumed.or_else(|| self.active_index()).unwrap_or(0);
-        self.selected = selected;
+        if self.image_section {
+            self.image_selected = self.selected;
+        } else {
+            self.parked.insert(self.client, self.selected);
+        }
+        match section {
+            HomeSection::CodexImage => {
+                self.client = ClientKind::Codex;
+                self.image_section = true;
+                self.selected = self.image_selected;
+            }
+            HomeSection::Client(client) => {
+                self.client = client;
+                self.image_section = false;
+                self.selected = self
+                    .parked
+                    .get(&client)
+                    .copied()
+                    .or_else(|| self.active_index())
+                    .unwrap_or(0);
+            }
+        }
         self.clamp_selection();
     }
 
@@ -1322,6 +1808,9 @@ impl State {
     }
 
     pub(super) fn mode(&self) -> ConnectionMode {
+        if self.image_section {
+            return self.status.codex_mode;
+        }
         match self.client {
             ClientKind::Codex => self.status.codex_mode,
             ClientKind::Claude => self.status.claude_mode,
@@ -1329,6 +1818,9 @@ impl State {
     }
 
     pub(super) fn active_id(&self) -> Option<&str> {
+        if self.image_section {
+            return self.status.codex_image_active_provider.as_deref();
+        }
         match self.client {
             ClientKind::Codex => self.status.codex_active_provider.as_deref(),
             ClientKind::Claude => self.status.claude_active_provider.as_deref(),
@@ -1341,9 +1833,116 @@ fn clear_form_field(form: &mut ProviderForm) {
         0 => form.base_url.clear(),
         1 => form.secret.clear(),
         2 => form.name.clear(),
-        3 if form.client == ClientKind::Codex => form.codex_config_name.clear(),
+        3 if primary_codex_form(form) => form.codex_config_name.clear(),
         field if field == form_description_field(form) => form.description.clear(),
+        field if form_proxy_host_field(form) == Some(field) => {
+            form.network_proxy.manual.host.clear();
+        }
+        field if form_proxy_port_field(form) == Some(field) => form.proxy_port.clear(),
+        field if form_proxy_username_field(form) == Some(field) => {
+            form.network_proxy.manual.username.clear();
+        }
+        field if form_proxy_password_field(form) == Some(field) => {
+            form.proxy_password.clear();
+            form.proxy_password_clear = true;
+        }
         _ => {}
+    }
+}
+
+fn new_provider_form(client: ClientKind, scope: ProviderScope) -> ProviderForm {
+    ProviderForm {
+        id: None,
+        revision: None,
+        client,
+        name: String::new(),
+        codex_config_name: if client == ClientKind::Codex && scope == ProviderScope::Primary {
+            DEFAULT_CODEX_CONFIG_NAME.into()
+        } else {
+            String::new()
+        },
+        description: String::new(),
+        base_url: String::new(),
+        auth_scheme: match client {
+            ClientKind::Codex => AuthScheme::Bearer,
+            ClientKind::Claude => AuthScheme::XApiKey,
+        },
+        secret: Zeroizing::new(String::new()),
+        copied_secret: None,
+        field: 0,
+        error: None,
+        secret_visible: false,
+        discovering_models: false,
+        cursor: 0,
+        claude_model_mapping: None,
+        scope,
+        codex_image: CodexImageConfig {
+            enabled: scope == ProviderScope::ImageOnly,
+            ..CodexImageConfig::default()
+        },
+        network_proxy: ProviderProxyConfig::default(),
+        proxy_port: hsin_core::ManualProxyConfig::default().port.to_string(),
+        proxy_password: Zeroizing::new(String::new()),
+        proxy_password_clear: false,
+    }
+}
+
+fn provider_form(provider: Provider) -> ProviderForm {
+    let name = normalize_generated_provider_name(&provider.name, &provider.base_url);
+    let cursor = caret_end(&provider.base_url);
+    ProviderForm {
+        id: Some(provider.id),
+        revision: Some(provider.revision),
+        client: provider.client,
+        name,
+        codex_config_name: if provider.scope == ProviderScope::Primary {
+            provider
+                .codex_config_name
+                .unwrap_or_else(|| DEFAULT_CODEX_CONFIG_NAME.into())
+        } else {
+            String::new()
+        },
+        description: provider.description,
+        base_url: provider.base_url,
+        auth_scheme: provider.auth_scheme,
+        secret: Zeroizing::new(String::new()),
+        copied_secret: None,
+        field: 0,
+        error: None,
+        secret_visible: false,
+        discovering_models: false,
+        cursor,
+        claude_model_mapping: provider.claude_model_mapping,
+        scope: provider.scope,
+        codex_image: provider.codex_image,
+        proxy_port: provider.network_proxy.manual.port.to_string(),
+        network_proxy: provider.network_proxy,
+        proxy_password: Zeroizing::new(String::new()),
+        proxy_password_clear: false,
+    }
+}
+
+fn image_edit_submission(provider: &Provider, enabled: bool) -> FormSubmission {
+    let mut codex_image = provider.codex_image.clone();
+    codex_image.enabled = enabled;
+    FormSubmission {
+        id: Some(provider.id.clone()),
+        revision: Some(provider.revision),
+        client: provider.client,
+        name: provider.name.clone(),
+        description: provider.description.clone(),
+        base_url: provider.base_url.clone(),
+        auth_scheme: provider.auth_scheme,
+        secret: Zeroizing::new(String::new()),
+        model: ModelUpdate::Preserve,
+        codex_config_name: CodexConfigNameUpdate::Preserve,
+        claude_model_mapping: ClaudeModelMappingUpdate::Preserve,
+        scope: provider.scope,
+        codex_image,
+        network_proxy: provider.network_proxy.clone(),
+        proxy_password: Zeroizing::new(String::new()),
+        proxy_password_clear: false,
+        skip_primary_model: true,
     }
 }
 
@@ -1366,8 +1965,8 @@ pub(super) fn take_form_submission(
     if name.chars().count() > 128 {
         return Err("validation_name_too_long");
     }
-    let codex_config_name = match form.client {
-        ClientKind::Codex => {
+    let codex_config_name = match (form.client, form.scope) {
+        (ClientKind::Codex, ProviderScope::Primary) => {
             let name = form.codex_config_name.trim();
             if name.is_empty() {
                 return Err("validation_config_name_required");
@@ -1377,10 +1976,29 @@ pub(super) fn take_form_submission(
             }
             CodexConfigNameUpdate::Set(name.to_owned())
         }
-        ClientKind::Claude => CodexConfigNameUpdate::Preserve,
+        _ => CodexConfigNameUpdate::Preserve,
     };
     if form.description.chars().count() > 1024 {
         return Err("validation_description_too_long");
+    }
+    let mut network_proxy = form.network_proxy.clone();
+    if network_proxy.mode == ProviderProxyMode::Manual {
+        network_proxy.manual.port = form
+            .proxy_port
+            .trim()
+            .parse::<u16>()
+            .map_err(|_| "validation_upstream_proxy_port")?;
+        trim_string(&mut network_proxy.manual.host);
+        trim_string(&mut network_proxy.manual.username);
+        network_proxy.manual.password_configured = if form.proxy_password_clear {
+            false
+        } else {
+            !form.proxy_password.is_empty()
+                || (form.id.is_some() && form.network_proxy.manual.password_configured)
+        };
+        network_proxy
+            .validate()
+            .map_err(|_| "validation_upstream_proxy")?;
     }
     if form.id.is_none() && form.secret.trim().is_empty() && form.copied_secret.is_none() {
         return Err("validation_api_key_required");
@@ -1402,6 +2020,51 @@ pub(super) fn take_form_submission(
         model: ModelUpdate::Preserve,
         codex_config_name,
         claude_model_mapping: ClaudeModelMappingUpdate::Preserve,
+        scope: form.scope,
+        codex_image: form.codex_image.clone(),
+        network_proxy,
+        proxy_password: std::mem::take(&mut form.proxy_password),
+        proxy_password_clear: form.proxy_password_clear,
+        skip_primary_model: false,
+    })
+}
+
+fn trim_string(value: &mut String) {
+    let original = std::mem::take(value);
+    original.trim().clone_into(value);
+}
+
+fn prepare_upstream_proxy_effect(
+    config: &mut UpstreamProxyConfig,
+    port: &str,
+    password: &str,
+    password_clear: bool,
+) -> std::result::Result<Effect, &'static str> {
+    if config.mode == UpstreamProxyMode::Manual {
+        config.manual.port = port
+            .trim()
+            .parse::<u16>()
+            .map_err(|_| "validation_upstream_proxy_port")?;
+        trim_string(&mut config.manual.host);
+        trim_string(&mut config.manual.username);
+        config.manual.password_configured = if password_clear {
+            false
+        } else {
+            !password.is_empty() || config.manual.password_configured
+        };
+        config.validate().map_err(|_| "validation_upstream_proxy")?;
+    }
+
+    let password_update = if password_clear {
+        SecretInput::Clear
+    } else if password.is_empty() {
+        SecretInput::Preserve
+    } else {
+        SecretInput::Replace(password.to_string())
+    };
+    Ok(Effect::SetUpstreamProxy {
+        config: config.clone(),
+        password: password_update,
     })
 }
 
@@ -1452,6 +2115,11 @@ fn edit_text(text: &mut String, cursor: &mut usize, key: KeyEvent) -> bool {
     true
 }
 
+fn text_key_mutates(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
+        || matches!(key.code, KeyCode::Char(_) if !key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
 /// The byte offset of character `index`, or the end of `text` when it is past the last character.
 fn character_offset(text: &str, index: usize) -> usize {
     text.char_indices()
@@ -1461,6 +2129,21 @@ fn character_offset(text: &str, index: usize) -> usize {
 
 fn caret_end(text: &str) -> usize {
     text.chars().count()
+}
+
+fn upstream_proxy_field_caret(
+    config: &UpstreamProxyConfig,
+    port: &str,
+    password: &str,
+    field: usize,
+) -> usize {
+    match field {
+        2 => caret_end(&config.manual.host),
+        3 => caret_end(port),
+        4 => caret_end(&config.manual.username),
+        5 => caret_end(password),
+        _ => 0,
+    }
 }
 
 /// The caret position at the end of the mapping row with focus; the master toggle has no text.
@@ -1478,30 +2161,126 @@ fn form_field_text(form: &ProviderForm) -> &str {
         0 => &form.base_url,
         1 => &form.secret,
         2 => &form.name,
-        3 if form.client == ClientKind::Codex => &form.codex_config_name,
+        3 if primary_codex_form(form) => &form.codex_config_name,
         field if field == form_description_field(form) => &form.description,
+        field if form_proxy_host_field(form) == Some(field) => &form.network_proxy.manual.host,
+        field if form_proxy_port_field(form) == Some(field) => &form.proxy_port,
+        field if form_proxy_username_field(form) == Some(field) => {
+            &form.network_proxy.manual.username
+        }
+        field if form_proxy_password_field(form) == Some(field) => &form.proxy_password,
         _ => "",
     }
 }
 
 pub(super) const fn form_field_count(form: &ProviderForm) -> usize {
-    match form.client {
-        ClientKind::Codex => 7,
-        ClientKind::Claude => 5,
-    }
+    form_auth_field(form) + 1
 }
 
 pub(super) const fn form_description_field(form: &ProviderForm) -> usize {
-    match form.client {
-        ClientKind::Codex => 5,
-        ClientKind::Claude => 3,
-    }
+    form_network_proxy_field(form)
+        + if provider_uses_manual_proxy(form) {
+            6
+        } else {
+            1
+        }
 }
 
 pub(super) const fn form_auth_field(form: &ProviderForm) -> usize {
-    match form.client {
-        ClientKind::Codex => 6,
-        ClientKind::Claude => 4,
+    form_description_field(form) + 1
+}
+
+pub(super) const fn form_network_proxy_field(form: &ProviderForm) -> usize {
+    if primary_codex_form(form) { 6 } else { 3 }
+}
+
+pub(super) const fn form_proxy_protocol_field(form: &ProviderForm) -> Option<usize> {
+    if provider_uses_manual_proxy(form) {
+        Some(form_network_proxy_field(form) + 1)
+    } else {
+        None
+    }
+}
+
+pub(super) const fn form_proxy_host_field(form: &ProviderForm) -> Option<usize> {
+    if provider_uses_manual_proxy(form) {
+        Some(form_network_proxy_field(form) + 2)
+    } else {
+        None
+    }
+}
+
+pub(super) const fn form_proxy_port_field(form: &ProviderForm) -> Option<usize> {
+    if provider_uses_manual_proxy(form) {
+        Some(form_network_proxy_field(form) + 3)
+    } else {
+        None
+    }
+}
+
+pub(super) const fn form_proxy_username_field(form: &ProviderForm) -> Option<usize> {
+    if provider_uses_manual_proxy(form) {
+        Some(form_network_proxy_field(form) + 4)
+    } else {
+        None
+    }
+}
+
+pub(super) const fn form_proxy_password_field(form: &ProviderForm) -> Option<usize> {
+    if provider_uses_manual_proxy(form) {
+        Some(form_network_proxy_field(form) + 5)
+    } else {
+        None
+    }
+}
+
+pub(super) const fn provider_uses_manual_proxy(form: &ProviderForm) -> bool {
+    matches!(form.network_proxy.mode, ProviderProxyMode::Manual)
+}
+
+pub(super) const fn form_image_field(form: &ProviderForm) -> Option<usize> {
+    if primary_codex_form(form) {
+        Some(5)
+    } else {
+        None
+    }
+}
+
+pub(super) const fn primary_codex_form(form: &ProviderForm) -> bool {
+    matches!(form.client, ClientKind::Codex) && matches!(form.scope, ProviderScope::Primary)
+}
+
+const fn next_provider_proxy_mode(mode: ProviderProxyMode) -> ProviderProxyMode {
+    match mode {
+        ProviderProxyMode::Inherit => ProviderProxyMode::Direct,
+        ProviderProxyMode::Direct => ProviderProxyMode::System,
+        ProviderProxyMode::System => ProviderProxyMode::Manual,
+        ProviderProxyMode::Manual => ProviderProxyMode::Inherit,
+    }
+}
+
+const fn previous_provider_proxy_mode(mode: ProviderProxyMode) -> ProviderProxyMode {
+    match mode {
+        ProviderProxyMode::Inherit => ProviderProxyMode::Manual,
+        ProviderProxyMode::Direct => ProviderProxyMode::Inherit,
+        ProviderProxyMode::System => ProviderProxyMode::Direct,
+        ProviderProxyMode::Manual => ProviderProxyMode::System,
+    }
+}
+
+const fn next_upstream_proxy_mode(mode: UpstreamProxyMode) -> UpstreamProxyMode {
+    match mode {
+        UpstreamProxyMode::Direct => UpstreamProxyMode::System,
+        UpstreamProxyMode::System => UpstreamProxyMode::Manual,
+        UpstreamProxyMode::Manual => UpstreamProxyMode::Direct,
+    }
+}
+
+const fn previous_upstream_proxy_mode(mode: UpstreamProxyMode) -> UpstreamProxyMode {
+    match mode {
+        UpstreamProxyMode::Direct => UpstreamProxyMode::Manual,
+        UpstreamProxyMode::System => UpstreamProxyMode::Direct,
+        UpstreamProxyMode::Manual => UpstreamProxyMode::System,
     }
 }
 
@@ -1518,6 +2297,67 @@ fn take_submission(form: &mut FormSubmission) -> FormSubmission {
         model: std::mem::take(&mut form.model),
         codex_config_name: std::mem::take(&mut form.codex_config_name),
         claude_model_mapping: std::mem::take(&mut form.claude_model_mapping),
+        scope: form.scope,
+        codex_image: std::mem::take(&mut form.codex_image),
+        network_proxy: std::mem::take(&mut form.network_proxy),
+        proxy_password: std::mem::take(&mut form.proxy_password),
+        proxy_password_clear: form.proxy_password_clear,
+        skip_primary_model: form.skip_primary_model,
+    }
+}
+
+fn image_model_picker(
+    form: FormSubmission,
+    mut models: Vec<String>,
+    warning: Option<String>,
+) -> ImageModelPicker {
+    models.sort_by_key(|model| image_model_rank(model));
+    let mut discovered = BTreeSet::new();
+    models.retain(|model| discovered.insert(model.clone()));
+    for saved in &form.codex_image.models {
+        if !models.contains(saved) {
+            models.push(saved.clone());
+        }
+    }
+
+    let mut checked = form
+        .codex_image
+        .models
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut preferred = form.codex_image.preferred_model.clone();
+    if checked.is_empty()
+        && let Some(default) = models
+            .iter()
+            .find(|model| model.eq_ignore_ascii_case("gpt-image-2"))
+            .cloned()
+    {
+        checked.insert(default.clone());
+        preferred = Some(default);
+    }
+
+    ImageModelPicker {
+        form,
+        models,
+        checked,
+        preferred,
+        selected: 0,
+        query: String::new(),
+        mode: ModelPickerMode::Browse,
+        warning,
+        cursor: 0,
+    }
+}
+
+fn image_model_rank(model: &str) -> u8 {
+    let model = model.to_ascii_lowercase();
+    if model.contains("gpt-image") {
+        0
+    } else if model.contains("image") {
+        1
+    } else {
+        2
     }
 }
 
@@ -1540,4 +2380,18 @@ fn selected_model(picker: &ModelPicker) -> Option<&str> {
         .selected
         .checked_sub(1)
         .and_then(|index| visible_models(picker).get(index).copied())
+}
+
+pub(super) fn visible_image_models(picker: &ImageModelPicker) -> Vec<&str> {
+    let query = picker.query.to_ascii_lowercase();
+    picker
+        .models
+        .iter()
+        .filter(|model| query.is_empty() || model.to_ascii_lowercase().contains(&query))
+        .map(String::as_str)
+        .collect()
+}
+
+fn selected_image_model(picker: &ImageModelPicker) -> Option<&str> {
+    visible_image_models(picker).get(picker.selected).copied()
 }

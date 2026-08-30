@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, ListState, Paragraph, Wrap},
 };
 use unicode_width::UnicodeWidthChar;
 
@@ -99,7 +99,11 @@ pub(super) fn draw_banner(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
 
 pub(super) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &State, i18n: &I18n) {
     let help = match &state.input {
-        InputMode::Normal => i18n.text("help"),
+        InputMode::Normal => i18n.text(if state.image_section {
+            "image_help"
+        } else {
+            "help"
+        }),
         InputMode::Search { .. } => i18n.text("search_help"),
         InputMode::Form(_) => i18n.text("form_help"),
         InputMode::Models(picker) => match picker.mode {
@@ -107,6 +111,14 @@ pub(super) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
             ModelPickerMode::Search => i18n.text("model_search_help"),
             ModelPickerMode::Manual(_) => i18n.text("model_manual_help"),
         },
+        InputMode::ImageModels(picker) => match picker.mode {
+            ModelPickerMode::Browse => i18n.text("image_model_help"),
+            ModelPickerMode::Search => i18n.text("model_search_help"),
+            ModelPickerMode::Manual(_) => i18n.text("model_manual_help"),
+        },
+        InputMode::ImageSource { .. } | InputMode::ImageImport { .. } => {
+            i18n.text("image_source_help")
+        }
         InputMode::ModelMapping(_) => i18n.text("model_mapping_help"),
         InputMode::DeleteConfirm { .. } => i18n.text("delete_help"),
         InputMode::Settings(screen) => match &screen.page {
@@ -118,6 +130,7 @@ pub(super) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
                 editing_port: true, ..
             } => i18n.text("settings_port_help"),
             SettingsPage::Proxy { .. } => i18n.text("settings_proxy_help"),
+            SettingsPage::UpstreamProxy { .. } => i18n.text("settings_upstream_proxy_help"),
             SettingsPage::ClientOrder { moving: true, .. } => {
                 i18n.text("settings_client_order_moving_help")
             }
@@ -141,6 +154,12 @@ pub(super) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
             .warning
             .as_ref()
             .map(|warning| format!("{}: {warning}", i18n.text("models_fetch_failed"))),
+        InputMode::ImageModels(picker) => picker.warning.as_ref().map(|warning| {
+            warning
+                .strip_prefix('@')
+                .map_or(warning.as_str(), |key| i18n.text(key))
+                .to_owned()
+        }),
         _ => None,
     }
     .or_else(|| {
@@ -241,4 +260,99 @@ pub(super) fn centered_fixed(area: Rect, width: u16, height: u16) -> Rect {
             Constraint::Min(0),
         ])
         .split(vertical[1])[1]
+}
+
+pub(super) fn scrolling_rows(
+    area: Rect,
+    selected: usize,
+    row_count: usize,
+    row_height: u16,
+) -> Vec<(usize, Rect)> {
+    if row_height == 0 || row_count == 0 {
+        return Vec::new();
+    }
+    let visible = usize::from(area.height / row_height).min(row_count);
+    if visible == 0 {
+        return Vec::new();
+    }
+    let selected = selected.min(row_count - 1);
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible)
+        .min(row_count - visible);
+    (start..start + visible)
+        .enumerate()
+        .map(|(offset, index)| {
+            (
+                index,
+                Rect {
+                    x: area.x,
+                    y: area.y.saturating_add(
+                        u16::try_from(offset)
+                            .unwrap_or(u16::MAX)
+                            .saturating_mul(row_height),
+                    ),
+                    width: area.width,
+                    height: row_height,
+                },
+            )
+        })
+        .collect()
+}
+
+pub(super) fn draw_row_scroll_indicators(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    rows: &[(usize, Rect)],
+    row_count: usize,
+) {
+    let has_rows_above = rows.first().is_some_and(|(index, _)| *index > 0);
+    let has_rows_below = rows
+        .last()
+        .is_some_and(|(index, _)| index.saturating_add(1) < row_count);
+    draw_scroll_indicators(frame, area, has_rows_above, has_rows_below);
+}
+
+pub(super) fn draw_list_scroll_indicators(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    viewport: Rect,
+    state: &ListState,
+    item_heights: impl IntoIterator<Item = usize>,
+) {
+    let offset = state.offset();
+    let remaining_height = item_heights
+        .into_iter()
+        .skip(offset)
+        .fold(0_usize, usize::saturating_add);
+    draw_scroll_indicators(
+        frame,
+        area,
+        offset > 0,
+        remaining_height > usize::from(viewport.height),
+    );
+}
+
+fn draw_scroll_indicators(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    has_content_above: bool,
+    has_content_below: bool,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let x = area.x.saturating_add(area.width.saturating_sub(1) / 2);
+    if has_content_above {
+        frame.render_widget(
+            Paragraph::new("^").style(Style::default().fg(WHITE)),
+            Rect::new(x, area.y, 1, 1),
+        );
+    }
+    if has_content_below {
+        frame.render_widget(
+            Paragraph::new("v").style(Style::default().fg(WHITE)),
+            Rect::new(x, area.bottom().saturating_sub(1), 1, 1),
+        );
+    }
 }

@@ -1,5 +1,6 @@
 pub use hsin_core::{
-    AuthScheme, ClaudeModelMapping, ClientKind, ClientState, ConfigStatus, ConnectionMode, Provider,
+    AuthScheme, ClaudeModelMapping, ClientKind, ClientState, CodexImageConfig, ConfigStatus,
+    ConnectionMode, Provider, ProviderProxyConfig, ProviderScope,
 };
 
 use hsin_core::{ProviderDraft, normalize_codex_config_name, provider_name_from_url};
@@ -16,6 +17,9 @@ pub struct ProviderInput {
     pub model: Option<String>,
     pub codex_config_name: Option<String>,
     pub claude_model_mapping: Option<ClaudeModelMapping>,
+    pub scope: ProviderScope,
+    pub codex_image: CodexImageConfig,
+    pub network_proxy: ProviderProxyConfig,
 }
 
 impl ProviderInput {
@@ -38,6 +42,9 @@ impl ProviderInput {
             model: self.model.clone(),
             codex_config_name: self.codex_config_name.clone(),
             claude_model_mapping: self.claude_model_mapping.clone(),
+            scope: self.scope,
+            codex_image: self.codex_image.clone(),
+            network_proxy: self.network_proxy.clone(),
         };
         draft
             .validate()
@@ -78,6 +85,9 @@ mod tests {
             model: None,
             codex_config_name: None,
             claude_model_mapping: None,
+            scope: ProviderScope::Primary,
+            codex_image: CodexImageConfig::default(),
+            network_proxy: ProviderProxyConfig::default(),
         }
     }
 

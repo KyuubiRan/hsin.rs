@@ -12,11 +12,13 @@ use std::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hsin_core::{
     AppError, AuthScheme, ClaudeModelMappingUpdate, ClientAuthSettings, ClientKind, ClientSettings,
-    CodexConfigNameUpdate, ConnectionMode, DaemonStatus, DoctorFinding, DoctorReport,
-    DoctorSeverity, ErrorCode, ImportCurrentParams, ImportCurrentResult, KeyStoreState,
-    ModelDiscoverParams, ModelDiscovery, ModelUpdate, Provider, ProviderAddParams,
-    ProviderEditParams, ProviderListParams, ProviderRemoveParams, ProviderSwitchParams,
-    SecretInput, SecurityStatus, Settings, SettingsPatch,
+    CodexConfigNameUpdate, CodexImageConfigUpdate, CodexImageListParams, CodexImageSwitchParams,
+    ConnectionMode, DaemonStatus, DoctorFinding, DoctorReport, DoctorSeverity, ErrorCode,
+    ImportCurrentParams, ImportCurrentResult, KeyStoreState, ModelDiscoverParams, ModelDiscovery,
+    ModelUpdate, Provider, ProviderAddParams, ProviderEditParams, ProviderListParams,
+    ProviderProxyConfig, ProviderProxyMode, ProviderRemoveParams, ProviderScope,
+    ProviderSwitchParams, SecretInput, SecurityStatus, Settings, SettingsPatch,
+    UpstreamProxyConfig, UpstreamProxyMode,
 };
 use parking_lot::RwLock;
 use secrecy::{ExposeSecret, SecretString};
@@ -28,15 +30,18 @@ use zeroize::Zeroizing;
 use crate::{
     config::{self, ConfigTarget},
     crypto::{self, CryptoManager, KeyStore},
-    db::Database,
+    db::{Database, ProtectedValueMutation, provider_proxy_password_key},
     error::{DaemonError, Result},
     model::ProviderInput,
+    network_proxy::{ClientOptions, OutboundProxySnapshot, build_client},
     paths::Paths,
 };
 
 const CODEX_AUTH_BACKUP_KEY: &str = "codex_auth_backup_v1";
 const CLAUDE_MODEL_ENV_BEFORE_KEY: &str = "claude_model_env_before";
 const CLAUDE_MODEL_NAMES_ENABLED_KEY: &str = "claude_model_names_enabled";
+const UPSTREAM_PROXY_KEY: &str = "upstream_proxy";
+const UPSTREAM_PROXY_PASSWORD_KEY: &str = "upstream_proxy_password";
 /// Records that the operator holds a copy of the current master key. Losing the
 /// keyring entry without one is unrecoverable, so this must track the actual
 /// export instead of merely asserting that a key exists.
@@ -78,7 +83,12 @@ pub struct App {
     shutdown_requested: AtomicBool,
     shutdown: tokio::sync::Notify,
     config_paths: RwLock<HashMap<ClientKind, PathBuf>>,
-    http_client: reqwest::Client,
+}
+
+pub(crate) struct UpstreamRequestSnapshot {
+    pub provider: Provider,
+    pub credential: SecretString,
+    pub network_proxy: OutboundProxySnapshot,
 }
 
 enum RecoveryOutcome {
@@ -140,12 +150,6 @@ impl App {
                 config::default_config_path(ClientKind::Claude, claude_config_dir)?,
             ),
         ]);
-        let http_client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(std::time::Duration::from_secs(4))
-            .timeout(std::time::Duration::from_secs(4))
-            .build()
-            .map_err(|error| DaemonError::Internal(error.to_string()))?;
         let enabled = db
             .setting("proxy_enabled")?
             .is_some_and(|value| value == "true");
@@ -176,7 +180,6 @@ impl App {
             shutdown_requested: AtomicBool::new(false),
             shutdown: tokio::sync::Notify::new(),
             config_paths: RwLock::new(config_paths),
-            http_client,
         }))
     }
 
@@ -310,9 +313,12 @@ impl App {
             model: None,
             codex_config_name: detected.codex_config_name,
             claude_model_mapping: None,
+            scope: ProviderScope::Primary,
+            codex_image: hsin_core::CodexImageConfig::default(),
+            network_proxy: ProviderProxyConfig::default(),
             revision: 1,
         };
-        self.db.insert_provider(&provider, None)?;
+        self.db.insert_provider(&provider, None, None)?;
         Ok(provider)
     }
 
@@ -344,6 +350,9 @@ impl App {
             model: None,
             codex_config_name: detected.codex_config_name,
             claude_model_mapping: None,
+            scope: ProviderScope::Primary,
+            codex_image: hsin_core::CodexImageConfig::default(),
+            network_proxy: ProviderProxyConfig::default(),
         };
         let mut provider = Database::new_provider(&input)?;
         let encrypted = detected
@@ -353,7 +362,8 @@ impl App {
             .map(|secret| self.crypto.encrypt_for(&provider, secret))
             .transpose()?;
         provider.credential_configured = encrypted.is_some();
-        self.db.insert_provider(&provider, encrypted.as_ref())?;
+        self.db
+            .insert_provider(&provider, encrypted.as_ref(), None)?;
         Ok(provider)
     }
 
@@ -431,39 +441,90 @@ impl App {
         Ok(providers)
     }
 
+    pub fn list_codex_image_providers(
+        &self,
+        _params: &CodexImageListParams,
+    ) -> Result<Vec<Provider>> {
+        let mut providers = self.db.list_image_providers()?;
+        for provider in &mut providers {
+            if !provider.credential_configured {
+                continue;
+            }
+            provider.credential_preview = self
+                .db
+                .secret(&provider.id)
+                .and_then(|encrypted| self.crypto.decrypt_for(provider, &encrypted))
+                .ok()
+                .map(|secret| credential_preview(secret.expose_secret()));
+        }
+        Ok(providers)
+    }
+
     pub async fn add_provider(&self, params: ProviderAddParams) -> Result<Provider> {
         let _guard = self.mutation.lock().await;
-        if params.provider.auth_scheme == AuthScheme::OAuth {
+        let image_available_before = self.db.image_active_provider_id()?.is_some();
+        let ProviderAddParams {
+            provider: draft,
+            secret,
+            proxy_password,
+        } = params;
+        if draft.auth_scheme == AuthScheme::OAuth {
             return Err(DaemonError::Invalid(
                 "OAuth is reserved for Official providers".into(),
             ));
         }
-        let api_key = match params.secret {
+        let api_key = match secret {
             SecretInput::Replace(value) if !value.trim().is_empty() => Zeroizing::new(value),
             SecretInput::Replace(_) | SecretInput::Preserve | SecretInput::Clear => {
                 return Err(DaemonError::Invalid("provider API key is required".into()));
             }
         };
+        let proxy_password = match proxy_password {
+            SecretInput::Replace(value) if !value.is_empty() => Some(Zeroizing::new(value)),
+            SecretInput::Replace(_) | SecretInput::Preserve | SecretInput::Clear => None,
+        };
+        let mut network_proxy = draft.network_proxy;
+        network_proxy.manual.password_configured = proxy_password.is_some();
         let input = ProviderInput {
-            client: params.provider.client,
-            name: params.provider.name,
-            description: params.provider.description,
-            base_url: params.provider.base_url,
-            auth_scheme: params.provider.auth_scheme,
-            model: params.provider.model,
-            codex_config_name: params.provider.codex_config_name,
-            claude_model_mapping: params.provider.claude_model_mapping,
+            client: draft.client,
+            name: draft.name,
+            description: draft.description,
+            base_url: draft.base_url,
+            auth_scheme: draft.auth_scheme,
+            model: draft.model,
+            codex_config_name: draft.codex_config_name,
+            claude_model_mapping: draft.claude_model_mapping,
+            scope: draft.scope,
+            codex_image: draft.codex_image,
+            network_proxy,
         };
         let mut provider = Database::new_provider(&input)?;
         let encrypted = self.crypto.encrypt_for(&provider, &api_key)?;
+        let encrypted_proxy_password = proxy_password
+            .as_ref()
+            .map(|password| {
+                self.crypto.encrypt_protected(
+                    &provider_proxy_password_key(&provider.id),
+                    password.as_bytes(),
+                )
+            })
+            .transpose()?;
         provider.credential_configured = true;
-        self.db.insert_provider(&provider, Some(&encrypted))?;
+        self.db.insert_provider(
+            &provider,
+            Some(&encrypted),
+            encrypted_proxy_password.as_ref(),
+        )?;
+        if image_available_before != self.db.image_active_provider_id()?.is_some() {
+            self.reconcile_codex_image_capability()?;
+        }
         Ok(provider)
     }
 
     #[allow(clippy::too_many_lines)]
     pub async fn edit_provider(&self, params: ProviderEditParams) -> Result<Provider> {
         let _guard = self.mutation.lock().await;
+        let image_available_before = self.db.image_active_provider_id()?.is_some();
         let current = self.db.get_provider(&params.id)?;
         if current.official {
             return Err(DaemonError::Invalid(
@@ -480,10 +541,34 @@ impl App {
             ClaudeModelMappingUpdate::Set(mapping) => Some(mapping),
             ClaudeModelMappingUpdate::Clear => None,
         };
+        let codex_image = match params.patch.codex_image {
+            CodexImageConfigUpdate::Preserve => current.codex_image.clone(),
+            CodexImageConfigUpdate::Set(config) => config,
+        };
         let codex_config_name = match params.patch.codex_config_name {
             CodexConfigNameUpdate::Preserve => current.codex_config_name.clone(),
             CodexConfigNameUpdate::Set(name) => Some(name),
         };
+        let mut network_proxy = params
+            .patch
+            .network_proxy
+            .unwrap_or_else(|| current.network_proxy.clone());
+        let proxy_password_key = provider_proxy_password_key(&current.id);
+        let preserve_proxy_password = matches!(&params.proxy_password, SecretInput::Preserve);
+        let proxy_password = match params.proxy_password {
+            SecretInput::Preserve => None,
+            SecretInput::Replace(value) if !value.is_empty() => Some(Zeroizing::new(value)),
+            SecretInput::Replace(_) | SecretInput::Clear => {
+                network_proxy.manual.password_configured = false;
+                None
+            }
+        };
+        if proxy_password.is_some() {
+            network_proxy.manual.password_configured = true;
+        } else if preserve_proxy_password {
+            network_proxy.manual.password_configured =
+                current.network_proxy.manual.password_configured;
+        }
         // The mapping env keys live in `settings.json` in both connection modes, so changing them on
         // the active provider has to be written out even while the proxy owns the base URL.
         let mapping_changed = current.client == ClientKind::Claude
@@ -506,6 +591,9 @@ impl App {
             model,
             codex_config_name,
             claude_model_mapping,
+            scope: current.scope,
+            codex_image,
+            network_proxy,
         };
         input.validate()?;
         let mut provider = Provider {
@@ -521,10 +609,17 @@ impl App {
             model: input.model.as_ref().map(|model| model.trim().to_owned()),
             codex_config_name: input.normalized_codex_config_name()?,
             claude_model_mapping: input.claude_model_mapping.clone(),
+            scope: current.scope,
+            codex_image: input
+                .codex_image
+                .normalized()
+                .map_err(|error| DaemonError::Invalid(error.to_string()))?,
+            network_proxy: input.network_proxy.clone(),
             revision: current.revision.saturating_add(1),
         };
         let state = self.db.client_state(provider.client)?;
-        let active = state.active_provider_id.as_deref() == Some(provider.id.as_str());
+        let active = provider.scope == ProviderScope::Primary
+            && state.active_provider_id.as_deref() == Some(provider.id.as_str());
         let active_direct = active && state.mode == ConnectionMode::Direct;
         let update_active_config = active
             && (active_direct
@@ -562,6 +657,20 @@ impl App {
         if encrypted.is_some() {
             provider.credential_configured = true;
         }
+        let encrypted_proxy_password = proxy_password
+            .as_ref()
+            .map(|password| {
+                self.crypto
+                    .encrypt_protected(&proxy_password_key, password.as_bytes())
+            })
+            .transpose()?;
+        let proxy_password_mutation = if let Some(password) = &encrypted_proxy_password {
+            ProtectedValueMutation::Set(password)
+        } else if preserve_proxy_password {
+            ProtectedValueMutation::Preserve
+        } else {
+            ProtectedValueMutation::Clear(&proxy_password_key)
+        };
         let pending_config = if update_active_config {
             let target = self.config_target(&provider, state.mode, None)?;
             let path = self.config_path(provider.client)?;
@@ -589,10 +698,12 @@ impl App {
         } else {
             None
         };
-        if let Err(error) =
-            self.db
-                .update_provider(&provider, params.expected_revision, encrypted.as_ref())
-        {
+        if let Err(error) = self.db.update_provider(
+            &provider,
+            params.expected_revision,
+            encrypted.as_ref(),
+            proxy_password_mutation,
+        ) {
             if let Some((_, _, _, operation, backup_created)) = &pending_config {
                 if *backup_created {
                     self.remove_codex_auth_backup()?;
@@ -641,49 +752,129 @@ impl App {
             self.release_claude_model_env_snapshot(&target)?;
             self.db.finish_operation(&operation, "complete", None)?;
         }
+        if image_available_before != self.db.image_active_provider_id()?.is_some() {
+            self.reconcile_codex_image_capability()?;
+        }
         Ok(provider)
     }
 
+    fn discovery_network_proxy(
+        &self,
+        config: &ProviderProxyConfig,
+        provider_id: Option<&str>,
+        password: SecretInput,
+    ) -> Result<OutboundProxySnapshot> {
+        match config.mode {
+            ProviderProxyMode::Inherit => {
+                let config = self.upstream_proxy_config()?;
+                let password = if config.manual.password_configured {
+                    self.protected_secret(UPSTREAM_PROXY_PASSWORD_KEY)?
+                } else {
+                    None
+                };
+                Ok(OutboundProxySnapshot { config, password })
+            }
+            ProviderProxyMode::Direct => Ok(OutboundProxySnapshot::direct()),
+            ProviderProxyMode::System => Ok(OutboundProxySnapshot {
+                config: UpstreamProxyConfig {
+                    mode: UpstreamProxyMode::System,
+                    manual: config.manual.clone(),
+                },
+                password: None,
+            }),
+            ProviderProxyMode::Manual => {
+                let password = match password {
+                    SecretInput::Replace(value) if !value.is_empty() => {
+                        Some(SecretString::from(value))
+                    }
+                    SecretInput::Preserve if config.manual.password_configured => {
+                        let provider_id = provider_id.ok_or_else(|| {
+                            DaemonError::Invalid(
+                                "provider ID is required to preserve the proxy password".into(),
+                            )
+                        })?;
+                        self.protected_secret(&provider_proxy_password_key(provider_id))?
+                    }
+                    SecretInput::Replace(_) | SecretInput::Clear | SecretInput::Preserve => None,
+                };
+                let mut manual = config.manual.clone();
+                manual.password_configured = password.is_some();
+                manual
+                    .validate()
+                    .map_err(|error| DaemonError::Invalid(error.to_string()))?;
+                Ok(OutboundProxySnapshot {
+                    config: UpstreamProxyConfig {
+                        mode: UpstreamProxyMode::Manual,
+                        manual,
+                    },
+                    password,
+                })
+            }
+        }
+    }
+
     pub async fn discover_models(&self, params: ModelDiscoverParams) -> Result<ModelDiscovery> {
-        if params.client != ClientKind::Codex {
+        let ModelDiscoverParams {
+            client,
+            provider_id,
+            base_url,
+            auth_scheme,
+            secret,
+            network_proxy,
+            proxy_password,
+        } = params;
+        if client != ClientKind::Codex {
             return Err(DaemonError::Invalid(
                 "model discovery is currently supported only for Codex providers".into(),
             ));
         }
         let input = ProviderInput {
-            client: params.client,
+            client,
             name: "model-discovery".into(),
             description: String::new(),
-            base_url: params.base_url.clone(),
-            auth_scheme: params.auth_scheme,
+            base_url: base_url.clone(),
+            auth_scheme,
             model: None,
             codex_config_name: None,
             claude_model_mapping: None,
+            scope: ProviderScope::Primary,
+            codex_image: hsin_core::CodexImageConfig::default(),
+            network_proxy: network_proxy.clone(),
         };
         input.validate()?;
-        let secret = match params.secret {
+        let secret = match secret {
             SecretInput::Replace(value) if !value.trim().is_empty() => SecretString::from(value),
             SecretInput::Preserve => {
-                let provider_id = params.provider_id.ok_or_else(|| {
+                let provider_id = provider_id.as_deref().ok_or_else(|| {
                     DaemonError::Invalid("provider ID is required to preserve the API key".into())
                 })?;
-                let provider = self.db.get_provider(&provider_id)?;
-                if provider.client != params.client {
+                let provider = self.db.get_provider(provider_id)?;
+                if provider.client != client {
                     return Err(DaemonError::Invalid(
                         "provider belongs to a different client".into(),
                     ));
                 }
-                let encrypted = self.db.secret(&provider_id)?;
+                let encrypted = self.db.secret(provider_id)?;
                 self.crypto.decrypt_for(&provider, &encrypted)?
             }
             SecretInput::Replace(_) | SecretInput::Clear => {
                 return Err(DaemonError::Invalid("provider API key is required".into()));
             }
         };
+        let outbound_proxy =
+            self.discovery_network_proxy(&network_proxy, provider_id.as_deref(), proxy_password)?;
+        let client = build_client(
+            &outbound_proxy,
+            ClientOptions {
+                connect_timeout: std::time::Duration::from_secs(4),
+                timeout: Some(std::time::Duration::from_secs(4)),
+            },
+        )
+        .await?;
 
-        let original = params.base_url.trim().trim_end_matches('/').to_owned();
+        let original = base_url.trim().trim_end_matches('/').to_owned();
         match self
-            .fetch_models(&original, params.auth_scheme, &secret)
+            .fetch_models(&client, &original, auth_scheme, &secret)
             .await
         {
             Ok(models) => Ok(ModelDiscovery {
@@ -692,7 +883,7 @@ impl App {
             }),
             Err(first_error) if !base_url_has_v1(&original) => {
                 let with_v1 = format!("{original}/v1");
-                self.fetch_models(&with_v1, params.auth_scheme, &secret)
+                self.fetch_models(&client, &with_v1, auth_scheme, &secret)
                     .await
                     .map(|models| ModelDiscovery {
                         models,
@@ -710,12 +901,13 @@ impl App {
 
     async fn fetch_models(
         &self,
+        client: &reqwest::Client,
         base_url: &str,
         auth_scheme: AuthScheme,
         secret: &SecretString,
     ) -> Result<Vec<String>> {
         let endpoint = format!("{}/models", base_url.trim_end_matches('/'));
-        let mut request = self.http_client.get(endpoint);
+        let mut request = client.get(endpoint);
         request = match auth_scheme {
             AuthScheme::Bearer => request.bearer_auth(secret.expose_secret()),
             AuthScheme::XApiKey => request.header("x-api-key", secret.expose_secret()),
@@ -744,6 +936,7 @@ impl App {
 
     pub async fn remove_provider(&self, params: ProviderRemoveParams) -> Result<()> {
         let _guard = self.mutation.lock().await;
+        let image_available_before = self.db.image_active_provider_id()?.is_some();
         let provider = self.db.get_provider(&params.id)?;
         if provider.official {
             return Err(DaemonError::Invalid(
@@ -753,7 +946,33 @@ impl App {
         if provider.revision != params.expected_revision {
             return Err(DaemonError::Conflict("provider revision changed".into()));
         }
-        self.db.remove_provider(&params.id)
+        self.db.remove_provider(&params.id)?;
+        if image_available_before != self.db.image_active_provider_id()?.is_some() {
+            self.reconcile_codex_image_capability()?;
+        }
+        Ok(())
+    }
+
+    pub async fn switch_codex_image(&self, params: CodexImageSwitchParams) -> Result<Provider> {
+        let _guard = self.mutation.lock().await;
+        let image_available_before = self.db.image_active_provider_id()?.is_some();
+        self.db.set_image_active(&params.provider_id)?;
+        if !image_available_before {
+            self.reconcile_codex_image_capability()?;
+        }
+        self.db.get_provider(&params.provider_id)
+    }
+
+    fn reconcile_codex_image_capability(&self) -> Result<()> {
+        let state = self.db.client_state(ClientKind::Codex)?;
+        if state.mode != ConnectionMode::Proxy {
+            return Ok(());
+        }
+        let Some(provider_id) = state.active_provider_id else {
+            return Ok(());
+        };
+        let provider = self.db.get_provider(&provider_id)?;
+        self.apply_configuration(&provider, ConnectionMode::Proxy)
     }
 
     pub async fn import_current(&self, params: ImportCurrentParams) -> Result<ImportCurrentResult> {
@@ -1045,6 +1264,9 @@ impl App {
             proxy_port: self.proxy_port()?,
             disable_custom_auth: disable_custom_auth
                 .unwrap_or(self.disable_custom_auth(provider.client)?),
+            codex_image_enabled: provider.client == ClientKind::Codex
+                && mode == ConnectionMode::Proxy
+                && self.db.image_active_provider_id()?.is_some(),
             claude_model_names_enabled: claude_model_names_enabled
                 .unwrap_or(self.claude_model_names_enabled()?),
             claude_model_names_update: claude_model_names_enabled,
@@ -1420,6 +1642,7 @@ impl App {
             proxy_listening: self.proxy_listening.load(Ordering::Acquire),
             proxy_enabled: self.proxy_enabled(),
             proxy_address: self.proxy_address()?.to_string(),
+            codex_image_active_provider_id: self.db.image_active_provider_id()?,
             clients: vec![
                 self.db.client_state(ClientKind::Codex)?,
                 self.db.client_state(ClientKind::Claude)?,
@@ -1439,6 +1662,7 @@ impl App {
             clients: self.client_settings()?,
             client_auth: self.client_auth_settings()?,
             claude_model_names_enabled: self.claude_model_names_enabled()?,
+            upstream_proxy: self.upstream_proxy_config()?,
         })
     }
 
@@ -1460,6 +1684,86 @@ impl App {
         };
         serde_json::from_str(&value)
             .map_err(|error| DaemonError::Config(format!("invalid client auth settings: {error}")))
+    }
+
+    fn upstream_proxy_config(&self) -> Result<UpstreamProxyConfig> {
+        let mut config: UpstreamProxyConfig = self
+            .db
+            .setting(UPSTREAM_PROXY_KEY)?
+            .map(|value| {
+                serde_json::from_str(&value).map_err(|error| {
+                    DaemonError::Config(format!("invalid upstream proxy setting: {error}"))
+                })
+            })
+            .transpose()?
+            .unwrap_or_default();
+        config.manual.password_configured = self
+            .db
+            .protected_value(UPSTREAM_PROXY_PASSWORD_KEY)?
+            .is_some();
+        config
+            .validate()
+            .map_err(|error| DaemonError::Config(error.to_string()))?;
+        Ok(config)
+    }
+
+    fn protected_secret(&self, key: &str) -> Result<Option<SecretString>> {
+        self.db
+            .protected_value(key)?
+            .map(|encrypted| {
+                let plaintext = self.crypto.decrypt_protected(&encrypted)?;
+                let value =
+                    String::from_utf8(plaintext.to_vec()).map_err(|_| DaemonError::Crypto)?;
+                Ok(SecretString::from(value))
+            })
+            .transpose()
+    }
+
+    fn update_upstream_proxy_setting(&self, update: hsin_core::UpstreamProxyUpdate) -> Result<()> {
+        let preserve_password = matches!(&update.password, SecretInput::Preserve);
+        let mut config = update.config;
+        let password = match update.password {
+            SecretInput::Replace(value) if !value.is_empty() => Some(Zeroizing::new(value)),
+            SecretInput::Replace(_) | SecretInput::Clear | SecretInput::Preserve => None,
+        };
+        config.manual.password_configured = if password.is_some() {
+            true
+        } else if preserve_password {
+            self.db
+                .protected_value(UPSTREAM_PROXY_PASSWORD_KEY)?
+                .is_some()
+        } else {
+            false
+        };
+        config
+            .validate()
+            .map_err(|error| DaemonError::Invalid(error.to_string()))?;
+        if config.manual.password_configured && config.manual.username.trim().is_empty() {
+            return Err(DaemonError::Invalid(
+                "proxy username is required when a password is configured".into(),
+            ));
+        }
+        let encrypted = password
+            .as_ref()
+            .map(|password| {
+                self.crypto
+                    .encrypt_protected(UPSTREAM_PROXY_PASSWORD_KEY, password.as_bytes())
+            })
+            .transpose()?;
+        let mutation = if let Some(encrypted) = &encrypted {
+            ProtectedValueMutation::Set(encrypted)
+        } else if preserve_password {
+            ProtectedValueMutation::Preserve
+        } else {
+            ProtectedValueMutation::Clear(UPSTREAM_PROXY_PASSWORD_KEY)
+        };
+        let mut stored = config;
+        stored.manual.password_configured = false;
+        self.db.set_setting_with_protected_value(
+            UPSTREAM_PROXY_KEY,
+            &serde_json::to_string(&stored)?,
+            mutation,
+        )
     }
 
     fn claude_model_names_enabled(&self) -> Result<bool> {
@@ -1502,6 +1806,7 @@ impl App {
             clients,
             client_auth,
             claude_model_names_enabled,
+            upstream_proxy,
         } = patch;
         if clients.as_ref().is_some_and(|clients| !clients.is_valid()) {
             return Err(DaemonError::Invalid(
@@ -1534,6 +1839,9 @@ impl App {
                 ));
             }
             self.db.set_setting("language", &language)?;
+        }
+        if let Some(update) = upstream_proxy {
+            self.update_upstream_proxy_setting(update)?;
         }
         if proxy_enabled == Some(false) {
             self.disable_all_client_proxies_locked()?;
@@ -1752,10 +2060,62 @@ impl App {
         }
     }
 
-    pub fn upstream_snapshot(&self, client: ClientKind) -> Result<(Provider, SecretString)> {
+    fn effective_network_proxy(&self, provider: &Provider) -> Result<OutboundProxySnapshot> {
+        match provider.network_proxy.mode {
+            ProviderProxyMode::Inherit => {
+                let config = self.upstream_proxy_config()?;
+                let password = if config.manual.password_configured {
+                    self.protected_secret(UPSTREAM_PROXY_PASSWORD_KEY)?
+                } else {
+                    None
+                };
+                Ok(OutboundProxySnapshot { config, password })
+            }
+            ProviderProxyMode::Direct => Ok(OutboundProxySnapshot::direct()),
+            ProviderProxyMode::System => Ok(OutboundProxySnapshot {
+                config: UpstreamProxyConfig {
+                    mode: UpstreamProxyMode::System,
+                    manual: provider.network_proxy.manual.clone(),
+                },
+                password: None,
+            }),
+            ProviderProxyMode::Manual => {
+                let password = if provider.network_proxy.manual.password_configured {
+                    self.protected_secret(&provider_proxy_password_key(&provider.id))?
+                } else {
+                    None
+                };
+                Ok(OutboundProxySnapshot {
+                    config: UpstreamProxyConfig {
+                        mode: UpstreamProxyMode::Manual,
+                        manual: provider.network_proxy.manual.clone(),
+                    },
+                    password,
+                })
+            }
+        }
+    }
+
+    pub fn upstream_snapshot(&self, client: ClientKind) -> Result<UpstreamRequestSnapshot> {
         let (provider, encrypted) = self.db.active_secret(client)?;
-        let secret = self.crypto.decrypt_for(&provider, &encrypted)?;
-        Ok((provider, secret))
+        let credential = self.crypto.decrypt_for(&provider, &encrypted)?;
+        let network_proxy = self.effective_network_proxy(&provider)?;
+        Ok(UpstreamRequestSnapshot {
+            provider,
+            credential,
+            network_proxy,
+        })
+    }
+
+    pub fn image_upstream_snapshot(&self) -> Result<UpstreamRequestSnapshot> {
+        let (provider, encrypted) = self.db.active_image_secret()?;
+        let credential = self.crypto.decrypt_for(&provider, &encrypted)?;
+        let network_proxy = self.effective_network_proxy(&provider)?;
+        Ok(UpstreamRequestSnapshot {
+            provider,
+            credential,
+            network_proxy,
+        })
     }
 
     pub fn proxy_capability(&self, client: ClientKind) -> Result<SecretString> {
@@ -1897,7 +2257,13 @@ mod tests {
     use super::*;
     use std::{collections::HashMap, fs};
 
-    use axum::{Json, Router, http::StatusCode, routing::get};
+    use axum::{
+        Json, Router,
+        extract::State as AxumState,
+        http::{HeaderMap as AxumHeaderMap, StatusCode},
+        routing::{any, get},
+    };
+    use hsin_core::{ProviderDraft, ProviderPatch};
     use parking_lot::Mutex as ParkingMutex;
     use serde_json::json;
 
@@ -1920,6 +2286,14 @@ mod tests {
             self.0.lock().remove(&version);
             Ok(())
         }
+    }
+
+    async fn proxy_model_response(
+        AxumState(sender): AxumState<tokio::sync::mpsc::UnboundedSender<AxumHeaderMap>>,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> Json<serde_json::Value> {
+        sender.send(request.headers().clone()).unwrap();
+        Json(json!({"data": [{"id": "gpt-image-2"}, {"id": "gpt-5"}]}))
     }
 
     #[test]
@@ -2007,6 +2381,126 @@ mod tests {
             "sk-abc***yz"
         );
         assert_eq!(credential_preview("short-key"), "••••••••");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn global_proxy_password_is_encrypted_and_provider_overrides_are_independent() {
+        let root = std::env::temp_dir().join(format!("hsind-upstream-{}", uuid::Uuid::new_v4()));
+        let paths = Paths {
+            database: root.join("hsin.sqlite3"),
+            lock: root.join("hsind.lock"),
+            logs: root.join("logs"),
+            backups: root.join("backups"),
+            home: root.clone(),
+        };
+        let app = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
+        let global_manual = hsin_core::ManualProxyConfig {
+            protocol: hsin_core::ProxyProtocol::Http,
+            host: "global.proxy.test".into(),
+            port: 8080,
+            username: "global-user".into(),
+            password_configured: false,
+        };
+        let settings = app
+            .update_settings(SettingsPatch {
+                upstream_proxy: Some(hsin_core::UpstreamProxyUpdate {
+                    config: UpstreamProxyConfig {
+                        mode: UpstreamProxyMode::Manual,
+                        manual: global_manual.clone(),
+                    },
+                    password: SecretInput::Replace("global-password".into()),
+                }),
+                ..SettingsPatch::default()
+            })
+            .await
+            .unwrap();
+        assert!(settings.upstream_proxy.manual.password_configured);
+        let public_json = serde_json::to_string(&settings).unwrap();
+        assert!(!public_json.contains("global-password"));
+        assert!(
+            !app.db
+                .setting(UPSTREAM_PROXY_KEY)
+                .unwrap()
+                .unwrap()
+                .contains("global-password")
+        );
+        assert!(
+            app.db
+                .protected_value(UPSTREAM_PROXY_PASSWORD_KEY)
+                .unwrap()
+                .is_some()
+        );
+
+        let provider = app
+            .add_provider(ProviderAddParams {
+                provider: ProviderDraft {
+                    client: ClientKind::Codex,
+                    name: "Inherited proxy".into(),
+                    description: String::new(),
+                    base_url: "https://provider.example.test/v1".into(),
+                    auth_scheme: AuthScheme::Bearer,
+                    model: None,
+                    codex_config_name: None,
+                    claude_model_mapping: None,
+                    scope: ProviderScope::Primary,
+                    codex_image: hsin_core::CodexImageConfig::default(),
+                    network_proxy: ProviderProxyConfig::default(),
+                },
+                secret: SecretInput::Replace("provider-key".into()),
+                proxy_password: SecretInput::Clear,
+            })
+            .await
+            .unwrap();
+        let inherited = app.effective_network_proxy(&provider).unwrap();
+        assert_eq!(inherited.config.mode, UpstreamProxyMode::Manual);
+        assert_eq!(inherited.config.manual.host, global_manual.host);
+        assert_eq!(
+            inherited.password.unwrap().expose_secret(),
+            "global-password"
+        );
+
+        let overridden = app
+            .edit_provider(ProviderEditParams {
+                id: provider.id.clone(),
+                expected_revision: provider.revision,
+                patch: ProviderPatch {
+                    network_proxy: Some(ProviderProxyConfig {
+                        mode: ProviderProxyMode::Manual,
+                        manual: hsin_core::ManualProxyConfig {
+                            protocol: hsin_core::ProxyProtocol::Socks5,
+                            host: "provider.proxy.test".into(),
+                            port: 1080,
+                            username: "provider-user".into(),
+                            password_configured: false,
+                        },
+                    }),
+                    ..ProviderPatch::default()
+                },
+                secret: SecretInput::Preserve,
+                proxy_password: SecretInput::Replace("provider-password".into()),
+            })
+            .await
+            .unwrap();
+        let override_snapshot = app.effective_network_proxy(&overridden).unwrap();
+        assert_eq!(override_snapshot.config.mode, UpstreamProxyMode::Manual);
+        assert_eq!(
+            override_snapshot.config.manual.protocol,
+            hsin_core::ProxyProtocol::Socks5
+        );
+        assert_eq!(
+            override_snapshot.password.unwrap().expose_secret(),
+            "provider-password"
+        );
+        assert!(
+            app.db
+                .protected_value(&provider_proxy_password_key(&provider.id))
+                .unwrap()
+                .is_some()
+        );
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -2105,8 +2599,12 @@ mod tests {
                 model: None,
                 codex_config_name: None,
                 claude_model_mapping: None,
+                scope: ProviderScope::Primary,
+                codex_image: hsin_core::CodexImageConfig::default(),
+                network_proxy: ProviderProxyConfig::default(),
             },
             secret: SecretInput::Replace(secret.into()),
+            proxy_password: SecretInput::Preserve,
         })
         .await
         .unwrap();
@@ -2124,6 +2622,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn active_codex_config_name_edits_rewrite_direct_and_proxy_configuration() {
         let root =
             std::env::temp_dir().join(format!("hsind-codex-config-name-{}", uuid::Uuid::new_v4()));
@@ -2152,8 +2651,12 @@ mod tests {
                     model: None,
                     codex_config_name: None,
                     claude_model_mapping: None,
+                    scope: ProviderScope::Primary,
+                    codex_image: hsin_core::CodexImageConfig::default(),
+                    network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("router-secret".into()),
+                proxy_password: SecretInput::Preserve,
             })
             .await
             .unwrap();
@@ -2175,6 +2678,7 @@ mod tests {
                     ..hsin_core::ProviderPatch::default()
                 },
                 secret: SecretInput::Preserve,
+                proxy_password: SecretInput::Preserve,
             })
             .await
             .unwrap();
@@ -2198,6 +2702,7 @@ mod tests {
                     ..hsin_core::ProviderPatch::default()
                 },
                 secret: SecretInput::Preserve,
+                proxy_password: SecretInput::Preserve,
             })
             .await
             .unwrap();
@@ -2215,6 +2720,7 @@ mod tests {
                 ..hsin_core::ProviderPatch::default()
             },
             secret: SecretInput::Preserve,
+            proxy_password: SecretInput::Preserve,
         })
         .await
         .unwrap();
@@ -2250,6 +2756,7 @@ mod tests {
                 clients: Some(clients.clone()),
                 client_auth: None,
                 claude_model_names_enabled: None,
+                upstream_proxy: None,
             })
             .await
             .unwrap();
@@ -2268,6 +2775,7 @@ mod tests {
                 }),
                 client_auth: None,
                 claude_model_names_enabled: None,
+                upstream_proxy: None,
             })
             .await;
         assert!(matches!(invalid, Err(DaemonError::Invalid(_))));
@@ -2308,8 +2816,12 @@ mod tests {
                     model: None,
                     codex_config_name: None,
                     claude_model_mapping: None,
+                    scope: ProviderScope::Primary,
+                    codex_image: hsin_core::CodexImageConfig::default(),
+                    network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("sk-client-auth-secret".into()),
+                proxy_password: SecretInput::Preserve,
             })
             .await
             .unwrap();
@@ -2354,6 +2866,7 @@ mod tests {
                     disable_custom_auth: true,
                 }),
                 claude_model_names_enabled: None,
+                upstream_proxy: None,
             })
             .await
             .unwrap();
@@ -2395,6 +2908,7 @@ mod tests {
                     disable_custom_auth: false,
                 }),
                 claude_model_names_enabled: None,
+                upstream_proxy: None,
             })
             .await
             .unwrap();
@@ -2428,6 +2942,7 @@ mod tests {
                 disable_custom_auth: true,
             }),
             claude_model_names_enabled: None,
+            upstream_proxy: None,
         })
         .await
         .unwrap();
@@ -2489,8 +3004,12 @@ mod tests {
                     model: None,
                     codex_config_name: None,
                     claude_model_mapping: None,
+                    scope: ProviderScope::Primary,
+                    codex_image: hsin_core::CodexImageConfig::default(),
+                    network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("recovery-secret".into()),
+                proxy_password: SecretInput::Preserve,
             })
             .await
             .unwrap();
@@ -2593,8 +3112,12 @@ mod tests {
                     model: None,
                     codex_config_name: None,
                     claude_model_mapping: None,
+                    scope: ProviderScope::Primary,
+                    codex_image: hsin_core::CodexImageConfig::default(),
+                    network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("upgrade-secret".into()),
+                proxy_password: SecretInput::Preserve,
             })
             .await
             .unwrap();
@@ -2661,8 +3184,12 @@ mod tests {
                     model: None,
                     codex_config_name: None,
                     claude_model_mapping: None,
+                    scope: ProviderScope::Primary,
+                    codex_image: hsin_core::CodexImageConfig::default(),
+                    network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("helper-secret".into()),
+                proxy_password: SecretInput::Preserve,
             })
             .await
             .unwrap();
@@ -2867,8 +3394,12 @@ mod tests {
                     model: None,
                     codex_config_name: None,
                     claude_model_mapping: None,
+                    scope: ProviderScope::Primary,
+                    codex_image: hsin_core::CodexImageConfig::default(),
+                    network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("import-secret".into()),
+                proxy_password: SecretInput::Preserve,
             })
             .await
             .unwrap();
@@ -2940,8 +3471,12 @@ mod tests {
                     model: None,
                     codex_config_name: None,
                     claude_model_mapping: None,
+                    scope: ProviderScope::Primary,
+                    codex_image: hsin_core::CodexImageConfig::default(),
+                    network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("recovery-secret".into()),
+                proxy_password: SecretInput::Preserve,
             })
             .await
             .unwrap();
@@ -3183,6 +3718,8 @@ mod tests {
                 base_url: format!("http://{address}"),
                 auth_scheme: AuthScheme::Bearer,
                 secret: SecretInput::Replace("test-key".into()),
+                network_proxy: ProviderProxyConfig::default(),
+                proxy_password: SecretInput::Preserve,
             })
             .await
             .unwrap();
@@ -3190,6 +3727,64 @@ mod tests {
         assert_eq!(discovery.models, ["gpt-5", "gpt-4.1"]);
 
         server.abort();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn model_discovery_uses_the_selected_authenticated_http_proxy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let router = Router::new()
+            .fallback(any(proxy_model_response))
+            .with_state(sender);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let root = std::env::temp_dir().join(format!("hsind-model-proxy-{}", uuid::Uuid::new_v4()));
+        let paths = Paths {
+            database: root.join("hsin.sqlite3"),
+            lock: root.join("hsind.lock"),
+            logs: root.join("logs"),
+            backups: root.join("backups"),
+            home: root.clone(),
+        };
+        let app = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
+        let discovery = app
+            .discover_models(ModelDiscoverParams {
+                client: ClientKind::Codex,
+                provider_id: None,
+                base_url: "http://127.0.0.2:8080/v1".into(),
+                auth_scheme: AuthScheme::Bearer,
+                secret: SecretInput::Replace("provider-key".into()),
+                network_proxy: ProviderProxyConfig {
+                    mode: ProviderProxyMode::Manual,
+                    manual: hsin_core::ManualProxyConfig {
+                        protocol: hsin_core::ProxyProtocol::Http,
+                        host: address.ip().to_string(),
+                        port: address.port(),
+                        username: "proxy-user".into(),
+                        password_configured: false,
+                    },
+                },
+                proxy_password: SecretInput::Replace("proxy-password".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(discovery.models, ["gpt-image-2", "gpt-5"]);
+        let headers = requests.recv().await.unwrap();
+        assert_eq!(
+            headers[axum::http::header::AUTHORIZATION],
+            "Bearer provider-key"
+        );
+        assert_eq!(
+            headers[axum::http::header::PROXY_AUTHORIZATION],
+            "Basic cHJveHktdXNlcjpwcm94eS1wYXNzd29yZA=="
+        );
+
+        server.abort();
+        drop(app);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -3221,6 +3816,7 @@ mod tests {
                 clients: None,
                 client_auth: None,
                 claude_model_names_enabled: None,
+                upstream_proxy: None,
             })
             .await
             .unwrap();
@@ -3238,8 +3834,12 @@ mod tests {
                     model: None,
                     codex_config_name: None,
                     claude_model_mapping: None,
+                    scope: ProviderScope::Primary,
+                    codex_image: hsin_core::CodexImageConfig::default(),
+                    network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("codex-secret".into()),
+                proxy_password: SecretInput::Preserve,
             })
             .await
             .unwrap();
@@ -3254,8 +3854,12 @@ mod tests {
                     model: None,
                     codex_config_name: None,
                     claude_model_mapping: None,
+                    scope: ProviderScope::Primary,
+                    codex_image: hsin_core::CodexImageConfig::default(),
+                    network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("claude-secret".into()),
+                proxy_password: SecretInput::Preserve,
             })
             .await
             .unwrap();
@@ -3276,6 +3880,7 @@ mod tests {
                 disable_custom_auth: true,
             }),
             claude_model_names_enabled: None,
+            upstream_proxy: None,
         })
         .await
         .unwrap();
@@ -3309,6 +3914,7 @@ mod tests {
                 clients: None,
                 client_auth: None,
                 claude_model_names_enabled: None,
+                upstream_proxy: None,
             })
             .await
             .unwrap();
@@ -3358,6 +3964,7 @@ mod tests {
             clients: None,
             client_auth: None,
             claude_model_names_enabled: None,
+            upstream_proxy: None,
         })
         .await
         .unwrap();
@@ -3413,8 +4020,12 @@ mod tests {
                     model: None,
                     codex_config_name: None,
                     claude_model_mapping: None,
+                    scope: ProviderScope::Primary,
+                    codex_image: hsin_core::CodexImageConfig::default(),
+                    network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("claude-secret".into()),
+                proxy_password: SecretInput::Preserve,
             })
             .await
             .unwrap();
@@ -3448,6 +4059,7 @@ mod tests {
                     ..hsin_core::ProviderPatch::default()
                 },
                 secret: SecretInput::Preserve,
+                proxy_password: SecretInput::Preserve,
             })
             .await
             .unwrap();
@@ -3471,6 +4083,7 @@ mod tests {
                 clients: None,
                 client_auth: None,
                 claude_model_names_enabled: Some(false),
+                upstream_proxy: None,
             })
             .await
             .unwrap();
@@ -3500,6 +4113,7 @@ mod tests {
             clients: None,
             client_auth: None,
             claude_model_names_enabled: Some(true),
+            upstream_proxy: None,
         })
         .await
         .unwrap();
@@ -3514,6 +4128,7 @@ mod tests {
             clients: None,
             client_auth: None,
             claude_model_names_enabled: Some(false),
+            upstream_proxy: None,
         })
         .await
         .unwrap();
@@ -3535,6 +4150,7 @@ mod tests {
                 ..hsin_core::ProviderPatch::default()
             },
             secret: SecretInput::Preserve,
+            proxy_password: SecretInput::Preserve,
         })
         .await
         .unwrap();
@@ -3598,8 +4214,12 @@ mod tests {
                         }),
                         ..hsin_core::ClaudeModelMapping::default()
                     }),
+                    scope: ProviderScope::Primary,
+                    codex_image: hsin_core::CodexImageConfig::default(),
+                    network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("mapped-secret".into()),
+                proxy_password: SecretInput::Preserve,
             })
             .await
             .unwrap();
@@ -3614,8 +4234,12 @@ mod tests {
                     model: None,
                     codex_config_name: None,
                     claude_model_mapping: None,
+                    scope: ProviderScope::Primary,
+                    codex_image: hsin_core::CodexImageConfig::default(),
+                    network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("unmapped-secret".into()),
+                proxy_password: SecretInput::Preserve,
             })
             .await
             .unwrap();

@@ -1,4 +1,7 @@
-use hsin_core::{AuthScheme, ClientKind, OPENAI_CODEX_CONFIG_NAME};
+use hsin_core::{
+    AuthScheme, ClientKind, OPENAI_CODEX_CONFIG_NAME, ProviderProxyMode, ProviderScope,
+    ProxyProtocol,
+};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -9,9 +12,17 @@ use ratatui::{
 use crate::i18n::I18n;
 
 use super::super::{
-    state::{ProviderForm, form_auth_field, form_description_field, form_field_count},
+    state::{
+        ProviderForm, form_auth_field, form_description_field, form_field_count, form_image_field,
+        form_network_proxy_field, form_proxy_host_field, form_proxy_password_field,
+        form_proxy_port_field, form_proxy_protocol_field, form_proxy_username_field,
+        primary_codex_form,
+    },
     theme::{INPUT_BG, RED, WHITE},
-    widgets::{centered_fixed, content_width, display_width, draw_input_field},
+    widgets::{
+        centered_fixed, content_width, display_width, draw_input_field, draw_row_scroll_indicators,
+        scrolling_rows,
+    },
 };
 
 const FORM_FIELD_HEIGHT: u16 = 3;
@@ -21,6 +32,11 @@ struct FormValues<'a> {
     secret_placeholder: &'a str,
     auth: &'static str,
     remote_compaction: String,
+    image_generation: String,
+    network_proxy: String,
+    proxy_protocol: &'static str,
+    proxy_password: String,
+    proxy_password_placeholder: &'a str,
 }
 
 pub(super) fn draw_form(frame: &mut Frame<'_>, area: Rect, form: &ProviderForm, i18n: &I18n) {
@@ -34,6 +50,19 @@ pub(super) fn draw_form(frame: &mut Frame<'_>, area: Rect, form: &ProviderForm, 
         i18n.text("api_key_preserve_hint")
     } else {
         "sk-****"
+    };
+    let hidden_proxy_password = "•".repeat(form.proxy_password.chars().count());
+    let proxy_password = if form.secret_visible {
+        form.proxy_password.to_string()
+    } else {
+        hidden_proxy_password
+    };
+    let proxy_password_placeholder = if form.proxy_password_clear {
+        i18n.text("proxy_password_clear_hint")
+    } else if form.id.is_some() && form.network_proxy.manual.password_configured {
+        i18n.text("api_key_preserve_hint")
+    } else {
+        i18n.text("optional")
     };
     let auth = match form.auth_scheme {
         AuthScheme::Bearer => "‹ Bearer ›",
@@ -50,6 +79,26 @@ pub(super) fn draw_form(frame: &mut Frame<'_>, area: Rect, form: &ProviderForm, 
         secret_placeholder,
         auth,
         remote_compaction,
+        image_generation: if form.codex_image.enabled {
+            format!("‹ {} ›", i18n.text("enabled"))
+        } else {
+            format!("‹ {} ›", i18n.text("disabled"))
+        },
+        network_proxy: format!(
+            "‹ {} ›",
+            match form.network_proxy.mode {
+                ProviderProxyMode::Inherit => i18n.text("upstream_proxy_inherit"),
+                ProviderProxyMode::Direct => i18n.text("upstream_proxy_direct"),
+                ProviderProxyMode::System => i18n.text("upstream_proxy_system"),
+                ProviderProxyMode::Manual => i18n.text("upstream_proxy_manual"),
+            }
+        ),
+        proxy_protocol: match form.network_proxy.manual.protocol {
+            ProxyProtocol::Http => "‹ HTTP ›",
+            ProxyProtocol::Socks5 => "‹ SOCKS5 ›",
+        },
+        proxy_password,
+        proxy_password_placeholder,
     };
     let field_count = form_field_count(form);
     let popup = form_popup(area, form, &values, field_count);
@@ -60,10 +109,12 @@ pub(super) fn draw_form(frame: &mut Frame<'_>, area: Rect, form: &ProviderForm, 
         .borders(Borders::ALL)
         .border_style(Style::default().fg(RED));
     let inner = block.inner(popup);
+    let fields = form_field_areas(inner, form.field, field_count);
     frame.render_widget(block, popup);
-    for (index, field) in form_field_areas(inner, form.field, field_count) {
+    for &(index, field) in &fields {
         draw_form_field(frame, field, index, form, i18n, &values);
     }
+    draw_row_scroll_indicators(frame, popup, &fields, field_count);
 }
 
 fn form_popup(
@@ -80,6 +131,10 @@ fn form_popup(
         display_width(values.secret),
         display_width(values.auth),
         display_width(&values.remote_compaction),
+        display_width(&values.image_generation),
+        display_width(&values.network_proxy),
+        display_width(&form.network_proxy.manual.host),
+        display_width(&form.network_proxy.manual.username),
     ]
     .into_iter()
     .max()
@@ -96,6 +151,7 @@ fn form_popup(
     centered_fixed(area, width, popup_height)
 }
 
+#[allow(clippy::too_many_lines)]
 fn draw_form_field(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -135,7 +191,7 @@ fn draw_form_field(
             (form.field == index).then_some(form.cursor),
             true,
         ),
-        3 if form.client == ClientKind::Codex => draw_input_field(
+        3 if primary_codex_form(form) => draw_input_field(
             frame,
             area,
             i18n.text("config_name"),
@@ -144,12 +200,69 @@ fn draw_form_field(
             (form.field == index).then_some(form.cursor),
             true,
         ),
-        4 if form.client == ClientKind::Codex => draw_choice_field(
+        4 if primary_codex_form(form) => draw_choice_field(
             frame,
             area,
             i18n.text("remote_compaction"),
             &values.remote_compaction,
             form.field == index,
+        ),
+        index if form_image_field(form) == Some(index) => draw_choice_field(
+            frame,
+            area,
+            i18n.text("configure_image_generation"),
+            &values.image_generation,
+            form.field == index,
+        ),
+        index if index == form_network_proxy_field(form) => draw_choice_field(
+            frame,
+            area,
+            i18n.text("upstream_proxy"),
+            &values.network_proxy,
+            form.field == index,
+        ),
+        index if form_proxy_protocol_field(form) == Some(index) => draw_choice_field(
+            frame,
+            area,
+            i18n.text("proxy_protocol"),
+            values.proxy_protocol,
+            form.field == index,
+        ),
+        index if form_proxy_host_field(form) == Some(index) => draw_input_field(
+            frame,
+            area,
+            i18n.text("proxy_address"),
+            &form.network_proxy.manual.host,
+            Some("127.0.0.1"),
+            (form.field == index).then_some(form.cursor),
+            true,
+        ),
+        index if form_proxy_port_field(form) == Some(index) => draw_input_field(
+            frame,
+            area,
+            i18n.text("proxy_port"),
+            &form.proxy_port,
+            Some("7890"),
+            (form.field == index).then_some(form.cursor),
+            true,
+        ),
+        index if form_proxy_username_field(form) == Some(index) => draw_input_field(
+            frame,
+            area,
+            i18n.text("proxy_username"),
+            &form.network_proxy.manual.username,
+            Some(i18n.text("optional")),
+            (form.field == index).then_some(form.cursor),
+            true,
+        ),
+        index if form_proxy_password_field(form) == Some(index) => draw_input_field(
+            frame,
+            area,
+            i18n.text("proxy_password"),
+            &values.proxy_password,
+            Some(values.proxy_password_placeholder),
+            (form.field == index).then_some(form.cursor),
+            true,
         ),
         index if index == form_description_field(form) => draw_input_field(
             frame,
@@ -187,7 +300,11 @@ fn draw_choice_field(frame: &mut Frame<'_>, area: Rect, label: &str, value: &str
 }
 
 fn form_title(form: &ProviderForm, i18n: &I18n) -> String {
-    let title = if form.id.is_some() {
+    let title = if form.scope == ProviderScope::ImageOnly && form.id.is_some() {
+        i18n.text("edit_image_provider")
+    } else if form.scope == ProviderScope::ImageOnly {
+        i18n.text("add_image_provider")
+    } else if form.id.is_some() {
         i18n.text("edit_provider")
     } else {
         i18n.text("add_provider")
@@ -204,29 +321,5 @@ pub(in crate::tui) fn form_field_areas(
     selected: usize,
     field_count: usize,
 ) -> Vec<(usize, Rect)> {
-    let visible = usize::from(area.height / FORM_FIELD_HEIGHT).min(field_count);
-    if visible == 0 || field_count == 0 {
-        return Vec::new();
-    }
-    let selected = selected.min(field_count - 1);
-    let start = selected
-        .saturating_add(1)
-        .saturating_sub(visible)
-        .min(field_count - visible);
-    (start..start + visible)
-        .enumerate()
-        .map(|(offset, index)| {
-            (
-                index,
-                Rect {
-                    x: area.x,
-                    y: area.y.saturating_add(
-                        u16::try_from(offset).unwrap_or(u16::MAX) * FORM_FIELD_HEIGHT,
-                    ),
-                    width: area.width,
-                    height: FORM_FIELD_HEIGHT,
-                },
-            )
-        })
-        .collect()
+    scrolling_rows(area, selected, field_count, FORM_FIELD_HEIGHT)
 }

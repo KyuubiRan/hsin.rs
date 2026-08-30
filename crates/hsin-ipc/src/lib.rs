@@ -51,6 +51,8 @@ pub mod method {
     pub const PROVIDER_SWITCH: &str = "provider.switch";
     pub const PROVIDER_IMPORT_CURRENT: &str = "provider.import_current";
     pub const PROVIDER_DISCOVER_MODELS: &str = "provider.discover_models";
+    pub const CODEX_IMAGE_LIST: &str = "codex_image.list";
+    pub const CODEX_IMAGE_SWITCH: &str = "codex_image.switch";
     pub const MODE_SET: &str = "mode.set";
     pub const STATUS: &str = "status";
     pub const DOCTOR: &str = "doctor";
@@ -71,6 +73,7 @@ pub mod capability {
     pub const SECURITY: &str = "security.v1";
     pub const CONFIG_SAGA: &str = "config_saga.v1";
     pub const MODEL_DISCOVERY: &str = "model_discovery.v1";
+    pub const CODEX_IMAGE: &str = "codex_image.v1";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -177,6 +177,7 @@ async fn synchronize_language(client: &DaemonClient, i18n: &mut I18n, overridden
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_provider(command: ProviderCommand, client: &DaemonClient, json: bool) -> Result<()> {
     match command {
         ProviderCommand::List(options) => {
@@ -208,8 +209,12 @@ async fn run_provider(command: ProviderCommand, client: &DaemonClient, json: boo
                     model: args.model,
                     codex_config_name: args.config_name,
                     claude_model_mapping: None,
+                    scope: hsin_core::ProviderScope::Primary,
+                    codex_image: hsin_core::CodexImageConfig::default(),
+                    network_proxy: hsin_core::ProviderProxyConfig::default(),
                 },
                 secret: secret.map_or(SecretInput::Clear, SecretInput::Replace),
+                proxy_password: SecretInput::Preserve,
             };
             let value: Value = client.call("provider.add", &request).await?;
             print_value(&value, json)
@@ -230,8 +235,11 @@ async fn run_provider(command: ProviderCommand, client: &DaemonClient, json: boo
                         .config_name
                         .map_or(CodexConfigNameUpdate::Preserve, CodexConfigNameUpdate::Set),
                     claude_model_mapping: ClaudeModelMappingUpdate::Preserve,
+                    codex_image: hsin_core::CodexImageConfigUpdate::Preserve,
+                    network_proxy: None,
                 },
                 secret: secret.map_or(SecretInput::Preserve, SecretInput::Replace),
+                proxy_password: SecretInput::Preserve,
             };
             let value: Value = client.call("provider.edit", &request).await?;
             print_value(&value, json)

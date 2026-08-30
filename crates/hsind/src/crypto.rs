@@ -306,7 +306,7 @@ impl CryptoManager {
 
     pub fn rotate(&self) -> Result<u32> {
         self.retry_pending_cleanup()?;
-        let providers = self.db.list_providers(None)?;
+        let providers = self.db.list_all_providers()?;
         let (old_version, old_key) = {
             let guard = self.material.read();
             let material = guard.as_ref().ok_or(DaemonError::Locked)?;
@@ -507,6 +507,9 @@ fn make_verifier(key: &[u8; KEY_BYTES], version: u32) -> Result<(Vec<u8>, Vec<u8
         model: None,
         codex_config_name: None,
         claude_model_mapping: None,
+        scope: hsin_core::ProviderScope::Primary,
+        codex_image: hsin_core::CodexImageConfig::default(),
+        network_proxy: hsin_core::ProviderProxyConfig::default(),
         revision: 0,
     };
     let encrypted = encrypt_secret(&provider, VERIFIER_TEXT, &material)?;
@@ -528,6 +531,9 @@ fn verify_key(key: &[u8; KEY_BYTES], version: u32, nonce: &[u8], verifier: &[u8]
         model: None,
         codex_config_name: None,
         claude_model_mapping: None,
+        scope: hsin_core::ProviderScope::Primary,
+        codex_image: hsin_core::CodexImageConfig::default(),
+        network_proxy: hsin_core::ProviderProxyConfig::default(),
         revision: 0,
     };
     let encrypted = EncryptedSecret {
@@ -697,6 +703,9 @@ mod tests {
                 model: None,
                 codex_config_name: None,
                 claude_model_mapping: None,
+                scope: hsin_core::ProviderScope::Primary,
+                codex_image: hsin_core::CodexImageConfig::default(),
+                network_proxy: hsin_core::ProviderProxyConfig::default(),
             })
             .unwrap();
         let encrypted = crypto.encrypt_for(&provider, "secret").unwrap();

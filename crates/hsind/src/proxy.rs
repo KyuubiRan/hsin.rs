@@ -2,9 +2,9 @@ use std::{future::IntoFuture, net::SocketAddr, sync::Arc};
 
 use axum::{
     Router,
-    body::Body,
+    body::{Body, to_bytes},
     extract::{ConnectInfo, State},
-    http::{HeaderMap, HeaderName, HeaderValue, Request, Response, StatusCode, header},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, header},
     routing::any,
 };
 use futures_util::StreamExt;
@@ -16,15 +16,18 @@ use crate::{
     app::App,
     config::HSIN_MANAGED_KEY,
     error::{DaemonError, Result},
-    model::{AuthScheme, ClientKind},
+    model::{AuthScheme, ClientKind, Provider},
+    network_proxy::{ClientOptions, build_client},
 };
 
 #[derive(Clone)]
 struct ProxyState {
     app: Arc<App>,
-    client: reqwest::Client,
     concurrency: Arc<Semaphore>,
 }
+
+const MAX_IMAGE_REQUEST_BYTES: usize = 256 * 1024 * 1024;
+const OPENAI_ACTOR_AUTHORIZATION: &str = "x-openai-actor-authorization";
 
 pub async fn serve(app: Arc<App>) -> Result<()> {
     let mut runtime = app.subscribe_proxy_runtime();
@@ -68,11 +71,6 @@ async fn serve_enabled(
     let listener = TcpListener::bind(desired.address).await?;
     let state = ProxyState {
         app: app.clone(),
-        client: reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|error| DaemonError::Internal(error.to_string()))?,
         concurrency: Arc::new(Semaphore::new(128)),
     };
     let router = Router::new()
@@ -116,6 +114,7 @@ async fn claude(
     forward(state, ClientKind::Claude, "/claude", peer, request).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn forward(
     state: ProxyState,
     kind: ClientKind,
@@ -142,11 +141,45 @@ async fn forward(
     ) {
         return text_response(StatusCode::UNAUTHORIZED, "invalid local proxy capability");
     }
-    let (provider, secret) = match state.app.upstream_snapshot(kind) {
-        Ok(value) => value,
-        Err(error) => return error_response(&error),
+    let image_request = kind == ClientKind::Codex
+        && matches!(
+            request.uri().path(),
+            "/codex/v1/images/generations" | "/codex/v1/images/edits"
+        );
+    if image_request && request.method() != Method::POST {
+        return text_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "image endpoint requires POST",
+        );
+    }
+    let snapshot = if image_request {
+        match state.app.image_upstream_snapshot() {
+            Ok(value) => value,
+            Err(DaemonError::NotFound(_)) => {
+                return text_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "no active Codex image provider",
+                );
+            }
+            Err(error) => return error_response(&error),
+        }
+    } else {
+        match state.app.upstream_snapshot(kind) {
+            Ok(value) => value,
+            Err(error) => return error_response(&error),
+        }
     };
+    let crate::app::UpstreamRequestSnapshot {
+        provider,
+        credential,
+        network_proxy,
+    } = snapshot;
     let (parts, body) = request.into_parts();
+    let declared_content_length = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok());
     let upstream = upstream_url(&provider.base_url, prefix, &parts.uri);
     let mut headers = parts.headers;
     remove_hop_by_hop(&mut headers);
@@ -154,9 +187,11 @@ async fn forward(
     headers.remove("x-api-key");
     headers.remove(header::HOST);
     headers.remove(header::CONTENT_LENGTH);
+    headers.remove(OPENAI_ACTOR_AUTHORIZATION);
     match provider.auth_scheme {
         AuthScheme::Bearer => {
-            if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", secret.expose_secret()))
+            if let Ok(value) =
+                HeaderValue::from_str(&format!("Bearer {}", credential.expose_secret()))
             {
                 headers.insert(header::AUTHORIZATION, value);
             } else {
@@ -164,7 +199,7 @@ async fn forward(
             }
         }
         AuthScheme::XApiKey => {
-            if let Ok(value) = HeaderValue::from_str(secret.expose_secret()) {
+            if let Ok(value) = HeaderValue::from_str(credential.expose_secret()) {
                 headers.insert(HeaderName::from_static("x-api-key"), value);
             } else {
                 return text_response(StatusCode::BAD_GATEWAY, "invalid upstream credential");
@@ -177,11 +212,30 @@ async fn forward(
             );
         }
     }
-    let outgoing = state
-        .client
+    let outgoing_body = if image_request {
+        match rewrite_image_body(body, declared_content_length, &provider).await {
+            Ok(body) => body,
+            Err(response) => return response,
+        }
+    } else {
+        reqwest::Body::wrap_stream(body.into_data_stream())
+    };
+    let client = match build_client(
+        &network_proxy,
+        ClientOptions {
+            connect_timeout: std::time::Duration::from_secs(10),
+            timeout: None,
+        },
+    )
+    .await
+    {
+        Ok(client) => client,
+        Err(error) => return error_response(&error),
+    };
+    let outgoing = client
         .request(parts.method, upstream)
         .headers(headers)
-        .body(reqwest::Body::wrap_stream(body.into_data_stream()));
+        .body(outgoing_body);
     let response = match outgoing.send().await {
         Ok(response) => response,
         Err(error) => {
@@ -208,6 +262,61 @@ async fn forward(
             "failed to build proxy response",
         )
     })
+}
+
+async fn rewrite_image_body(
+    body: Body,
+    declared_content_length: Option<usize>,
+    provider: &Provider,
+) -> std::result::Result<reqwest::Body, Response<Body>> {
+    if declared_content_length.is_some_and(|length| length > MAX_IMAGE_REQUEST_BYTES) {
+        return Err(text_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "image request body exceeds 256 MiB",
+        ));
+    }
+    let Ok(body) = to_bytes(body, MAX_IMAGE_REQUEST_BYTES).await else {
+        return Err(text_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "image request body exceeds 256 MiB",
+        ));
+    };
+    let mut value: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|_| text_response(StatusCode::BAD_REQUEST, "invalid image request JSON"))?;
+    let Some(object) = value.as_object_mut() else {
+        return Err(text_response(
+            StatusCode::BAD_REQUEST,
+            "image request must be a JSON object",
+        ));
+    };
+    let requested = object.get("model").and_then(serde_json::Value::as_str);
+    let selected = requested
+        .filter(|requested| {
+            provider
+                .codex_image
+                .models
+                .iter()
+                .any(|allowed| allowed == *requested)
+        })
+        .or(provider.codex_image.preferred_model.as_deref());
+    let Some(selected) = selected else {
+        return Err(text_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "active Codex image provider has no preferred model",
+        ));
+    };
+    object.insert(
+        "model".into(),
+        serde_json::Value::String(selected.to_owned()),
+    );
+    serde_json::to_vec(&value)
+        .map(reqwest::Body::from)
+        .map_err(|_| {
+            text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to encode image request",
+            )
+        })
 }
 
 fn authorized(
@@ -359,8 +468,45 @@ mod tests {
                         model: None,
                         codex_config_name: None,
                         claude_model_mapping: None,
+                        scope: hsin_core::ProviderScope::Primary,
+                        codex_image: hsin_core::CodexImageConfig::default(),
+                        network_proxy: hsin_core::ProviderProxyConfig::default(),
                     },
                     secret: SecretInput::Replace(secret.to_owned()),
+                    proxy_password: SecretInput::Preserve,
+                })
+                .await
+                .unwrap()
+        }
+
+        async fn add_image_provider(
+            &self,
+            name: &str,
+            base_url: String,
+            auth_scheme: AuthScheme,
+            secret: &str,
+        ) -> Provider {
+            self.app
+                .add_provider(ProviderAddParams {
+                    provider: ProviderDraft {
+                        client: ClientKind::Codex,
+                        name: name.to_owned(),
+                        description: String::new(),
+                        base_url,
+                        auth_scheme,
+                        model: None,
+                        codex_config_name: None,
+                        claude_model_mapping: None,
+                        scope: hsin_core::ProviderScope::ImageOnly,
+                        codex_image: hsin_core::CodexImageConfig {
+                            enabled: true,
+                            models: vec!["gpt-image-2".into(), "image-alpha".into()],
+                            preferred_model: Some("gpt-image-2".into()),
+                        },
+                        network_proxy: hsin_core::ProviderProxyConfig::default(),
+                    },
+                    secret: SecretInput::Replace(secret.to_owned()),
+                    proxy_password: SecretInput::Preserve,
                 })
                 .await
                 .unwrap()
@@ -376,10 +522,6 @@ mod tests {
     fn proxy_state(app: Arc<App>) -> ProxyState {
         ProxyState {
             app,
-            client: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .unwrap(),
             concurrency: Arc::new(Semaphore::new(8)),
         }
     }
@@ -596,6 +738,178 @@ mod tests {
         assert!(!seen.headers.contains_key(header::AUTHORIZATION));
         assert_eq!(seen.body, "claude-body");
 
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn image_endpoints_use_the_image_provider_and_rewrite_only_unallowed_models() {
+        let test = TestApp::new();
+        let (main_sender, mut main_requests) = mpsc::unbounded_channel();
+        let (main_address, main_server) = spawn_server(
+            Router::new()
+                .fallback(any(capture_request))
+                .with_state(main_sender),
+        )
+        .await;
+        let (image_sender, mut image_requests) = mpsc::unbounded_channel();
+        let (image_address, image_server) = spawn_server(
+            Router::new()
+                .fallback(any(capture_request))
+                .with_state(image_sender),
+        )
+        .await;
+        let main = test
+            .add_provider(
+                ClientKind::Codex,
+                "main",
+                format!("http://{main_address}/v1"),
+                AuthScheme::Bearer,
+                "main-secret",
+            )
+            .await;
+        test.app
+            .db
+            .set_active(ClientKind::Codex, &main.id, "synchronized")
+            .unwrap();
+        test.add_image_provider(
+            "images",
+            format!("http://{image_address}/v1"),
+            AuthScheme::XApiKey,
+            "image-secret",
+        )
+        .await;
+        let capability = test.app.proxy_capability(ClientKind::Codex).unwrap();
+        let state = proxy_state(test.app.clone());
+
+        let generation = Request::builder()
+            .method(Method::POST)
+            .uri("/codex/v1/images/generations")
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", capability.expose_secret()),
+            )
+            .header(OPENAI_ACTOR_AUTHORIZATION, "local-marker")
+            .body(Body::from(r#"{"model":"not-allowed","prompt":"test"}"#))
+            .unwrap();
+        let response =
+            forward_loopback(state.clone(), ClientKind::Codex, "/codex/v1", generation).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let seen = image_requests.recv().await.unwrap();
+        assert_eq!(seen.uri, "/v1/images/generations");
+        assert_eq!(seen.headers["x-api-key"], "image-secret");
+        assert!(!seen.headers.contains_key(header::AUTHORIZATION));
+        assert!(!seen.headers.contains_key(OPENAI_ACTOR_AUTHORIZATION));
+        let body: serde_json::Value = serde_json::from_slice(&seen.body).unwrap();
+        assert_eq!(body["model"], "gpt-image-2");
+
+        let edit = Request::builder()
+            .method(Method::POST)
+            .uri("/codex/v1/images/edits")
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", capability.expose_secret()),
+            )
+            .body(Body::from(
+                r#"{"model":"image-alpha","image":"data:image/png;base64,AA=="}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            forward_loopback(state.clone(), ClientKind::Codex, "/codex/v1", edit)
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        let seen = image_requests.recv().await.unwrap();
+        assert_eq!(seen.uri, "/v1/images/edits");
+        let body: serde_json::Value = serde_json::from_slice(&seen.body).unwrap();
+        assert_eq!(body["model"], "image-alpha");
+
+        let normal = Request::builder()
+            .method(Method::POST)
+            .uri("/codex/v1/responses")
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", capability.expose_secret()),
+            )
+            .header(OPENAI_ACTOR_AUTHORIZATION, "local-marker")
+            .body(Body::from("normal"))
+            .unwrap();
+        assert_eq!(
+            forward_loopback(state, ClientKind::Codex, "/codex/v1", normal)
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        let seen = main_requests.recv().await.unwrap();
+        assert_eq!(seen.uri, "/v1/responses");
+        assert_eq!(seen.headers[header::AUTHORIZATION], "Bearer main-secret");
+        assert!(!seen.headers.contains_key(OPENAI_ACTOR_AUTHORIZATION));
+        assert_eq!(seen.body, "normal");
+
+        main_server.abort();
+        image_server.abort();
+    }
+
+    #[tokio::test]
+    async fn image_endpoints_reject_wrong_methods_invalid_json_and_oversized_bodies() {
+        let test = TestApp::new();
+        let (sender, _requests) = mpsc::unbounded_channel();
+        let (address, server) = spawn_server(
+            Router::new()
+                .fallback(any(capture_request))
+                .with_state(sender),
+        )
+        .await;
+        test.add_image_provider(
+            "images",
+            format!("http://{address}/v1"),
+            AuthScheme::Bearer,
+            "image-secret",
+        )
+        .await;
+        let capability = test.app.proxy_capability(ClientKind::Codex).unwrap();
+        let state = proxy_state(test.app.clone());
+
+        let get = proxy_request("/codex/v1/images/generations", capability.expose_secret());
+        assert_eq!(
+            forward_loopback(state.clone(), ClientKind::Codex, "/codex/v1", get)
+                .await
+                .status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        let invalid = Request::builder()
+            .method(Method::POST)
+            .uri("/codex/v1/images/generations")
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", capability.expose_secret()),
+            )
+            .body(Body::from("not-json"))
+            .unwrap();
+        assert_eq!(
+            forward_loopback(state.clone(), ClientKind::Codex, "/codex/v1", invalid)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/codex/v1/images/edits")
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", capability.expose_secret()),
+            )
+            .header(header::CONTENT_LENGTH, MAX_IMAGE_REQUEST_BYTES + 1)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            forward_loopback(state, ClientKind::Codex, "/codex/v1", request)
+                .await
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
         server.abort();
     }
 

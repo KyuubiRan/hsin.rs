@@ -13,7 +13,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// Monotonic CLI/daemon release compatibility code. Every published workspace
 /// version must be exactly one greater than the preceding release so a new CLI
 /// always replaces an older daemon.
-pub const VERSION_CODE: u32 = 25;
+pub const VERSION_CODE: u32 = 26;
 
 pub const HSIN_CODEX_CONFIG_NAME: &str = "hsin";
 pub const OPENAI_CODEX_CONFIG_NAME: &str = "OpenAI";
@@ -241,6 +241,251 @@ impl FromStr for ConnectionMode {
             "proxy" => Ok(Self::Proxy),
             _ => Err(ParseEnumError::new("connection_mode", value)),
         }
+    }
+}
+
+/// How daemon-owned outbound HTTP clients reach an upstream provider.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamProxyMode {
+    #[default]
+    Direct,
+    System,
+    Manual,
+}
+
+impl UpstreamProxyMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::System => "system",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+impl fmt::Display for UpstreamProxyMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for UpstreamProxyMode {
+    type Err = ParseEnumError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "direct" => Ok(Self::Direct),
+            "system" => Ok(Self::System),
+            "manual" => Ok(Self::Manual),
+            _ => Err(ParseEnumError::new("upstream proxy mode", value)),
+        }
+    }
+}
+
+/// A provider can inherit the daemon-wide outbound proxy or override it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderProxyMode {
+    #[default]
+    Inherit,
+    Direct,
+    System,
+    Manual,
+}
+
+impl ProviderProxyMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inherit => "inherit",
+            Self::Direct => "direct",
+            Self::System => "system",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+impl fmt::Display for ProviderProxyMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ProviderProxyMode {
+    type Err = ParseEnumError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "inherit" => Ok(Self::Inherit),
+            "direct" => Ok(Self::Direct),
+            "system" => Ok(Self::System),
+            "manual" => Ok(Self::Manual),
+            _ => Err(ParseEnumError::new("provider proxy mode", value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyProtocol {
+    #[default]
+    Http,
+    Socks5,
+}
+
+impl ProxyProtocol {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Socks5 => "socks5",
+        }
+    }
+}
+
+impl fmt::Display for ProxyProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ProxyProtocol {
+    type Err = ParseEnumError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "http" => Ok(Self::Http),
+            "socks5" | "socks5h" => Ok(Self::Socks5),
+            _ => Err(ParseEnumError::new("proxy protocol", value)),
+        }
+    }
+}
+
+/// Public manual-proxy metadata. The password itself is encrypted separately by the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualProxyConfig {
+    #[serde(default)]
+    pub protocol: ProxyProtocol,
+    #[serde(default = "default_manual_proxy_host")]
+    pub host: String,
+    #[serde(default = "default_manual_proxy_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password_configured: bool,
+}
+
+impl Default for ManualProxyConfig {
+    fn default() -> Self {
+        Self {
+            protocol: ProxyProtocol::Http,
+            host: default_manual_proxy_host(),
+            port: default_manual_proxy_port(),
+            username: String::new(),
+            password_configured: false,
+        }
+    }
+}
+
+impl ManualProxyConfig {
+    /// Validate values used to construct a proxy URL without accepting embedded credentials.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when the host, port, username, or password-presence metadata is
+    /// not safe to use as a manual proxy endpoint.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let host = self.host.trim();
+        if host.is_empty() {
+            return Err(ValidationError::new("network_proxy.host", "empty"));
+        }
+        if host.chars().count() > 253 || host.chars().any(char::is_whitespace) {
+            return Err(ValidationError::new("network_proxy.host", "invalid"));
+        }
+        let authority_host = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{host}]")
+        } else {
+            host.to_owned()
+        };
+        let url = Url::parse(&format!("http://{authority_host}:{}", self.port))
+            .map_err(|_| ValidationError::new("network_proxy.host", "invalid"))?;
+        if url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(ValidationError::new("network_proxy.host", "invalid"));
+        }
+        if self.port == 0 {
+            return Err(ValidationError::new("network_proxy.port", "invalid"));
+        }
+        if self.username.chars().count() > 256 || self.username.chars().any(char::is_control) {
+            return Err(ValidationError::new("network_proxy.username", "invalid"));
+        }
+        if self.password_configured && self.username.trim().is_empty() {
+            return Err(ValidationError::new(
+                "network_proxy.username",
+                "required_for_password",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_manual_proxy_host() -> String {
+    "127.0.0.1".into()
+}
+
+const fn default_manual_proxy_port() -> u16 {
+    7890
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamProxyConfig {
+    #[serde(default)]
+    pub mode: UpstreamProxyMode,
+    #[serde(default)]
+    pub manual: ManualProxyConfig,
+}
+
+impl UpstreamProxyConfig {
+    /// Validate the active daemon-wide outbound proxy mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when manual mode is active and its endpoint is invalid.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.mode == UpstreamProxyMode::Manual {
+            self.manual.validate()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderProxyConfig {
+    #[serde(default)]
+    pub mode: ProviderProxyMode,
+    #[serde(default)]
+    pub manual: ManualProxyConfig,
+}
+
+impl ProviderProxyConfig {
+    /// Validate a provider's outbound proxy override.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when manual override mode is active and its endpoint is invalid.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.mode == ProviderProxyMode::Manual {
+            self.manual.validate()?;
+        }
+        Ok(())
     }
 }
 
@@ -549,6 +794,12 @@ pub struct Provider {
     pub codex_config_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_model_mapping: Option<ClaudeModelMapping>,
+    #[serde(default)]
+    pub scope: ProviderScope,
+    #[serde(default)]
+    pub codex_image: CodexImageConfig,
+    #[serde(default)]
+    pub network_proxy: ProviderProxyConfig,
     pub revision: u64,
 }
 
@@ -571,8 +822,120 @@ impl Provider {
             model: self.model.clone(),
             codex_config_name: self.codex_config_name.clone(),
             claude_model_mapping: self.claude_model_mapping.clone(),
+            scope: self.scope,
+            codex_image: self.codex_image.clone(),
+            network_proxy: self.network_proxy.clone(),
         }
         .validate()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderScope {
+    #[default]
+    Primary,
+    ImageOnly,
+}
+
+impl ProviderScope {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::ImageOnly => "image_only",
+        }
+    }
+}
+
+impl fmt::Display for ProviderScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ProviderScope {
+    type Err = ParseEnumError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "primary" => Ok(Self::Primary),
+            "image_only" | "image-only" => Ok(Self::ImageOnly),
+            _ => Err(ParseEnumError::new("provider scope", value)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexImageConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_model: Option<String>,
+}
+
+impl CodexImageConfig {
+    #[must_use]
+    pub fn is_inert(&self) -> bool {
+        !self.enabled && self.models.is_empty() && self.preferred_model.is_none()
+    }
+
+    /// Validate and normalize a persisted image model configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] for empty, oversized, duplicate, or inconsistent model IDs.
+    pub fn normalized(&self) -> Result<Self, ValidationError> {
+        if self.models.len() > 32 {
+            return Err(ValidationError::new("codex_image.models", "too_many"));
+        }
+        let mut models = Vec::with_capacity(self.models.len());
+        for model in &self.models {
+            let model = model.trim();
+            if model.is_empty() {
+                return Err(ValidationError::new("codex_image.models", "empty"));
+            }
+            if model.chars().count() > 256 {
+                return Err(ValidationError::new("codex_image.models", "too_long"));
+            }
+            if models.iter().any(|existing: &String| existing == model) {
+                continue;
+            }
+            models.push(model.to_owned());
+        }
+        let preferred_model = self
+            .preferred_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_owned);
+        if self.enabled && models.is_empty() {
+            return Err(ValidationError::new("codex_image.models", "empty"));
+        }
+        if models.is_empty() && preferred_model.is_some() {
+            return Err(ValidationError::new(
+                "codex_image.preferred_model",
+                "without_models",
+            ));
+        }
+        if let Some(preferred) = &preferred_model
+            && !models.iter().any(|model| model == preferred)
+        {
+            return Err(ValidationError::new(
+                "codex_image.preferred_model",
+                "not_allowed",
+            ));
+        }
+        if self.enabled && preferred_model.is_none() {
+            return Err(ValidationError::new("codex_image.preferred_model", "empty"));
+        }
+        Ok(Self {
+            enabled: self.enabled,
+            models,
+            preferred_model,
+        })
     }
 }
 
@@ -590,6 +953,12 @@ pub struct ProviderDraft {
     pub codex_config_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_model_mapping: Option<ClaudeModelMapping>,
+    #[serde(default)]
+    pub scope: ProviderScope,
+    #[serde(default)]
+    pub codex_image: CodexImageConfig,
+    #[serde(default)]
+    pub network_proxy: ProviderProxyConfig,
 }
 
 impl ProviderDraft {
@@ -623,6 +992,19 @@ impl ProviderDraft {
 
         if let Some(mapping) = &self.claude_model_mapping {
             mapping.validate(self.client)?;
+        }
+        let image = self.codex_image.normalized()?;
+        self.network_proxy.validate()?;
+        match self.client {
+            ClientKind::Claude if self.scope != ProviderScope::Primary || !image.is_inert() => {
+                return Err(ValidationError::new("codex_image", "unsupported_client"));
+            }
+            ClientKind::Codex
+                if self.scope == ProviderScope::ImageOnly && !self.codex_image.enabled =>
+            {
+                return Err(ValidationError::new("codex_image", "image_only_disabled"));
+            }
+            _ => {}
         }
 
         let url = Url::parse(self.base_url.trim())
@@ -700,6 +1082,25 @@ pub struct ProviderPatch {
     pub codex_config_name: CodexConfigNameUpdate,
     #[serde(default, skip_serializing_if = "ClaudeModelMappingUpdate::is_preserve")]
     pub claude_model_mapping: ClaudeModelMappingUpdate,
+    #[serde(default, skip_serializing_if = "CodexImageConfigUpdate::is_preserve")]
+    pub codex_image: CodexImageConfigUpdate,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_proxy: Option<ProviderProxyConfig>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum CodexImageConfigUpdate {
+    #[default]
+    Preserve,
+    Set(CodexImageConfig),
+}
+
+impl CodexImageConfigUpdate {
+    #[must_use]
+    pub const fn is_preserve(&self) -> bool {
+        matches!(self, Self::Preserve)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -750,9 +1151,10 @@ impl ModelUpdate {
 }
 
 /// How an RPC should update an existing secret.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum SecretInput {
+    #[default]
     Preserve,
     Replace(String),
     Clear,
@@ -778,6 +1180,8 @@ pub struct ProviderListParams {
 pub struct ProviderAddParams {
     pub provider: ProviderDraft,
     pub secret: SecretInput,
+    #[serde(default)]
+    pub proxy_password: SecretInput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -786,6 +1190,8 @@ pub struct ProviderEditParams {
     pub expected_revision: u64,
     pub patch: ProviderPatch,
     pub secret: SecretInput,
+    #[serde(default)]
+    pub proxy_password: SecretInput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -800,6 +1206,14 @@ pub struct ProviderSwitchParams {
     pub provider_id: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexImageListParams {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexImageSwitchParams {
+    pub provider_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelDiscoverParams {
     pub client: ClientKind,
@@ -808,6 +1222,10 @@ pub struct ModelDiscoverParams {
     pub base_url: String,
     pub auth_scheme: AuthScheme,
     pub secret: SecretInput,
+    #[serde(default)]
+    pub network_proxy: ProviderProxyConfig,
+    #[serde(default)]
+    pub proxy_password: SecretInput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -851,6 +1269,8 @@ pub struct DaemonStatus {
     #[serde(default)]
     pub proxy_enabled: bool,
     pub proxy_address: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_image_active_provider_id: Option<String>,
     pub clients: Vec<ClientState>,
 }
 
@@ -867,6 +1287,8 @@ pub struct Settings {
     pub client_auth: ClientAuthSettings,
     #[serde(default = "default_true")]
     pub claude_model_names_enabled: bool,
+    #[serde(default)]
+    pub upstream_proxy: UpstreamProxyConfig,
 }
 
 pub const LANGUAGE_SYSTEM: &str = "system";
@@ -883,8 +1305,16 @@ impl Default for Settings {
             clients: ClientSettings::default(),
             client_auth: ClientAuthSettings::default(),
             claude_model_names_enabled: true,
+            upstream_proxy: UpstreamProxyConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpstreamProxyUpdate {
+    pub config: UpstreamProxyConfig,
+    #[serde(default)]
+    pub password: SecretInput,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -903,6 +1333,8 @@ pub struct SettingsPatch {
     pub client_auth: Option<ClientAuthUpdate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_model_names_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_proxy: Option<UpstreamProxyUpdate>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1141,6 +1573,135 @@ mod tests {
             serde_json::to_string(&AuthScheme::OAuth).unwrap(),
             "\"oauth\""
         );
+        assert_eq!(
+            serde_json::to_string(&ProviderScope::ImageOnly).unwrap(),
+            "\"image_only\""
+        );
+        assert_eq!(
+            serde_json::to_string(&UpstreamProxyMode::System).unwrap(),
+            "\"system\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ProviderProxyMode::Inherit).unwrap(),
+            "\"inherit\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ProxyProtocol::Socks5).unwrap(),
+            "\"socks5\""
+        );
+    }
+
+    #[test]
+    fn manual_proxy_validation_rejects_unsafe_or_incomplete_values() {
+        let mut manual = ManualProxyConfig {
+            protocol: ProxyProtocol::Socks5,
+            host: "proxy.example.test".into(),
+            port: 1080,
+            username: "proxy-user".into(),
+            password_configured: true,
+        };
+        assert!(manual.validate().is_ok());
+
+        manual.username.clear();
+        assert_eq!(
+            manual.validate(),
+            Err(ValidationError::new(
+                "network_proxy.username",
+                "required_for_password"
+            ))
+        );
+        manual.password_configured = false;
+        manual.host = "user:password@proxy.example.test".into();
+        assert_eq!(
+            manual.validate(),
+            Err(ValidationError::new("network_proxy.host", "invalid"))
+        );
+        manual.host = "proxy.example.test/path".into();
+        assert_eq!(
+            manual.validate(),
+            Err(ValidationError::new("network_proxy.host", "invalid"))
+        );
+    }
+
+    #[test]
+    fn public_proxy_configs_expose_only_password_presence() {
+        let settings = Settings {
+            upstream_proxy: UpstreamProxyConfig {
+                mode: UpstreamProxyMode::Manual,
+                manual: ManualProxyConfig {
+                    username: "proxy-user".into(),
+                    password_configured: true,
+                    ..ManualProxyConfig::default()
+                },
+            },
+            ..Settings::default()
+        };
+        let encoded = serde_json::to_string(&settings).unwrap();
+        assert!(encoded.contains("\"password_configured\":true"));
+        assert!(!encoded.contains("proxy-password"));
+    }
+
+    #[test]
+    fn codex_image_models_are_normalized_and_preferred_must_be_allowed() {
+        let normalized = CodexImageConfig {
+            enabled: false,
+            models: vec![
+                " gpt-image-2 ".into(),
+                "gpt-image-2".into(),
+                "image-alpha".into(),
+            ],
+            preferred_model: Some(" gpt-image-2 ".into()),
+        }
+        .normalized()
+        .unwrap();
+        assert!(!normalized.enabled);
+        assert_eq!(normalized.models, ["gpt-image-2", "image-alpha"]);
+        assert_eq!(normalized.preferred_model.as_deref(), Some("gpt-image-2"));
+
+        assert_eq!(
+            CodexImageConfig {
+                enabled: true,
+                models: vec!["gpt-image-2".into()],
+                preferred_model: Some("other".into()),
+            }
+            .normalized(),
+            Err(ValidationError::new(
+                "codex_image.preferred_model",
+                "not_allowed"
+            ))
+        );
+    }
+
+    #[test]
+    fn image_only_providers_are_codex_only_and_must_be_enabled() {
+        let mut draft = ProviderDraft {
+            client: ClientKind::Codex,
+            name: "Images".into(),
+            description: String::new(),
+            base_url: "https://images.example.test/v1".into(),
+            auth_scheme: AuthScheme::Bearer,
+            model: None,
+            codex_config_name: None,
+            claude_model_mapping: None,
+            scope: ProviderScope::ImageOnly,
+            codex_image: CodexImageConfig::default(),
+            network_proxy: ProviderProxyConfig::default(),
+        };
+        assert_eq!(
+            draft.validate(),
+            Err(ValidationError::new("codex_image", "image_only_disabled"))
+        );
+        draft.codex_image = CodexImageConfig {
+            enabled: true,
+            models: vec!["gpt-image-2".into()],
+            preferred_model: Some("gpt-image-2".into()),
+        };
+        assert!(draft.validate().is_ok());
+        draft.client = ClientKind::Claude;
+        assert_eq!(
+            draft.validate(),
+            Err(ValidationError::new("codex_image", "unsupported_client"))
+        );
     }
 
     #[test]
@@ -1198,6 +1759,9 @@ mod tests {
             model: None,
             codex_config_name: None,
             claude_model_mapping: None,
+            scope: ProviderScope::Primary,
+            codex_image: CodexImageConfig::default(),
+            network_proxy: ProviderProxyConfig::default(),
         };
         assert!(valid.validate().is_ok());
 

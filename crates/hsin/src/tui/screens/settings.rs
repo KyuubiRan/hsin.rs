@@ -1,4 +1,4 @@
-use hsin_core::{ClientKind, LANGUAGE_EN_US, LANGUAGE_ZH_CN};
+use hsin_core::{ClientKind, LANGUAGE_EN_US, LANGUAGE_ZH_CN, ProxyProtocol, UpstreamProxyMode};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -51,6 +51,7 @@ pub(super) fn draw_settings_screen(
         .collect::<Vec<_>>()
         .join(" → ");
     let auth_warning = matches!(&screen.page, SettingsPage::ClientConfig { selected: 0, .. });
+    let upstream_mode = upstream_proxy_mode_label(state.upstream_proxy.mode, i18n);
 
     let columns = Layout::default()
         .direction(Direction::Horizontal)
@@ -61,6 +62,7 @@ pub(super) fn draw_settings_screen(
         SettingsPage::Root => {
             let items = vec![
                 settings_option_item(i18n.text("proxy_master"), proxy, option_width),
+                settings_option_item(i18n.text("upstream_proxy"), upstream_mode, option_width),
                 ListItem::new(i18n.text("client_configuration")),
                 settings_option_item(i18n.text("language"), language, option_width),
             ];
@@ -77,11 +79,19 @@ pub(super) fn draw_settings_screen(
                     items,
                     screen.selected,
                     i18n.text("settings_options"),
+                    i18n.text("upstream_proxy"),
+                    i18n.text("settings_upstream_proxy_description"),
+                    Some(upstream_mode),
+                ),
+                2 => (
+                    items,
+                    screen.selected,
+                    i18n.text("settings_options"),
                     i18n.text("client_configuration"),
                     i18n.text("settings_client_configuration_description"),
                     None,
                 ),
-                2 => (
+                3 => (
                     items,
                     screen.selected,
                     i18n.text("settings_options"),
@@ -126,6 +136,98 @@ pub(super) fn draw_settings_screen(
                 detail_title,
                 description,
                 Some(current),
+            )
+        }
+        SettingsPage::UpstreamProxy {
+            selected,
+            config,
+            port,
+            password,
+            password_clear,
+            password_visible,
+            ..
+        } => {
+            let mode = upstream_proxy_mode_label(config.mode, i18n);
+            let protocol = match config.manual.protocol {
+                ProxyProtocol::Http => "HTTP",
+                ProxyProtocol::Socks5 => "SOCKS5",
+            };
+            let hidden_password = "•".repeat(password.chars().count());
+            let password_value = if *password_clear {
+                i18n.text("proxy_password_clear_hint").to_owned()
+            } else if password.is_empty() && config.manual.password_configured {
+                i18n.text("api_key_preserve_hint").to_owned()
+            } else if *password_visible {
+                password.to_string()
+            } else {
+                hidden_password
+            };
+            let mut items = vec![settings_option_item(
+                i18n.text("upstream_proxy_mode"),
+                mode,
+                option_width,
+            )];
+            if config.mode == UpstreamProxyMode::Manual {
+                items.extend([
+                    settings_option_item(i18n.text("proxy_protocol"), protocol, option_width),
+                    settings_option_item(
+                        i18n.text("proxy_address"),
+                        &config.manual.host,
+                        option_width,
+                    ),
+                    settings_option_item(i18n.text("proxy_port"), port, option_width),
+                    settings_option_item(
+                        i18n.text("proxy_username"),
+                        &config.manual.username,
+                        option_width,
+                    ),
+                    settings_option_item(
+                        i18n.text("proxy_password"),
+                        &password_value,
+                        option_width,
+                    ),
+                ]);
+            }
+            let (detail_title, description, current) = match *selected {
+                0 => (
+                    i18n.text("upstream_proxy_mode"),
+                    i18n.text("settings_upstream_proxy_mode_description"),
+                    Some(mode),
+                ),
+                1 if config.mode == UpstreamProxyMode::Manual => (
+                    i18n.text("proxy_protocol"),
+                    i18n.text("settings_proxy_protocol_description"),
+                    Some(protocol),
+                ),
+                2 => (
+                    i18n.text("proxy_address"),
+                    i18n.text("settings_upstream_proxy_address_description"),
+                    Some(config.manual.host.as_str()),
+                ),
+                3 => (
+                    i18n.text("proxy_port"),
+                    i18n.text("settings_upstream_proxy_port_description"),
+                    Some(port.as_str()),
+                ),
+                4 => (
+                    i18n.text("proxy_username"),
+                    i18n.text("settings_proxy_username_description"),
+                    Some(config.manual.username.as_str()),
+                ),
+                5 => (
+                    i18n.text("proxy_password"),
+                    i18n.text("settings_proxy_password_description"),
+                    None,
+                ),
+                _ => unreachable!("upstream proxy selection is bounded"),
+            };
+            (
+                items,
+                *selected,
+                i18n.text("upstream_proxy"),
+                detail_title,
+                description,
+                current,
             )
         }
         SettingsPage::Language { selected } => {
@@ -365,6 +467,14 @@ pub(super) fn draw_settings_screen(
         ),
         columns[1],
     );
+}
+
+fn upstream_proxy_mode_label(mode: UpstreamProxyMode, i18n: &I18n) -> &str {
+    match mode {
+        UpstreamProxyMode::Direct => i18n.text("upstream_proxy_direct"),
+        UpstreamProxyMode::System => i18n.text("upstream_proxy_system"),
+        UpstreamProxyMode::Manual => i18n.text("upstream_proxy_manual"),
+    }
 }
 
 fn client_label(client: ClientKind, i18n: &I18n) -> &str {

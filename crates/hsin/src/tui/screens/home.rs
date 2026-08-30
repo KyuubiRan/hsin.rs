@@ -1,5 +1,6 @@
 use hsin_core::{
     AuthScheme, ClientKind, ConnectionMode, DEFAULT_CODEX_CONFIG_NAME, OPENAI_CODEX_CONFIG_NAME,
+    ProviderProxyMode,
 };
 use ratatui::{
     Frame,
@@ -31,6 +32,8 @@ pub(super) fn draw_provider_list(
             i18n.text("loading")
         } else if searching {
             i18n.text("no_search_results")
+        } else if state.image_section {
+            i18n.text("no_image_providers")
         } else {
             i18n.text("no_providers")
         })]
@@ -76,13 +79,18 @@ pub(super) fn draw_provider_list(
         )
         .block(
             Block::default()
-                .title(i18n.text("provider"))
+                .title(i18n.text(if state.image_section {
+                    "codex_image_providers"
+                } else {
+                    "provider"
+                }))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(MUTED)),
         );
     frame.render_stateful_widget(list, area, &mut list_state);
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn draw_details(frame: &mut Frame<'_>, area: Rect, state: &State, i18n: &I18n) {
     let Some(provider) = state.selected_provider() else {
         frame.render_widget(
@@ -128,6 +136,20 @@ pub(super) fn draw_details(frame: &mut Frame<'_>, area: Rect, state: &State, i18
     } else {
         i18n.text("disabled")
     };
+    let network_proxy = match provider.network_proxy.mode {
+        ProviderProxyMode::Inherit => i18n.text("upstream_proxy_inherit").to_owned(),
+        ProviderProxyMode::Direct => i18n.text("upstream_proxy_direct").to_owned(),
+        ProviderProxyMode::System => i18n.text("upstream_proxy_system").to_owned(),
+        ProviderProxyMode::Manual => format!(
+            "{} ({}:{})",
+            i18n.text("upstream_proxy_manual"),
+            provider.network_proxy.manual.host,
+            provider.network_proxy.manual.port
+        ),
+    };
+    let image_models = state
+        .image_section
+        .then(|| provider.codex_image.models.join(", "));
     let mut lines = vec![
         Line::from(Span::styled(
             name,
@@ -139,8 +161,30 @@ pub(super) fn draw_details(frame: &mut Frame<'_>, area: Rect, state: &State, i18
         detail_line(i18n.text("description"), description),
         detail_line(i18n.text("auth_type"), auth),
         detail_line(i18n.text("tool_proxy"), proxy),
+        detail_line(i18n.text("upstream_proxy"), &network_proxy),
     ];
-    if provider.client == ClientKind::Codex {
+    if state.image_section {
+        lines.push(detail_line(
+            i18n.text("image_provider_source"),
+            i18n.text(if provider.scope == hsin_core::ProviderScope::ImageOnly {
+                "image_source_manual"
+            } else {
+                "image_source_imported"
+            }),
+        ));
+        lines.push(detail_line(
+            i18n.text("preferred_image_model"),
+            provider
+                .codex_image
+                .preferred_model
+                .as_deref()
+                .unwrap_or(i18n.text("none")),
+        ));
+        lines.push(detail_line(
+            i18n.text("allowed_image_models"),
+            image_models.as_deref().unwrap_or(""),
+        ));
+    } else if provider.client == ClientKind::Codex {
         let config_name = provider
             .codex_config_name
             .as_deref()

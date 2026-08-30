@@ -1,4 +1,3 @@
-use hsin_core::ClientKind;
 use ratatui::{
     Frame,
     layout::{Alignment, Rect},
@@ -10,7 +9,7 @@ use ratatui::{
 use crate::i18n::I18n;
 
 use super::super::{
-    state::{InputMode, State},
+    state::{HomeSection, InputMode, State},
     theme::{INPUT_BG, MUTED, RED, WHITE},
     widgets::display_width,
 };
@@ -162,25 +161,27 @@ fn draw_compact_client_switcher(
 
 fn client_switcher_line<'a>(state: &State, i18n: &'a I18n) -> Line<'a> {
     let mut spans = Vec::new();
-    for client in state.visible_clients() {
+    for section in state.visible_sections() {
         if !spans.is_empty() {
             spans.push(Span::raw(" "));
         }
-        let label = match client {
-            ClientKind::Codex => i18n.text("codex"),
-            ClientKind::Claude => i18n.text("claude"),
-        };
-        spans.push(client_span(label, state.client == client));
+        let label = section_label(section, i18n);
+        spans.push(client_span(label, state.section() == section));
     }
     Line::from(spans)
 }
 
 fn selected_client_line<'a>(state: &State, i18n: &'a I18n) -> Line<'a> {
-    let label = match state.client {
-        ClientKind::Codex => i18n.text("codex"),
-        ClientKind::Claude => i18n.text("claude"),
-    };
+    let label = section_label(state.section(), i18n);
     Line::from(client_span(label, true))
+}
+
+fn section_label(section: HomeSection, i18n: &I18n) -> &str {
+    match section {
+        HomeSection::Client(hsin_core::ClientKind::Codex) => i18n.text("codex"),
+        HomeSection::Client(hsin_core::ClientKind::Claude) => i18n.text("claude"),
+        HomeSection::CodexImage => i18n.text("codex_image"),
+    }
 }
 
 fn client_span(label: &str, selected: bool) -> Span<'_> {
@@ -196,17 +197,14 @@ fn client_span(label: &str, selected: bool) -> Span<'_> {
 }
 
 fn client_switcher_width(state: &State, i18n: &I18n) -> u16 {
-    let clients = state.visible_clients();
-    let labels = clients
+    let sections = state.visible_sections();
+    let labels = sections
         .iter()
-        .map(|client| match client {
-            ClientKind::Codex => i18n.text("codex"),
-            ClientKind::Claude => i18n.text("claude"),
-        })
+        .map(|section| section_label(*section, i18n))
         .map(display_width)
         .sum::<usize>();
     let width = labels
-        .saturating_add(clients.len().saturating_mul(2))
-        .saturating_add(clients.len().saturating_sub(1));
+        .saturating_add(sections.len().saturating_mul(2))
+        .saturating_add(sections.len().saturating_sub(1));
     u16::try_from(width).unwrap_or(u16::MAX)
 }

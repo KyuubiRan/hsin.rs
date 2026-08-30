@@ -106,6 +106,7 @@ async fn serve_connection(
                         capability::SECURITY.into(),
                         capability::CONFIG_SAGA.into(),
                         capability::MODEL_DISCOVERY.into(),
+                        capability::CODEX_IMAGE.into(),
                     ],
                 })
             }) {
@@ -128,6 +129,7 @@ async fn serve_connection(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn dispatch(
     app: Arc<App>,
     id: u64,
@@ -174,6 +176,12 @@ async fn dispatch(
             }
             .await
         ),
+        method::CODEX_IMAGE_LIST => {
+            call!(parse(params).and_then(|params| app.list_codex_image_providers(&params)))
+        }
+        method::CODEX_IMAGE_SWITCH => {
+            call!(async { app.switch_codex_image(parse(params)?).await }.await)
+        }
         method::MODE_SET => call!(
             async {
                 let params: ModeSetParams = parse(params)?;

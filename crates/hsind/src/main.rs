@@ -12,6 +12,7 @@ mod crypto;
 mod db;
 mod error;
 mod model;
+mod network_proxy;
 mod paths;
 mod proxy;
 mod rpc;
