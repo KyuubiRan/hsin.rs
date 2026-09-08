@@ -20,8 +20,8 @@ use super::{
     state::{
         DELETE_CONFIRM_WINDOW, FormSubmission, HomeSection, ImageModelPicker, InputMode,
         ModelPicker, ModelPickerMode, ProviderClipboard, ProviderForm, SettingsPage,
-        SettingsScreen, form_field_count, form_proxy_password_field, form_proxy_protocol_field,
-        take_form_submission,
+        SettingsScreen, form_field_count, form_image_field, form_network_proxy_field,
+        form_proxy_password_field, form_proxy_protocol_field, take_form_submission,
     },
     theme::{INPUT_BG, RED, WHITE},
     widgets::centered_fixed,
@@ -1019,6 +1019,45 @@ fn provider_proxy_defaults_to_global_and_expands_manual_override_fields() {
         &state.input,
         InputMode::Form(form) if form.network_proxy.mode == ProviderProxyMode::System
     ));
+}
+
+#[test]
+fn provider_form_enter_continues_without_changing_choice_fields() {
+    let submit = |configure: fn(&mut ProviderForm)| {
+        let mut state = State {
+            loading: false,
+            ..State::default()
+        };
+        state.reduce(key(KeyCode::Char('a')));
+        let InputMode::Form(form) = &mut state.input else {
+            panic!("add must open the provider form");
+        };
+        form.base_url = "http://100.77.77.77:8317".into();
+        form.secret = Zeroizing::new("secret".into());
+        form.name = "Tailscale".into();
+        configure(form);
+
+        state.reduce(key(KeyCode::Enter));
+        let Some(Effect::DiscoverModels(submission)) = state.take_effect() else {
+            panic!("enter must continue to model discovery");
+        };
+        submission
+    };
+
+    let submission = submit(|form| form.field = form_network_proxy_field(form));
+    assert_eq!(submission.network_proxy.mode, ProviderProxyMode::Inherit);
+
+    let submission = submit(|form| {
+        form.network_proxy.mode = ProviderProxyMode::Manual;
+        form.field = form_proxy_protocol_field(form).expect("manual proxy protocol field");
+    });
+    assert_eq!(
+        submission.network_proxy.manual.protocol,
+        ProxyProtocol::Http
+    );
+
+    let submission = submit(|form| form.field = form_image_field(form).expect("image field"));
+    assert!(!submission.codex_image.enabled);
 }
 
 #[test]

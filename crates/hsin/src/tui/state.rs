@@ -646,16 +646,13 @@ impl State {
                     form.network_proxy.mode = previous_provider_proxy_mode(form.network_proxy.mode);
                     form.cursor = 0;
                 }
-                KeyCode::Right | KeyCode::Char('l' | ' ') | KeyCode::Enter
+                KeyCode::Right | KeyCode::Char('l' | ' ')
                     if form.field == form_network_proxy_field(form) =>
                 {
                     form.network_proxy.mode = next_provider_proxy_mode(form.network_proxy.mode);
                     form.cursor = 0;
                 }
-                KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Char('j' | 'l' | ' ')
-                | KeyCode::Enter
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('j' | 'l' | ' ')
                     if form_proxy_protocol_field(form) == Some(form.field) =>
                 {
                     form.network_proxy.manual.protocol = match form.network_proxy.manual.protocol {
@@ -663,10 +660,7 @@ impl State {
                         ProxyProtocol::Socks5 => ProxyProtocol::Http,
                     };
                 }
-                KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Char('j' | 'l' | ' ')
-                | KeyCode::Enter
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('j' | 'l' | ' ')
                     if form_image_field(form) == Some(form.field) =>
                 {
                     form.codex_image.enabled = !form.codex_image.enabled;
