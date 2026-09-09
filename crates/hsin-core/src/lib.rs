@@ -13,7 +13,7 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// Monotonic CLI/daemon release compatibility code. Every published workspace
 /// version must be exactly one greater than the preceding release so a new CLI
 /// always replaces an older daemon.
-pub const VERSION_CODE: u32 = 27;
+pub const VERSION_CODE: u32 = 28;
 
 pub const HSIN_CODEX_CONFIG_NAME: &str = "hsin";
 pub const OPENAI_CODEX_CONFIG_NAME: &str = "OpenAI";
