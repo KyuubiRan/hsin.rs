@@ -70,6 +70,36 @@ fn a_held_key_keeps_deleting_instead_of_stalling_after_one_character() {
     assert!(super::key_action(&release).is_none());
 }
 
+#[test]
+fn shifted_text_reaches_the_form_on_press_and_repeat_but_not_release() {
+    // Kitty resolves alternate keycodes and clears Shift; other backends may retain it.
+    let text = ":\"{}!@#$%^&*()_+<>?~|AZÜ";
+    for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+        for kind in [KeyEventKind::Press, KeyEventKind::Repeat] {
+            let mut state = State::default();
+            state.reduce(key(KeyCode::Char('a')));
+            for character in text.chars() {
+                let event = Event::Key(KeyEvent::new_with_kind(
+                    KeyCode::Char(character),
+                    modifiers,
+                    kind,
+                ));
+                state.reduce(super::key_action(&event).expect("text input"));
+                let release = Event::Key(KeyEvent::new_with_kind(
+                    KeyCode::Char(character),
+                    modifiers,
+                    KeyEventKind::Release,
+                ));
+                assert!(super::key_action(&release).is_none());
+            }
+            assert!(matches!(
+                &state.input,
+                InputMode::Form(form) if form.base_url == text && form.cursor == text.chars().count()
+            ));
+        }
+    }
+}
+
 fn submission() -> FormSubmission {
     FormSubmission {
         id: None,

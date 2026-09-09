@@ -108,6 +108,8 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                // Preserve layout-specific Shift characters when all keys use escape codes.
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
                 | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
         )
     );
