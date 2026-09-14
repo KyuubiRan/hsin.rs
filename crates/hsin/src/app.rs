@@ -55,6 +55,7 @@ pub async fn run(cli: Cli, i18n: &mut I18n) -> Result<()> {
             client: kind,
             provider_id,
             revision,
+            proxy,
         } => {
             let value: Value = client
                 .call(
@@ -63,6 +64,7 @@ pub async fn run(cli: Cli, i18n: &mut I18n) -> Result<()> {
                         "client": ClientKind::from(kind),
                         "provider_id": provider_id,
                         "revision": revision,
+                        "proxy": proxy,
                     }),
                 )
                 .await?;

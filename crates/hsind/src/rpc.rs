@@ -221,6 +221,7 @@ async fn dispatch(
                         params.client,
                         params.provider_id.as_deref(),
                         params.revision,
+                        params.proxy,
                     )
                 })
                 .map(|secret| secret.expose_secret().to_owned())
@@ -250,6 +251,8 @@ struct CredentialParams {
     provider_id: Option<String>,
     #[serde(default)]
     revision: Option<u64>,
+    #[serde(default)]
+    proxy: bool,
 }
 
 fn parse<T: DeserializeOwned>(value: Value) -> Result<T> {

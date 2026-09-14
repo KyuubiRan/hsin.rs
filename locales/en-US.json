@@ -140,6 +140,7 @@
   "codex_configuration": "Codex configuration",
   "claude_configuration": "Claude Code configuration",
   "disable_custom_auth": "Disable custom Auth",
+  "preserve_official_auth": "Preserve official login",
   "model_name_mapping": "Map model names",
   "client_visibility": "Displayed clients",
   "client_order": "Client order",
@@ -163,6 +164,7 @@
   "settings_codex_configuration_description": "Configure Codex authentication behavior.",
   "settings_claude_configuration_description": "Configure Claude Code authentication and model-name behavior.",
   "settings_disable_custom_auth_description": "Enabling this disables the Hsin Auth proxy and reduces security. If you must enable it, also use proxy mode.",
+  "settings_preserve_official_auth_description": "Keep the Codex official login while switching third-party Providers, and supply model credentials through Hsin Auth. Real API keys are never written to Codex configuration.",
   "settings_model_name_mapping_description": "Replace Claude Code's model-picker names and descriptions with the upstream model IDs configured in each Provider. Model routing remains mapped when this is off.",
   "settings_disable_custom_auth_warning_prefix": "Enabling this disables the Hsin Auth proxy and ",
   "settings_disable_custom_auth_warning_red": "reduces security",
@@ -173,6 +175,7 @@
   "settings_client_order_item_description": "Press Enter to select this client for repositioning.",
   "settings_client_order_moving_description": "Use Up and Down to move the selected client, then press Enter to save.",
   "client_auth_changed": "Client Auth settings updated",
+  "codex_official_auth_preservation_changed": "Codex official login preservation updated",
   "claude_model_names_changed": "Claude Code model-name mapping updated",
   "import_current": "Import current Provider",
   "settings_import_current_description": "A new Provider is created only when its Base URL or API key differs from every existing Provider.",
@@ -319,5 +322,6 @@
   "error.oauth_proxy_unsupported": "Official OAuth providers use the client's native session and cannot use the local proxy",
   "error.no_active_provider": "Configure or import a Provider before changing proxy mode",
   "error.current_credential_unavailable": "The current configuration does not expose an API key that can be imported",
+  "error.codex_official_auth_unavailable": "No preserved Codex official login is available; switch to Official and sign in first",
   "error.internal": "An internal daemon error occurred"
 }

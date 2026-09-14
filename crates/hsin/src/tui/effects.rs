@@ -32,6 +32,7 @@ pub(super) enum Effect {
         client: ClientKind,
         disable_custom_auth: bool,
     },
+    SetCodexOfficialAuthPreservation(bool),
     SetClaudeModelNames(bool),
     ImportCurrent(ClientKind),
     Add(FormSubmission),
@@ -182,6 +183,9 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
             client: kind,
             disable_custom_auth,
         } => update_client_auth(client, kind, disable_custom_auth).await,
+        Effect::SetCodexOfficialAuthPreservation(enabled) => {
+            update_codex_official_auth_preservation(client, enabled).await
+        }
         Effect::SetClaudeModelNames(enabled) => update_claude_model_names(client, enabled).await,
         Effect::ImportCurrent(kind) => {
             let imported = import_current(client, kind).await?;
@@ -368,6 +372,7 @@ async fn update_proxy_enabled(
                 proxy_enabled: Some(enabled),
                 clients: None,
                 client_auth: None,
+                codex_preserve_official_auth: None,
                 claude_model_names_enabled: None,
                 upstream_proxy: None,
             },
@@ -391,6 +396,7 @@ async fn update_proxy_host(client: &DaemonClient, host: String) -> Result<Option
                 proxy_enabled: None,
                 clients: None,
                 client_auth: None,
+                codex_preserve_official_auth: None,
                 claude_model_names_enabled: None,
                 upstream_proxy: None,
             },
@@ -410,6 +416,7 @@ async fn update_proxy_port(client: &DaemonClient, port: u16) -> Result<Option<&'
                 proxy_enabled: None,
                 clients: None,
                 client_auth: None,
+                codex_preserve_official_auth: None,
                 claude_model_names_enabled: None,
                 upstream_proxy: None,
             },
@@ -429,6 +436,7 @@ async fn update_language(client: &DaemonClient, language: String) -> Result<Opti
                 proxy_enabled: None,
                 clients: None,
                 client_auth: None,
+                codex_preserve_official_auth: None,
                 claude_model_names_enabled: None,
                 upstream_proxy: None,
             },
@@ -468,6 +476,7 @@ async fn update_clients(
                 proxy_enabled: None,
                 clients: Some(clients),
                 client_auth: None,
+                codex_preserve_official_auth: None,
                 claude_model_names_enabled: None,
                 upstream_proxy: None,
             },
@@ -494,12 +503,36 @@ async fn update_client_auth(
                     client: kind,
                     disable_custom_auth,
                 }),
+                codex_preserve_official_auth: None,
                 claude_model_names_enabled: None,
                 upstream_proxy: None,
             },
         )
         .await?;
     Ok(Some("client_auth_changed"))
+}
+
+async fn update_codex_official_auth_preservation(
+    client: &DaemonClient,
+    enabled: bool,
+) -> Result<Option<&'static str>> {
+    let _: Value = client
+        .call(
+            "settings.set",
+            &SettingsPatch {
+                language: None,
+                proxy_host: None,
+                proxy_port: None,
+                proxy_enabled: None,
+                clients: None,
+                client_auth: None,
+                codex_preserve_official_auth: Some(enabled),
+                claude_model_names_enabled: None,
+                upstream_proxy: None,
+            },
+        )
+        .await?;
+    Ok(Some("codex_official_auth_preservation_changed"))
 }
 
 async fn update_claude_model_names(
@@ -516,6 +549,7 @@ async fn update_claude_model_names(
                 proxy_enabled: None,
                 clients: None,
                 client_auth: None,
+                codex_preserve_official_auth: None,
                 claude_model_names_enabled: Some(enabled),
                 upstream_proxy: None,
             },

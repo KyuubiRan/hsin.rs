@@ -150,6 +150,14 @@ same value can be set explicitly with `--config-name`. This changes only
 `[model_providers.hsin].name`; the active selector and provider table key remain
 `hsin`.
 
+Settings -> Client configuration -> Codex configuration also provides an
+opt-in **Preserve official login** switch. It restores and then leaves Codex's
+native `auth.json` login untouched while third-party model requests obtain their
+credential through `[model_providers.hsin.auth]`. Hsin never writes the real
+provider key or an environment-variable value into Codex configuration. Enable
+this only after signing in through the Official provider; enabling it also turns
+Hsin Auth back on. Enabling **Disable custom Auth** later turns preservation off.
+
 Set `HSIN_HOME` to run isolated instances; each one keeps its own storage, IPC
 endpoint, keyring entries and service identity. `CODEX_HOME` and
 `CLAUDE_CONFIG_DIR` redirect the managed client configuration in the same way.

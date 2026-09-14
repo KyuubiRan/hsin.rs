@@ -140,6 +140,7 @@
   "codex_configuration": "Codex 配置",
   "claude_configuration": "Claude Code 配置",
   "disable_custom_auth": "禁用自定义 Auth",
+  "preserve_official_auth": "保持官方登录",
   "model_name_mapping": "映射模型名称",
   "client_visibility": "显示客户端",
   "client_order": "客户端顺序",
@@ -163,6 +164,7 @@
   "settings_codex_configuration_description": "配置 Codex 的认证行为。",
   "settings_claude_configuration_description": "配置 Claude Code 的认证和模型名称行为。",
   "settings_disable_custom_auth_description": "开启后，禁用 Hsin Auth 代理，这会使安全性降低，如果一定要开启此功能，建议同时开启代理模式。",
+  "settings_preserve_official_auth_description": "切换第三方 Provider 时保持 Codex 官方登录，并通过 Hsin Auth 提供模型凭据。开启后不会把真实 API Key 写入 Codex 配置。",
   "settings_model_name_mapping_description": "使用每个 Provider 配置的上游模型 ID 替换 Claude Code 模型选择器中的名称和说明。关闭后仍会保留模型路由映射。",
   "settings_disable_custom_auth_warning_prefix": "开启后，禁用 Hsin Auth 代理，这会使",
   "settings_disable_custom_auth_warning_red": "安全性降低",
@@ -173,6 +175,7 @@
   "settings_client_order_item_description": "按 Enter 选中此客户端，然后调整位置。",
   "settings_client_order_moving_description": "使用上、下键移动选中的客户端，按 Enter 保存。",
   "client_auth_changed": "客户端 Auth 设置已更新",
+  "codex_official_auth_preservation_changed": "Codex 官方登录保留设置已更新",
   "claude_model_names_changed": "Claude Code 模型名称映射已更新",
   "import_current": "导入当前 Provider",
   "settings_import_current_description": "只有 Base URL 或 API Key 与已有 Provider 不同时，才会创建新的 Provider。",
@@ -319,5 +322,6 @@
   "error.oauth_proxy_unsupported": "Official OAuth 使用客户端原生登录状态，不能通过本地代理转发",
   "error.no_active_provider": "请先配置或导入 Provider，再切换代理模式",
   "error.current_credential_unavailable": "当前配置没有可导入的 API Key",
+  "error.codex_official_auth_unavailable": "没有可恢复的 Codex 官方登录，请先切换到 Official 并完成登录",
   "error.internal": "daemon 发生内部错误"
 }

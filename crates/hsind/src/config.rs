@@ -41,6 +41,7 @@ pub struct DetectedProvider {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ConfigTarget {
     pub client: ClientKind,
     pub mode: ConnectionMode,
@@ -51,6 +52,8 @@ pub struct ConfigTarget {
     pub proxy_port: u16,
     #[serde(default)]
     pub disable_custom_auth: bool,
+    #[serde(default)]
+    pub codex_preserve_official_auth: bool,
     #[serde(default)]
     pub codex_image_enabled: bool,
     #[serde(default = "default_true")]
@@ -619,29 +622,29 @@ fn codex_provider_table(target: &ConfigTarget, credential: Option<&str>) -> Resu
         provider["requires_openai_auth"] = value(true);
         return Ok(provider);
     }
-    if target.disable_custom_auth
-        && !(target.mode == ConnectionMode::Proxy && target.codex_image_enabled)
+    let disable_custom_auth = target.disable_custom_auth && !target.codex_preserve_official_auth;
+    if disable_custom_auth && !(target.mode == ConnectionMode::Proxy && target.codex_image_enabled)
     {
         let _ = configured_key(target, credential)?;
         provider["requires_openai_auth"] = value(true);
         return Ok(provider);
     }
-    if target.disable_custom_auth {
+    if disable_custom_auth {
         provider["experimental_bearer_token"] = value(HSIN_MANAGED_KEY);
     } else {
         let mut auth = Table::new();
         auth["command"] = value(target.credential_command.clone());
-        let args = match target.mode {
-            ConnectionMode::Direct => vec![
-                "credential".to_owned(),
-                "codex".to_owned(),
-                "--provider-id".to_owned(),
-                target.provider.id.clone(),
-                "--revision".to_owned(),
-                target.provider.revision.to_string(),
-            ],
-            ConnectionMode::Proxy => vec!["credential".to_owned(), "codex".to_owned()],
-        };
+        let mut args = vec![
+            "credential".to_owned(),
+            "codex".to_owned(),
+            "--provider-id".to_owned(),
+            target.provider.id.clone(),
+            "--revision".to_owned(),
+            target.provider.revision.to_string(),
+        ];
+        if target.mode == ConnectionMode::Proxy {
+            args.push("--proxy".to_owned());
+        }
         auth["args"] = toml_edit::value(toml_edit::Array::from_iter(args));
         auth["timeout_ms"] = value(5000);
         auth["refresh_interval_ms"] = value(0);
@@ -1556,6 +1559,7 @@ mod tests {
             proxy_host: "127.0.0.1".into(),
             proxy_port: 9999,
             disable_custom_auth: false,
+            codex_preserve_official_auth: false,
             codex_image_enabled: false,
             claude_model_names_enabled: true,
             claude_model_names_update: None,
@@ -1610,6 +1614,20 @@ mod tests {
         assert!(!output.contains("requires_openai_auth"));
         assert!(!output.contains("[model_providers.hsin.auth]"));
         assert!(output.contains("x-openai-actor-authorization"));
+    }
+
+    #[test]
+    fn official_auth_preservation_always_uses_the_credential_helper() {
+        let mut codex = target(ClientKind::Codex);
+        codex.mode = ConnectionMode::Proxy;
+        codex.disable_custom_auth = true;
+        codex.codex_preserve_official_auth = true;
+        codex.codex_image_enabled = true;
+        let output = patch_codex("", &codex).unwrap();
+        assert!(output.contains("[model_providers.hsin.auth]"));
+        assert!(!output.contains("requires_openai_auth"));
+        assert!(!output.contains("experimental_bearer_token"));
+        assert!(!output.contains("env_key"));
     }
 
     #[test]
@@ -1907,6 +1925,28 @@ mod tests {
                 "p",
                 "--revision",
                 "1"
+            ]
+        );
+
+        codex.mode = ConnectionMode::Proxy;
+        let output = patch_codex("", &codex).unwrap();
+        let document = output.parse::<DocumentMut>().unwrap();
+        let args = document["model_providers"]["hsin"]["auth"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(toml_edit::Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "credential",
+                "codex",
+                "--provider-id",
+                "p",
+                "--revision",
+                "1",
+                "--proxy"
             ]
         );
 

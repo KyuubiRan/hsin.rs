@@ -312,6 +312,15 @@ pub(super) fn draw_settings_screen(
                         i18n.text("off")
                     }),
                 ),
+                (ClientKind::Codex, 1) => (
+                    i18n.text("preserve_official_auth"),
+                    i18n.text("settings_preserve_official_auth_description"),
+                    Some(if state.client_auth.codex_preserve_official_auth {
+                        i18n.text("on")
+                    } else {
+                        i18n.text("off")
+                    }),
+                ),
                 (ClientKind::Claude, 1) => (
                     i18n.text("model_name_mapping"),
                     i18n.text("settings_model_name_mapping_description"),
@@ -340,6 +349,16 @@ pub(super) fn draw_settings_screen(
                 items.push(settings_option_item(
                     i18n.text("model_name_mapping"),
                     if model_names {
+                        i18n.text("on")
+                    } else {
+                        i18n.text("off")
+                    },
+                    option_width,
+                ));
+            } else {
+                items.push(settings_option_item(
+                    i18n.text("preserve_official_auth"),
+                    if state.client_auth.codex_preserve_official_auth {
                         i18n.text("on")
                     } else {
                         i18n.text("off")

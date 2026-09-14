@@ -1358,19 +1358,23 @@ impl State {
                         *selected = selected.saturating_sub(1);
                     }
                     KeyCode::Down | KeyCode::Char('k') => {
-                        let last = if *client == ClientKind::Claude { 2 } else { 1 };
-                        *selected = (*selected + 1).min(last);
+                        *selected = (*selected + 1).min(2);
                     }
                     KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
-                        if *selected == 0 || (*client == ClientKind::Claude && *selected == 1) =>
+                        if *selected <= 1 =>
                     {
-                        self.pending_effect = Some(if *selected == 0 {
-                            Effect::SetClientAuth {
+                        self.pending_effect = Some(match (*client, *selected) {
+                            (_, 0) => Effect::SetClientAuth {
                                 client: *client,
                                 disable_custom_auth: !client_auth.disable_custom_auth(*client),
+                            },
+                            (ClientKind::Codex, 1) => Effect::SetCodexOfficialAuthPreservation(
+                                !client_auth.codex_preserve_official_auth,
+                            ),
+                            (ClientKind::Claude, 1) => {
+                                Effect::SetClaudeModelNames(!claude_model_names_enabled)
                             }
-                        } else {
-                            Effect::SetClaudeModelNames(!claude_model_names_enabled)
+                            _ => unreachable!(),
                         });
                         self.loading = true;
                     }

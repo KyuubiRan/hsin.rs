@@ -583,6 +583,35 @@ fn client_configuration_toggles_custom_auth_per_client() {
 }
 
 #[test]
+fn codex_client_configuration_toggles_official_auth_preservation() {
+    let mut state = State {
+        loading: false,
+        input: InputMode::Settings(SettingsScreen {
+            selected: 1,
+            page: SettingsPage::ClientConfig {
+                client: ClientKind::Codex,
+                selected: 1,
+            },
+        }),
+        ..State::default()
+    };
+
+    state.reduce(key(KeyCode::Enter));
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::SetCodexOfficialAuthPreservation(true))
+    ));
+
+    state.client_auth.codex_preserve_official_auth = true;
+    state.loading = false;
+    state.reduce(key(KeyCode::Enter));
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::SetCodexOfficialAuthPreservation(false))
+    ));
+}
+
+#[test]
 fn claude_client_configuration_toggles_model_name_mapping() {
     let mut state = State {
         loading: false,
@@ -1124,10 +1153,7 @@ fn proxy_settings_edits_address_and_port_while_enabled() {
 #[test]
 fn client_configuration_imports_the_corresponding_current_provider() {
     for client in ClientKind::ALL {
-        let import_index = match client {
-            ClientKind::Codex => 1,
-            ClientKind::Claude => 2,
-        };
+        let import_index = 2;
         let mut state = State {
             input: InputMode::Settings(SettingsScreen {
                 selected: match client {
@@ -2554,6 +2580,25 @@ fn claude_client_configuration_renders_model_name_mapping_on_by_default() {
     assert!(rendered.contains("Map model names"));
     assert!(rendered.contains("upstream model IDs"));
     assert!(rendered.contains("[on]"));
+}
+
+#[test]
+fn codex_client_configuration_renders_official_auth_preservation_off_by_default() {
+    let mut state = State {
+        loading: false,
+        input: InputMode::Settings(SettingsScreen {
+            selected: 1,
+            page: SettingsPage::ClientConfig {
+                client: ClientKind::Codex,
+                selected: 1,
+            },
+        }),
+        ..State::default()
+    };
+    let rendered = render(&mut state, 90, 24);
+    assert!(rendered.contains("Preserve official login"));
+    assert!(rendered.contains("third-party"));
+    assert!(rendered.contains("[off]"));
 }
 
 fn rendered_with(status: crate::rpc::StatusSnapshot) -> String {

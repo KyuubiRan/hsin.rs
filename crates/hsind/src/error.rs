@@ -19,6 +19,8 @@ pub enum DaemonError {
     NoActiveProvider,
     #[error("the current client configuration does not expose an importable API key")]
     CurrentCredentialUnavailable,
+    #[error("no preserved Codex official login is available; switch to Official and sign in first")]
+    CodexOfficialAuthUnavailable,
     #[error("configuration error: {0}")]
     Config(String),
     #[error("protocol error: {0}")]
@@ -51,6 +53,7 @@ impl DaemonError {
             Self::OAuthProxyUnsupported => "oauth_proxy_unsupported",
             Self::NoActiveProvider => "no_active_provider",
             Self::CurrentCredentialUnavailable => "current_credential_unavailable",
+            Self::CodexOfficialAuthUnavailable => "codex_official_auth_unavailable",
             Self::Config(_) => "config_error",
             Self::Protocol(_) => "protocol_error",
             Self::Database(_) => "database_error",

@@ -74,9 +74,10 @@ replace it.
 
 - **`uninstall` does not release managed client configuration.** Codex and
   Claude keep the base URL and the credential-helper command that pointed at the
-  removed daemon, and `auth.json` keeps the `HSIN_MANAGED_KEY` placeholder that
-  only a local proxy accepts. Switch the client back to an unmanaged provider
-  *before* uninstalling, or restore its config by hand afterwards.
+  removed daemon. Unless official-auth preservation was enabled, `auth.json`
+  also keeps the `HSIN_MANAGED_KEY` placeholder that only a local proxy accepts.
+  Switch the client back to an unmanaged provider *before* uninstalling, or
+  restore its config by hand afterwards.
 - **A taken proxy port fails the mode switch.** `hsin mode set <client> proxy`
   reports the bind error and leaves the mode unchanged. Point the listener
   somewhere free first:

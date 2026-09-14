@@ -18,7 +18,7 @@ The only client-side bootstrap operation is launching `hsind service install --s
 
 ## Configuration ownership
 
-- Codex: `model_provider` and the `model_providers.hsin` subtree.
+- Codex: `model_provider` and the `model_providers.hsin` subtree. With official-auth preservation disabled, hsin also owns only the top-level `auth_mode` and `OPENAI_API_KEY` fields in `auth.json`; preservation restores those fields once and then leaves the file untouched.
 - Claude Code: `env.ANTHROPIC_BASE_URL`, `env.ANTHROPIC_API_KEY`, `env.ANTHROPIC_AUTH_TOKEN`, and `apiKeyHelper`.
 - Claude Code model mapping (opt-in per provider): `env.ANTHROPIC_DEFAULT_FABLE_MODEL`, `env.ANTHROPIC_DEFAULT_OPUS_MODEL`, `env.ANTHROPIC_DEFAULT_SONNET_MODEL`, and `env.ANTHROPIC_DEFAULT_HAIKU_MODEL`. The 1M-context option is written as a `[1m]` suffix on the model ID. Whatever the user had in these keys before hsin first wrote them is snapshotted and restored for any tier that is not mapped, so disabling the mapping is non-destructive. `ANTHROPIC_MODEL` is never touched.
 

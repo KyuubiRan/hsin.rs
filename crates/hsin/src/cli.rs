@@ -64,6 +64,8 @@ pub enum Command {
         provider_id: Option<String>,
         #[arg(long, hide = true)]
         revision: Option<u64>,
+        #[arg(long, hide = true)]
+        proxy: bool,
     },
 }
 

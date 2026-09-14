@@ -13,7 +13,7 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// Monotonic CLI/daemon release compatibility code. Every published workspace
 /// version must be exactly one greater than the preceding release so a new CLI
 /// always replaces an older daemon.
-pub const VERSION_CODE: u32 = 28;
+pub const VERSION_CODE: u32 = 29;
 
 pub const HSIN_CODEX_CONFIG_NAME: &str = "hsin";
 pub const OPENAI_CODEX_CONFIG_NAME: &str = "OpenAI";
@@ -131,6 +131,8 @@ pub struct ClientSettings {
 pub struct ClientAuthSettings {
     #[serde(default)]
     pub codex_disable_custom_auth: bool,
+    #[serde(default)]
+    pub codex_preserve_official_auth: bool,
     #[serde(default)]
     pub claude_disable_custom_auth: bool,
 }
@@ -1332,6 +1334,8 @@ pub struct SettingsPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_auth: Option<ClientAuthUpdate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_preserve_official_auth: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_model_names_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_proxy: Option<UpstreamProxyUpdate>,
@@ -1407,6 +1411,7 @@ pub enum ErrorCode {
     OAuthProxyUnsupported,
     NoActiveProvider,
     CurrentCredentialUnavailable,
+    CodexOfficialAuthUnavailable,
     Internal,
 }
 
@@ -1431,6 +1436,7 @@ impl ErrorCode {
             Self::OAuthProxyUnsupported => "oauth_proxy_unsupported",
             Self::NoActiveProvider => "no_active_provider",
             Self::CurrentCredentialUnavailable => "current_credential_unavailable",
+            Self::CodexOfficialAuthUnavailable => "codex_official_auth_unavailable",
             Self::Internal => "internal",
         }
     }
@@ -1745,7 +1751,9 @@ mod tests {
         }))
         .unwrap();
         assert!(settings.claude_model_names_enabled);
+        assert!(!settings.client_auth.codex_preserve_official_auth);
         assert!(Settings::default().claude_model_names_enabled);
+        assert!(!Settings::default().client_auth.codex_preserve_official_auth);
     }
 
     #[test]
