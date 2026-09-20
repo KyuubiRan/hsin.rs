@@ -13,7 +13,7 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// Monotonic CLI/daemon release compatibility code. Every published workspace
 /// version must be exactly one greater than the preceding release so a new CLI
 /// always replaces an older daemon.
-pub const VERSION_CODE: u32 = 29;
+pub const VERSION_CODE: u32 = 30;
 
 pub const HSIN_CODEX_CONFIG_NAME: &str = "hsin";
 pub const OPENAI_CODEX_CONFIG_NAME: &str = "OpenAI";
@@ -1276,6 +1276,171 @@ pub struct DaemonStatus {
     pub clients: Vec<ClientState>,
 }
 
+/// Origin of a normalized token-usage event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageDataSource {
+    Proxy,
+    Session,
+}
+
+impl UsageDataSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Proxy => "proxy",
+            Self::Session => "session",
+        }
+    }
+}
+
+/// Confidence that an event belongs to the recorded provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageAttribution {
+    Exact,
+    Inferred,
+    Unattributed,
+}
+
+impl UsageAttribution {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Inferred => "inferred",
+            Self::Unattributed => "unattributed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageStatsQuery {
+    pub client: ClientKind,
+    /// Inclusive UTC timestamp in seconds.
+    pub from: i64,
+    /// Exclusive UTC timestamp in seconds.
+    pub to: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageTokenSummary {
+    pub input_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+    pub request_count: u64,
+}
+
+impl UsageTokenSummary {
+    #[must_use]
+    pub const fn non_hit_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.cache_write_tokens)
+    }
+
+    #[must_use]
+    pub const fn total_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_write_tokens)
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.output_tokens)
+    }
+
+    #[must_use]
+    pub fn cache_hit_rate(&self) -> f64 {
+        let input = self
+            .input_tokens
+            .saturating_add(self.cache_write_tokens)
+            .saturating_add(self.cache_read_tokens);
+        if input == 0 {
+            0.0
+        } else {
+            let millionths = self
+                .cache_read_tokens
+                .saturating_mul(1_000_000)
+                .checked_div(input)
+                .unwrap_or(0)
+                .min(1_000_000);
+            f64::from(u32::try_from(millionths).unwrap_or(1_000_000)) / 1_000_000.0
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageDailyBucket {
+    /// Local calendar date in `YYYY-MM-DD` form.
+    pub date: String,
+    pub tokens: UsageTokenSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageProviderBreakdown {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    pub provider_name: String,
+    pub provider_revision: u64,
+    pub inferred: bool,
+    pub tokens: UsageTokenSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageModelBreakdown {
+    pub model: String,
+    pub tokens: UsageTokenSummary,
+    pub daily: Vec<UsageDailyBucket>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageAttributionCounts {
+    pub exact: u64,
+    pub inferred: u64,
+    pub unattributed: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageFilterOptions {
+    pub providers: Vec<UsageProviderOption>,
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageProviderOption {
+    pub id: String,
+    pub name: String,
+    pub inferred: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageStatsReport {
+    pub query: UsageStatsQuery,
+    pub summary: UsageTokenSummary,
+    pub total_tokens: u64,
+    pub hit_tokens: u64,
+    pub non_hit_tokens: u64,
+    pub cache_hit_rate: f64,
+    pub daily: Vec<UsageDailyBucket>,
+    pub providers: Vec<UsageProviderBreakdown>,
+    pub models: Vec<UsageModelBreakdown>,
+    pub attribution: UsageAttributionCounts,
+    pub filters: UsageFilterOptions,
+    pub collected_since: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_synced_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageSyncResult {
+    pub imported: u64,
+    pub skipped: u64,
+    pub failed_files: u64,
+    pub synced_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     pub language: String,
@@ -1560,6 +1725,21 @@ pub fn json_object<T: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn usage_summary_uses_non_overlapping_token_buckets() {
+        let summary = UsageTokenSummary {
+            input_tokens: 30,
+            cache_write_tokens: 10,
+            cache_read_tokens: 60,
+            output_tokens: 20,
+            reasoning_output_tokens: 8,
+            request_count: 1,
+        };
+        assert_eq!(summary.non_hit_tokens(), 40);
+        assert_eq!(summary.total_tokens(), 120);
+        assert!((summary.cache_hit_rate() - 0.6).abs() < f64::EPSILON);
+    }
 
     #[test]
     fn enums_have_stable_wire_and_cli_names() {

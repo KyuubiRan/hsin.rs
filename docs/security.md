@@ -8,4 +8,5 @@
 - Codex official-auth preservation keeps native login material in Codex's own credential store and uses the daemon-backed provider `auth.command`; no real provider key is projected into `config.toml`, `auth.json`, or an environment variable.
 - The proxy may bind to loopback, a specific interface, or a wildcard address. Every request validates a per-client capability token before replacing inbound authentication with the upstream credential; the fixed `HSIN_MANAGED_KEY` compatibility value is accepted only from loopback peers.
 - Request bodies, authorization headers, provider secrets, recovery keys and raw IPC parameters are excluded from tracing.
+- Token statistics store only client/source, a Provider name/ID/revision snapshot, model, normalized Token counters, timestamp, attribution, and hashed deduplication material. They never store prompts, responses, authorization data, raw session IDs, or project/session file paths. Session cursors persist only a hash of the normalized path.
 - If the system keyring is unavailable, the daemon enters a locked state instead of falling back to plaintext storage.

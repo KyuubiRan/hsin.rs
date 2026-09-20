@@ -5,7 +5,9 @@ use hsin_core::{
     CodexConfigNameUpdate, CodexImageConfig, ConnectionMode, DEFAULT_CODEX_CONFIG_NAME,
     HSIN_CODEX_CONFIG_NAME, LANGUAGE_EN_US, LANGUAGE_SYSTEM, LANGUAGE_ZH_CN, ModelDiscovery,
     ModelSlot, ModelUpdate, OPENAI_CODEX_CONFIG_NAME, Provider, ProviderProxyMode, ProviderScope,
-    ProxyProtocol, SecretInput, Settings, UpstreamProxyMode,
+    ProxyProtocol, SecretInput, Settings, UpstreamProxyMode, UsageAttributionCounts,
+    UsageDailyBucket, UsageFilterOptions, UsageModelBreakdown, UsageProviderBreakdown,
+    UsageProviderOption, UsageStatsQuery, UsageStatsReport, UsageTokenSummary,
 };
 use ratatui::{
     backend::TestBackend,
@@ -2857,6 +2859,21 @@ fn focus_tier(state: &mut State, index: usize) {
     }
 }
 
+/// Press tab on the focused mapping row and answer the daemon's model list with `models`.
+///
+/// Tab now opens a dialog rather than filling the row, so a test that wants the old one-keystroke
+/// fill has to say what the provider offered.
+fn complete_from_list(state: &mut State, models: &[&str]) {
+    state.reduce(key(KeyCode::Tab));
+    let Some(Effect::DiscoverMappingModels(_)) = state.take_effect() else {
+        panic!("tab must ask the daemon for the provider's models");
+    };
+    state.reduce(Action::MappingModelsDiscovered(ModelDiscovery {
+        resolved_base_url: "https://api.example.test".into(),
+        models: models.iter().map(|model| (*model).to_owned()).collect(),
+    }));
+}
+
 #[test]
 fn a_claude_form_opens_the_mapping_dialog_instead_of_saving_immediately() {
     // Codex resolves its model by discovery; Claude has no discovery endpoint, so the mapping
@@ -2869,11 +2886,12 @@ fn a_claude_form_opens_the_mapping_dialog_instead_of_saving_immediately() {
 #[test]
 fn arrow_keys_do_not_flip_a_tier_1m_box() {
     // ←/→ belong to the model text a tier row is focused on; only space touches its 1M box, so a
-    // stray arrow while typing cannot silently change what gets requested upstream.
+    // stray arrow while typing cannot silently change what gets requested upstream. → now also
+    // quick-fills the tier default, which is why the row is filled before the arrows are sent.
     let mut state = mapping_state(None);
     state.reduce(key(KeyCode::Char(' '))); // enable the mapping
     focus_tier(&mut state, 0); // Fable
-    state.reduce(key(KeyCode::Tab));
+    state.reduce(key(KeyCode::Right));
     state.reduce(key(KeyCode::Right));
     state.reduce(key(KeyCode::Left));
 
@@ -2891,13 +2909,19 @@ fn arrow_keys_do_not_flip_a_tier_1m_box() {
 }
 
 #[test]
-fn tab_completes_the_default_model_for_the_focused_tier() {
+fn tab_opens_the_provider_model_list_for_the_focused_tier() {
+    // Tab used to fill the first-party default straight in. It now opens the provider's own list,
+    // the same gesture the Codex form uses, because a mapped tier usually points at a third-party
+    // model ID the default could never supply.
     let mut state = mapping_state(None);
     state.reduce(key(KeyCode::Char(' '))); // enable the mapping
     focus_tier(&mut state, 0); // Fable
-    state.reduce(key(KeyCode::Tab));
+    complete_from_list(&mut state, &["claude-fable-5-1", "deepseek-v4"]);
+    state.reduce(key(KeyCode::Enter)); // choose the first entry
+
     state.reduce(key(KeyCode::Down)); // Opus
-    state.reduce(key(KeyCode::Tab));
+    complete_from_list(&mut state, &["claude-opus-5"]);
+    state.reduce(key(KeyCode::Enter));
     state.reduce(key(KeyCode::Char(' '))); // 1M on Opus
 
     state.reduce(key(KeyCode::Enter));
@@ -2908,7 +2932,7 @@ fn tab_completes_the_default_model_for_the_focused_tier() {
     assert_eq!(
         mapping.fable,
         Some(ModelSlot {
-            model: "claude-fable-5".into(),
+            model: "claude-fable-5-1".into(),
             context_1m: false,
         })
     );
@@ -2923,18 +2947,200 @@ fn tab_completes_the_default_model_for_the_focused_tier() {
 }
 
 #[test]
-fn tab_does_not_overwrite_a_model_the_operator_typed() {
+fn a_chosen_model_replaces_what_the_row_already_held() {
+    // Picking from the list states which model to use, so it overwrites. Appending at the caret
+    // the way typing does would leave a half-typed ID glued to the chosen one.
     let mut state = mapping_state(None);
     state.reduce(key(KeyCode::Char(' ')));
     focus_tier(&mut state, 0);
-    type_query(&mut state, "custom");
-    state.reduce(key(KeyCode::Tab));
+    type_query(&mut state, "deepseek");
+    complete_from_list(&mut state, &["claude-fable-5-1"]);
+    state.reduce(key(KeyCode::Enter));
 
     state.reduce(key(KeyCode::Enter));
     let ClaudeModelMappingUpdate::Set(mapping) = submitted_mapping(&mut state) else {
         panic!("expected a mapping");
     };
-    assert_eq!(mapping.fable.expect("fable tier").model, "custom");
+    assert_eq!(mapping.fable.expect("fable tier").model, "claude-fable-5-1");
+}
+
+#[test]
+fn cancelling_the_model_list_leaves_the_mapping_row_untouched() {
+    // The list is a dialog over the mapping, not a replacement for it: esc has to put the operator
+    // back in the row they came from with everything else intact.
+    let mut state = mapping_state(None);
+    state.reduce(key(KeyCode::Char(' ')));
+    focus_tier(&mut state, 2); // Sonnet
+    type_query(&mut state, "deepseek");
+    complete_from_list(&mut state, &["claude-sonnet-5"]);
+    state.reduce(key(KeyCode::Esc));
+
+    let InputMode::ModelMapping(mapping) = &state.input else {
+        panic!("esc must return to the mapping dialog");
+    };
+    assert_eq!(mapping.field, 4, "focus must return to the Sonnet row");
+    assert_eq!(mapping.rows[2].model, "deepseek");
+    assert!(
+        mapping.rows[0].model.is_empty() && mapping.rows[1].model.is_empty(),
+        "the other tiers must be untouched"
+    );
+    assert!(
+        mapping.enabled,
+        "the dialog must not switch the mapping off on its way out"
+    );
+}
+
+#[test]
+fn opening_the_model_list_keeps_the_mapping_the_operator_already_built() {
+    // The dialog owns the live mapping for as long as it is up, so every row — including the
+    // master switch, which is not one of the rows it can fill — has to survive the round trip.
+    // Rebuilding the mapping from the provider form instead silently reset `enabled` to off.
+    let mut state = mapping_state(Some(ClaudeModelMapping {
+        enabled: true,
+        default_model: Some("deepseek-v4-pro".into()),
+        default_context_1m: true,
+        haiku: Some(ModelSlot {
+            model: "deepseek-flash".into(),
+            context_1m: true,
+        }),
+        ..ClaudeModelMapping::default()
+    }));
+    focus_tier(&mut state, 0); // Fable
+    complete_from_list(&mut state, &["claude-fable-5-1"]);
+    state.reduce(key(KeyCode::Enter));
+
+    state.reduce(key(KeyCode::Enter)); // save the mapping
+    let ClaudeModelMappingUpdate::Set(mapping) = submitted_mapping(&mut state) else {
+        panic!("expected a mapping");
+    };
+    assert!(mapping.enabled);
+    assert_eq!(mapping.default_model.as_deref(), Some("deepseek-v4-pro"));
+    assert!(mapping.default_context_1m);
+    assert_eq!(
+        mapping.haiku.expect("haiku tier").resolved_model(),
+        "deepseek-flash[1m]"
+    );
+    assert_eq!(mapping.fable.expect("fable tier").model, "claude-fable-5-1");
+}
+
+#[test]
+fn the_default_model_row_lists_models_too() {
+    // ANTHROPIC_MODEL is the row that most needs a list: it is what a fresh Claude Code run
+    // starts on, and it is the one row with no tier default to fall back to.
+    let mut state = mapping_state(None);
+    state.reduce(key(KeyCode::Char(' ')));
+    state.reduce(key(KeyCode::Down)); // the default model row
+    complete_from_list(&mut state, &["deepseek-v4-pro"]);
+    state.reduce(key(KeyCode::Enter));
+
+    state.reduce(key(KeyCode::Enter));
+    let Some(Effect::Add(submission)) = state.take_effect() else {
+        panic!("expected an add effect");
+    };
+    let mapping = provider_add_params(submission)
+        .provider
+        .claude_model_mapping
+        .expect("the add request should carry the mapping");
+    assert_eq!(mapping.default_model.as_deref(), Some("deepseek-v4-pro"));
+}
+
+#[test]
+fn the_model_list_says_it_is_fetching_while_the_daemon_answers() {
+    // The dialog ignores keys until the reply lands, so the footer has to advertise that rather
+    // than listing shortcuts that do nothing for the next second.
+    let mut state = mapping_state(None);
+    state.reduce(key(KeyCode::Char(' ')));
+    focus_tier(&mut state, 0);
+    state.reduce(key(KeyCode::Tab));
+
+    let rendered = render(&mut state, 100, 32);
+    assert!(rendered.contains("Fetching model list"));
+
+    // Keys sent meanwhile are dropped rather than queued up behind the reply.
+    state.reduce(key(KeyCode::Esc));
+    assert!(matches!(state.input, InputMode::MappingModels(_)));
+}
+
+#[test]
+fn an_empty_provider_list_still_lets_the_model_be_typed() {
+    // A provider with no /models endpoint is the common case for the endpoints this feature is
+    // for, so a failed lookup must not dead-end the dialog.
+    let mut state = mapping_state(None);
+    state.reduce(key(KeyCode::Char(' ')));
+    focus_tier(&mut state, 1); // Opus
+    state.reduce(key(KeyCode::Tab));
+    let Some(Effect::DiscoverMappingModels(_)) = state.take_effect() else {
+        panic!("tab must ask the daemon for models");
+    };
+    state.reduce(Action::MappingModelDiscoveryFailed(
+        "model endpoint returned HTTP 404".into(),
+    ));
+
+    state.reduce(key(KeyCode::Char('m')));
+    type_query(&mut state, "my-opus");
+    state.reduce(key(KeyCode::Enter));
+
+    state.reduce(key(KeyCode::Enter));
+    let ClaudeModelMappingUpdate::Set(mapping) = submitted_mapping(&mut state) else {
+        panic!("expected a mapping");
+    };
+    assert_eq!(mapping.opus.expect("opus tier").model, "my-opus");
+}
+
+#[test]
+fn the_model_list_asks_for_models_at_the_provider_base_url() {
+    // The list is fetched from the provider being configured, not from whatever the daemon has
+    // active, and an edit must reuse the stored credential rather than sending an empty one.
+    let mut state = mapping_state(None);
+    state.reduce(key(KeyCode::Char(' ')));
+    focus_tier(&mut state, 0);
+    state.reduce(key(KeyCode::Tab));
+
+    let Some(Effect::DiscoverMappingModels(request)) = state.take_effect() else {
+        panic!("tab must ask the daemon for models");
+    };
+    assert_eq!(request.client, ClientKind::Claude);
+    assert_eq!(request.base_url, "https://api.example.test");
+    assert_eq!(request.auth_scheme, AuthScheme::XApiKey);
+    assert!(matches!(
+        request.secret,
+        hsin_core::SecretInput::Replace(ref secret) if secret == "secret"
+    ));
+}
+
+#[test]
+fn the_master_toggle_has_no_model_list() {
+    // The toggle carries no text, so there is nothing for a list to fill in.
+    let mut state = mapping_state(None);
+    state.reduce(key(KeyCode::Tab));
+    assert!(matches!(state.input, InputMode::ModelMapping(_)));
+    assert!(state.take_effect().is_none());
+}
+
+#[test]
+fn right_fills_the_first_party_default_into_an_empty_tier_row() {
+    // The quick fill moved from tab to →. It is only a guess at what the operator wants, so it
+    // must not overwrite a row they already filled in.
+    let mut state = mapping_state(None);
+    state.reduce(key(KeyCode::Char(' '))); // enable the mapping
+    focus_tier(&mut state, 0); // Fable
+    state.reduce(key(KeyCode::Right));
+
+    let InputMode::ModelMapping(mapping) = &state.input else {
+        panic!("expected the mapping dialog");
+    };
+    assert_eq!(mapping.rows[0].model, "claude-fable-5-1");
+    assert!(mapping.enabled, "the fill must not reach the master toggle");
+
+    // A second → moves the caret instead of refilling, so a typo can still be fixed in place.
+    type_query(&mut state, "-x");
+    state.reduce(key(KeyCode::Right));
+    state.reduce(key(KeyCode::Right));
+    type_query(&mut state, "!");
+    let InputMode::ModelMapping(mapping) = &state.input else {
+        panic!("expected the mapping dialog");
+    };
+    assert_eq!(mapping.rows[0].model, "claude-fable-5-1-x!");
 }
 
 #[test]
@@ -2942,7 +3148,7 @@ fn control_u_clears_the_focused_mapping_row() {
     let mut state = mapping_state(None);
     state.reduce(key(KeyCode::Char(' ')));
     focus_tier(&mut state, 0);
-    state.reduce(key(KeyCode::Tab));
+    state.reduce(key(KeyCode::Right));
     state.reduce(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL));
 
     state.reduce(key(KeyCode::Enter));
@@ -3109,7 +3315,7 @@ fn a_new_provider_carries_its_mapping_into_the_add_request() {
     let mut state = mapping_state(None);
     state.reduce(key(KeyCode::Char(' '))); // enable the mapping
     focus_tier(&mut state, 0); // Fable
-    state.reduce(key(KeyCode::Tab));
+    state.reduce(key(KeyCode::Right));
     state.reduce(key(KeyCode::Enter));
 
     let Some(Effect::Add(submission)) = state.take_effect() else {
@@ -3122,8 +3328,8 @@ fn a_new_provider_carries_its_mapping_into_the_add_request() {
     assert!(mapping.enabled);
     assert_eq!(
         mapping.fable.expect("fable tier").model,
-        "claude-fable-5",
-        "the tier typed in the dialog should reach the daemon"
+        "claude-fable-5-1",
+        "the tier filled in the dialog should reach the daemon"
     );
 }
 
@@ -3280,6 +3486,84 @@ fn arrows_move_the_caret_on_a_mapping_row() {
 }
 
 #[test]
+fn the_model_list_names_the_row_it_fills() {
+    // The dialog covers the mapping row it was opened from, so the title has to say which tier
+    // the chosen model lands in — otherwise a five-row dialog looks identical for every row.
+    let mut state = mapping_state(None);
+    state.reduce(key(KeyCode::Char(' ')));
+    focus_tier(&mut state, 2); // Sonnet
+    complete_from_list(&mut state, &["deepseek-v4-pro"]);
+
+    let rendered = render(&mut state, 100, 32);
+    assert!(rendered.contains("Select model"));
+    assert!(rendered.contains("Sonnet"));
+    assert!(rendered.contains("deepseek-v4-pro"));
+}
+
+#[test]
+fn an_empty_model_list_says_how_to_get_out() {
+    // The mapping dialog cannot save without a model the way the Codex picker can, so an empty
+    // list has to point at manual entry rather than leaving a blank box.
+    let mut state = mapping_state(None);
+    state.reduce(key(KeyCode::Char(' ')));
+    focus_tier(&mut state, 0);
+    state.reduce(key(KeyCode::Tab));
+    let Some(Effect::DiscoverMappingModels(_)) = state.take_effect() else {
+        panic!("tab must ask the daemon for models");
+    };
+    state.reduce(Action::MappingModelsDiscovered(ModelDiscovery {
+        resolved_base_url: "https://api.example.test".into(),
+        models: Vec::new(),
+    }));
+
+    let rendered = render(&mut state, 100, 32);
+    assert!(rendered.contains("No models found"));
+}
+
+#[test]
+fn the_search_box_filters_the_mapping_model_list() {
+    let mut state = mapping_state(None);
+    state.reduce(key(KeyCode::Char(' ')));
+    focus_tier(&mut state, 0);
+    complete_from_list(
+        &mut state,
+        &["claude-opus-5", "claude-sonnet-5", "deepseek-v4"],
+    );
+    state.reduce(key(KeyCode::Char('s')));
+    type_query(&mut state, "sonnet");
+    state.reduce(key(KeyCode::Enter)); // leave the search box
+    state.reduce(key(KeyCode::Enter)); // take the only match
+
+    state.reduce(key(KeyCode::Enter));
+    let ClaudeModelMappingUpdate::Set(mapping) = submitted_mapping(&mut state) else {
+        panic!("expected a mapping");
+    };
+    assert_eq!(
+        mapping.fable.expect("fable tier").model,
+        "claude-sonnet-5",
+        "the filter must decide what enter picks, not the full list"
+    );
+}
+
+#[test]
+fn esc_clears_a_committed_search_before_leaving_the_list() {
+    // The filter outlives the search box, so a single esc would otherwise drop the operator back
+    // into a short list they cannot explain.
+    let mut state = mapping_state(None);
+    state.reduce(key(KeyCode::Char(' ')));
+    focus_tier(&mut state, 0);
+    complete_from_list(&mut state, &["claude-opus-5", "deepseek-v4"]);
+    state.reduce(key(KeyCode::Char('s')));
+    type_query(&mut state, "deepseek");
+    state.reduce(key(KeyCode::Enter)); // commit the filter
+
+    state.reduce(key(KeyCode::Esc)); // clears the filter
+    assert!(matches!(state.input, InputMode::MappingModels(_)));
+    state.reduce(key(KeyCode::Esc)); // and only then leaves
+    assert!(matches!(state.input, InputMode::ModelMapping(_)));
+}
+
+#[test]
 fn the_search_box_edits_at_the_caret() {
     let mut state = State {
         providers: vec![example_provider()],
@@ -3296,4 +3580,130 @@ fn the_search_box_edits_at_the_caret() {
         panic!("expected the search box");
     };
     assert_eq!(query, "example");
+}
+
+fn usage_report() -> UsageStatsReport {
+    let tokens = UsageTokenSummary {
+        input_tokens: 100,
+        cache_write_tokens: 20,
+        cache_read_tokens: 80,
+        output_tokens: 50,
+        reasoning_output_tokens: 10,
+        request_count: 2,
+    };
+    UsageStatsReport {
+        query: UsageStatsQuery {
+            client: ClientKind::Codex,
+            from: 1_788_800_000,
+            to: 1_791_392_000,
+            provider_id: None,
+            model: None,
+        },
+        summary: tokens.clone(),
+        total_tokens: tokens.total_tokens(),
+        hit_tokens: tokens.cache_read_tokens,
+        non_hit_tokens: tokens.non_hit_tokens(),
+        cache_hit_rate: tokens.cache_hit_rate(),
+        daily: vec![UsageDailyBucket {
+            date: "2026-09-14".into(),
+            tokens: tokens.clone(),
+        }],
+        providers: vec![UsageProviderBreakdown {
+            provider_id: Some("provider-1".into()),
+            provider_name: "Example".into(),
+            provider_revision: 1,
+            inferred: true,
+            tokens: tokens.clone(),
+        }],
+        models: vec![UsageModelBreakdown {
+            model: "gpt-5".into(),
+            tokens: tokens.clone(),
+            daily: vec![UsageDailyBucket {
+                date: "2026-09-14".into(),
+                tokens,
+            }],
+        }],
+        attribution: UsageAttributionCounts {
+            exact: 1,
+            inferred: 1,
+            unattributed: 0,
+        },
+        filters: UsageFilterOptions {
+            providers: vec![UsageProviderOption {
+                id: "provider-1".into(),
+                name: "Example".into(),
+                inferred: true,
+            }],
+            models: vec!["gpt-5".into()],
+        },
+        collected_since: 1_788_800_000,
+        last_synced_at: Some(1_791_300_000),
+    }
+}
+
+#[test]
+fn stats_navigation_queries_filters_and_returns_home() {
+    let mut state = State {
+        providers: vec![example_provider()],
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Char('s')));
+    assert!(matches!(state.input, InputMode::Stats(_)));
+    assert!(matches!(state.take_effect(), Some(Effect::QueryUsage(_))));
+    state.reduce(Action::UsageLoaded(usage_report()));
+    state.reduce(key(KeyCode::Char('2')));
+    assert!(
+        matches!(state.input, InputMode::Stats(ref screen) if screen.page == state::StatsPage::Models)
+    );
+    state.reduce(key(KeyCode::Char('p')));
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Enter));
+    assert!(
+        matches!(state.take_effect(), Some(Effect::QueryUsage(ref query)) if query.provider_id.as_deref() == Some("provider-1"))
+    );
+    state.reduce(key(KeyCode::Esc));
+    assert!(matches!(state.input, InputMode::Normal));
+}
+
+#[test]
+fn stats_render_wide_and_compact_without_losing_token_details() {
+    for (width, height) in [(100, 32), (48, 16)] {
+        let mut state = State {
+            loading: false,
+            input: InputMode::Stats(state::StatsScreen {
+                page: state::StatsPage::Overview,
+                report: Some(usage_report()),
+                from: "2026-08-16".into(),
+                to: "2026-09-14".into(),
+                provider_id: None,
+                model: None,
+                filter: None,
+                scroll: 0,
+            }),
+            ..State::default()
+        };
+        let locale = I18n::new(Some(LANGUAGE_EN_US));
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut state, &locale))
+            .expect("draw stats");
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Total"));
+        assert!(rendered.contains("Hit"));
+        assert!(rendered.contains("Output"));
+    }
+}
+
+#[test]
+fn image_stats_are_rejected_with_a_localized_notice() {
+    let mut state = State {
+        image_section: true,
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Char('s')));
+    assert!(matches!(state.input, InputMode::Normal));
+    assert_eq!(state.notice.as_deref(), Some("@stats_image_unsupported"));
+    assert!(state.take_effect().is_none());
 }

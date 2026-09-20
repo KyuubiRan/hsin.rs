@@ -123,6 +123,9 @@ scriptable:
 
 ```bash
 hsin status                                   # daemon, proxy and client state
+hsin stats codex                              # last 30 days of Codex token usage
+hsin stats claude --from 2026-09-01 --to 2026-09-14
+hsin stats codex --provider <id> --model gpt-5 --json
 hsin doctor                                   # configuration, security and service checks
 hsin update                                   # update to the latest release
 
@@ -157,6 +160,14 @@ credential through `[model_providers.hsin.auth]`. Hsin never writes the real
 provider key or an environment-variable value into Codex configuration. Enable
 this only after signing in through the Official provider; enabling it also turns
 Hsin Auth back on. Enabling **Disable custom Auth** later turns preservation off.
+
+Press `s` on a Codex or Claude Code TUI page to open token statistics. Hsin
+combines exact usage observed by its local proxy with usage metadata from new
+Codex and Claude Code session-log entries, so official-login and direct-mode
+requests are included too. Collection begins after the upgraded daemon first
+starts: old sessions are not backfilled, and normalized usage events are kept
+for 90 days. Provider attribution from local session logs is inferred from
+Hsin's route history and is marked with `~`.
 
 Set `HSIN_HOME` to run isolated instances; each one keeps its own storage, IPC
 endpoint, keyring entries and service identity. `CODEX_HOME` and

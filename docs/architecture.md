@@ -23,3 +23,22 @@ The only client-side bootstrap operation is launching `hsind service install --s
 - Claude Code model mapping (opt-in per provider): `env.ANTHROPIC_DEFAULT_FABLE_MODEL`, `env.ANTHROPIC_DEFAULT_OPUS_MODEL`, `env.ANTHROPIC_DEFAULT_SONNET_MODEL`, and `env.ANTHROPIC_DEFAULT_HAIKU_MODEL`. The 1M-context option is written as a `[1m]` suffix on the model ID. Whatever the user had in these keys before hsin first wrote them is snapshotted and restored for any tier that is not mapped, so disabling the mapping is non-destructive. `ANTHROPIC_MODEL` is never touched.
 
 Everything else is outside hsin ownership. Patchers operate on source-preserving syntax trees and use compare-and-swap plus atomic replacement.
+
+## Usage statistics
+
+`hsind` normalizes Token usage from two sources. Proxy responses supply exact
+Provider snapshots without delaying streaming data; bounded observers recognize
+Anthropic Messages events, OpenAI Responses completion events, compatible
+stream-final usage, and bounded non-streaming JSON. Incremental readers scan
+only usage metadata from new Codex and Claude Code JSONL records, allowing
+official-login and direct-mode requests to be counted without reading or
+storing prompts and responses.
+
+The daemon records successful Provider/mode transitions in `usage_routes`.
+Session events are matched against the route active at their timestamp and are
+marked `inferred`; events before a known route remain `unattributed`. Proxy
+events are `exact` and take precedence during cross-source deduplication.
+Collection begins when a schema-9 daemon first starts, with existing complete
+lines marked as read. File cursors contain only a normalized-path hash, byte
+offset, modification metadata, and a tail fingerprint. Events older than the
+local-calendar 90-day boundary are removed.

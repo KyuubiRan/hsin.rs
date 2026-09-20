@@ -1,11 +1,12 @@
 use std::io::{self, Read, Write};
 
 use anyhow::{Context, Result, bail};
+use chrono::{Local, NaiveDate, TimeZone};
 use hsin_core::{
     ClaudeModelMappingUpdate, ClientKind, CodexConfigNameUpdate, DoctorFinding, DoctorReport,
     DoctorSeverity, ImportCurrentParams, ModeSetParams, ModelUpdate, Provider, ProviderAddParams,
     ProviderDraft, ProviderEditParams, ProviderPatch, ProviderRemoveParams, ProviderSwitchParams,
-    SecretInput,
+    SecretInput, UsageStatsQuery, UsageStatsReport,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -47,6 +48,7 @@ pub async fn run(cli: Cli, i18n: &mut I18n) -> Result<()> {
             let value: Value = client.call("status", &json!({})).await?;
             print_value(&value, cli.json)
         }
+        Command::Stats(args) => run_stats(args, &client, cli.json).await,
         Command::Doctor => unreachable!("doctor handled before bootstrapping"),
         Command::Update => unreachable!("update command handled before connecting"),
         Command::Security { command } => run_security(command, &client, cli.json).await,
@@ -80,6 +82,93 @@ pub async fn run(cli: Cli, i18n: &mut I18n) -> Result<()> {
         }
         Command::Daemon { .. } => unreachable!("daemon command handled before connecting"),
     }
+}
+
+async fn run_stats(args: crate::cli::StatsArgs, client: &DaemonClient, json: bool) -> Result<()> {
+    let today = Local::now().date_naive();
+    let to_date = args
+        .to
+        .as_deref()
+        .map(parse_date)
+        .transpose()?
+        .unwrap_or(today);
+    let from_date = args
+        .from
+        .as_deref()
+        .map(parse_date)
+        .transpose()?
+        .unwrap_or(to_date - chrono::Duration::days(29));
+    if from_date > to_date {
+        bail!("--from must not be later than --to");
+    }
+    let from = local_midnight(from_date)?;
+    let to = local_midnight(to_date + chrono::Duration::days(1))?;
+    let report: UsageStatsReport = client
+        .call(
+            hsin_ipc::method::STATS_QUERY,
+            &UsageStatsQuery {
+                client: args.client.into(),
+                from,
+                to,
+                provider_id: args.provider,
+                model: args.model,
+            },
+        )
+        .await?;
+    if json {
+        return print_json(&report);
+    }
+    println!("{}  {} — {}", report.query.client, from_date, to_date);
+    println!("Total tokens: {}", report.summary.total_tokens());
+    println!(
+        "Cache hit rate: {:.2}%",
+        report.summary.cache_hit_rate() * 100.0
+    );
+    println!("Cache hit tokens: {}", report.summary.cache_read_tokens);
+    println!("Non-hit tokens: {}", report.summary.non_hit_tokens());
+    println!("Input tokens: {}", report.summary.input_tokens);
+    println!("Cache write tokens: {}", report.summary.cache_write_tokens);
+    println!("Output tokens: {}", report.summary.output_tokens);
+    println!(
+        "Reasoning output tokens: {}",
+        report.summary.reasoning_output_tokens
+    );
+    println!("Requests: {}", report.summary.request_count);
+    println!(
+        "Attribution: exact {} · inferred {} · unattributed {}",
+        report.attribution.exact, report.attribution.inferred, report.attribution.unattributed
+    );
+    if !report.providers.is_empty() {
+        println!("\nProviders:");
+        for provider in &report.providers {
+            println!(
+                "  {}{}  {} tokens",
+                if provider.inferred { "~" } else { "" },
+                provider.provider_name,
+                provider.tokens.total_tokens()
+            );
+        }
+    }
+    if !report.models.is_empty() {
+        println!("\nModels:");
+        for model in &report.models {
+            println!("  {}  {} tokens", model.model, model.tokens.total_tokens());
+        }
+    }
+    Ok(())
+}
+
+fn parse_date(value: &str) -> Result<NaiveDate> {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .with_context(|| format!("invalid date {value:?}; expected YYYY-MM-DD"))
+}
+
+fn local_midnight(date: NaiveDate) -> Result<i64> {
+    let local = date
+        .and_hms_opt(0, 0, 0)
+        .and_then(|value| Local.from_local_datetime(&value).earliest())
+        .context("local calendar date has no valid midnight")?;
+    Ok(local.timestamp())
 }
 
 async fn run_doctor(json: bool, i18n: &I18n) -> Result<()> {

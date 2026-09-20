@@ -17,6 +17,7 @@ mod paths;
 mod proxy;
 mod rpc;
 mod service;
+mod usage;
 
 use std::path::{Path, PathBuf};
 
@@ -193,6 +194,24 @@ async fn run(
         "reconcile proxy configurations",
         app.reconcile_proxy_configurations(),
     )?;
+    app.initialize_usage()?;
+    let usage_app = app.clone();
+    let usage_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let collector = usage_app.usage_collector();
+            let result = tokio::task::spawn_blocking(move || collector.sync()).await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(code = error.code(), "usage synchronization failed");
+                }
+                Err(error) => tracing::warn!(%error, "usage synchronization task failed"),
+            }
+        }
+    });
     let mut rpc = tokio::spawn(rpc::serve(app.clone()));
     tokio::task::yield_now().await;
     let proxy = tokio::spawn(proxy::serve(app.clone()));
@@ -229,6 +248,7 @@ async fn run(
         Err(error) => tracing::warn!(%error,"proxy task failed"),
         _ => {}
     }
+    usage_task.abort();
     #[cfg(unix)]
     if let hsin_ipc::IpcEndpoint::Filesystem(path) = hsin_ipc::default_endpoint() {
         let _ = std::fs::remove_file(path);

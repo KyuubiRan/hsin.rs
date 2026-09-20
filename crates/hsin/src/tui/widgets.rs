@@ -97,7 +97,18 @@ pub(super) fn draw_banner(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
     );
 }
 
-pub(super) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &State, i18n: &I18n) {
+/// The footer hints shared by the two model-list dialogs, which differ only in the bare-browse
+/// line: the Codex picker can leave the model alone, the mapping one cannot.
+fn model_help<'a>(mode: &ModelPickerMode, i18n: &'a I18n, browse: &'a str) -> &'a str {
+    match mode {
+        ModelPickerMode::Browse => i18n.text(browse),
+        ModelPickerMode::Search => i18n.text("model_search_help"),
+        ModelPickerMode::Manual(_) => i18n.text("model_manual_help"),
+    }
+}
+
+/// The keyboard hints for whichever screen has focus.
+fn footer_help(state: &State, i18n: &I18n) -> String {
     let help = match &state.input {
         InputMode::Normal => i18n.text(if state.image_section {
             "image_help"
@@ -106,11 +117,14 @@ pub(super) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
         }),
         InputMode::Search { .. } => i18n.text("search_help"),
         InputMode::Form(_) => i18n.text("form_help"),
-        InputMode::Models(picker) => match picker.mode {
-            ModelPickerMode::Browse => i18n.text("model_help"),
-            ModelPickerMode::Search => i18n.text("model_search_help"),
-            ModelPickerMode::Manual(_) => i18n.text("model_manual_help"),
-        },
+        InputMode::Models(picker) => model_help(&picker.mode, i18n, "model_help"),
+        InputMode::MappingModels(picker) => {
+            if picker.discovering {
+                i18n.text("fetching_models")
+            } else {
+                model_help(&picker.mode, i18n, "model_help")
+            }
+        }
         InputMode::ImageModels(picker) => match picker.mode {
             ModelPickerMode::Browse => i18n.text("image_model_help"),
             ModelPickerMode::Search => i18n.text("model_search_help"),
@@ -141,13 +155,21 @@ pub(super) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
                 i18n.text("settings_submenu_help")
             }
         },
+        InputMode::Stats(screen) => i18n.text(if screen.filter.is_some() {
+            "stats_filter_help"
+        } else {
+            "stats_help"
+        }),
     };
     // With a committed filter, esc clears it instead of quitting; advertise that.
-    let help = if matches!(state.input, InputMode::Normal) && !state.search.is_empty() {
-        format!("{help} · {}", i18n.text("search_clear_hint"))
-    } else {
-        help.to_owned()
-    };
+    if matches!(state.input, InputMode::Normal) && !state.search.is_empty() {
+        return format!("{help} · {}", i18n.text("search_clear_hint"));
+    }
+    help.to_owned()
+}
+
+pub(super) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &State, i18n: &I18n) {
+    let help = footer_help(state, i18n);
     let transient = match &state.input {
         InputMode::Form(form) => form.error.map(|error| i18n.text(error).to_owned()),
         InputMode::Models(picker) => picker
@@ -160,6 +182,10 @@ pub(super) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
                 .map_or(warning.as_str(), |key| i18n.text(key))
                 .to_owned()
         }),
+        InputMode::MappingModels(picker) => picker
+            .warning
+            .as_ref()
+            .map(|warning| format!("{}: {warning}", i18n.text("models_fetch_failed"))),
         _ => None,
     }
     .or_else(|| {

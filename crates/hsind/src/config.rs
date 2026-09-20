@@ -533,6 +533,10 @@ pub fn patch_codex_with_credential(
     target: &ConfigTarget,
     credential: Option<&str>,
 ) -> Result<String> {
+    if target.provider.official {
+        return remove_codex_hsin_configuration(text);
+    }
+
     let mut output = text.to_owned();
     if let Some(model) = target.provider.model.as_deref() {
         let document = parse_toml(&output)?;
@@ -596,6 +600,56 @@ pub fn patch_codex_with_credential(
     }
     parse_toml(&output)?;
     Ok(output)
+}
+
+/// Hand Codex configuration back to its native provider selection.
+///
+/// `hsin` owns only its selector and provider subtree. An existing selector for another provider
+/// may have been written outside hsin, so it must remain intact.
+fn remove_codex_hsin_configuration(text: &str) -> Result<String> {
+    let document = parse_toml(text)?;
+    let mut ranges = Vec::new();
+
+    if document.get("model_provider").and_then(Item::as_str) == Some("hsin") {
+        let selector = document
+            .get("model_provider")
+            .and_then(Item::span)
+            .ok_or_else(|| DaemonError::Config("model_provider has no source span".into()))?;
+        ranges.push(line_range(selector, text));
+    }
+
+    if let Some(Item::Table(providers)) = document.get("model_providers")
+        && let Some(hsin) = providers.get("hsin")
+    {
+        match hsin {
+            Item::Value(value) => {
+                let span = value.span().ok_or_else(|| {
+                    DaemonError::Config("hsin provider has no source span".into())
+                })?;
+                ranges.push(line_range(span, text));
+            }
+            Item::Table(_) | Item::ArrayOfTables(_) => {
+                collect_explicit_table_ranges(hsin, text, &mut ranges);
+            }
+            Item::None => {}
+        }
+    }
+
+    // Apply the ranges in reverse so byte offsets remain valid.
+    let mut output = text.to_owned();
+    for range in merge_whitespace_separated_ranges(ranges, text)
+        .into_iter()
+        .rev()
+    {
+        output.replace_range(range, "");
+    }
+    parse_toml(&output)?;
+    Ok(output)
+}
+
+fn line_range(span: Range<usize>, text: &str) -> Range<usize> {
+    let start = text[..span.start].rfind('\n').map_or(0, |index| index + 1);
+    start..extend_to_line_end(span, text).end
 }
 
 fn parse_toml(text: &str) -> Result<ImDocument<String>> {
@@ -1719,7 +1773,7 @@ mod tests {
     }
 
     #[test]
-    fn official_configuration_restores_native_auth_and_preserves_unowned_fields() {
+    fn official_codex_configuration_removes_hsin_configuration() {
         let mut codex = target(ClientKind::Codex);
         codex.provider = Provider {
             id: "official-codex".into(),
@@ -1740,15 +1794,37 @@ mod tests {
             network_proxy: hsin_core::ProviderProxyConfig::default(),
         };
         let patched = patch_codex(
-            "# keep\nmodel_provider = \"hsin\"\napproval_policy = \"never\"\n[model_providers.hsin]\nname = \"hsin\"\nbase_url = \"http://127.0.0.1:9999/codex/v1\"\n",
+            "# keep\nmodel = \"gpt-test\"\nmodel_provider = \"hsin\" # hsin selector\napproval_policy = \"never\"\n\n[model_providers.hsin]\nname = \"hsin\"\nbase_url = \"http://127.0.0.1:9999/codex/v1\"\n\n[model_providers.hsin.auth]\ncommand = \"hsin credential\"\n\n# another provider remains unmanaged\n[model_providers.keep]\nbase_url = \"https://keep.example/v1\"\n",
             &codex,
         )
         .unwrap();
-        assert!(patched.contains("model_provider = \"hsin\""));
-        assert!(patched.contains("requires_openai_auth = true"));
+        assert!(!patched.contains("model_provider ="));
+        assert!(!patched.contains("[model_providers.hsin]"));
+        assert!(!patched.contains("hsin credential"));
         assert!(patched.contains("# keep"));
+        assert!(patched.contains("model = \"gpt-test\""));
         assert!(patched.contains("approval_policy = \"never\""));
-        assert!(patched.contains("[model_providers.hsin]"));
+        assert!(patched.contains("# another provider remains unmanaged"));
+        assert!(patched.contains("[model_providers.keep]"));
+
+        let user_selected = patch_codex(
+            "model_provider = \"keep\"\n[model_providers.hsin]\nbase_url = \"https://stale.example/v1\"\n\n[model_providers.keep]\nbase_url = \"https://keep.example/v1\"\n",
+            &codex,
+        )
+        .unwrap();
+        assert!(user_selected.contains("model_provider = \"keep\""));
+        assert!(!user_selected.contains("[model_providers.hsin]"));
+
+        let crlf = patch_codex(
+            "model_provider = \"hsin\"\n\n[model_providers.hsin]\nbase_url = \"https://stale.example/v1\"\n"
+                .replace('\n', "\r\n")
+                .as_str(),
+            &codex,
+        )
+        .unwrap();
+        assert!(!crlf.contains("model_provider ="));
+        assert!(!crlf.contains("[model_providers.hsin]"));
+        assert_crlf_only(&crlf);
 
         let mut claude = target(ClientKind::Claude);
         claude.provider = Provider {
@@ -2096,13 +2172,13 @@ mod tests {
             enabled: true,
             default_model: Some("deepseek-v4-pro".into()),
             default_context_1m: true,
-            fable: Some(mapped("claude-fable-5", false)),
+            fable: Some(mapped("claude-fable-5-1", false)),
             opus: Some(mapped("claude-opus-5", true)),
             sonnet: None,
             haiku: Some(mapped("deepseek-flash", true)),
         });
         let output = patch_claude_with_credential("", &claude, None).unwrap();
-        assert!(output.contains("\"ANTHROPIC_DEFAULT_FABLE_MODEL\": \"claude-fable-5\""));
+        assert!(output.contains("\"ANTHROPIC_DEFAULT_FABLE_MODEL\": \"claude-fable-5-1\""));
         assert!(output.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL\": \"claude-opus-5[1m]\""));
         assert!(output.contains("\"ANTHROPIC_DEFAULT_HAIKU_MODEL\": \"deepseek-flash[1m]\""));
         // An unmapped tier is not written at all rather than being blanked out.

@@ -5,6 +5,7 @@ use hsin_core::{
     ImportCurrentParams, ImportCurrentResult, ModeSetParams, ModelDiscoverParams, ModelUpdate,
     Provider, ProviderAddParams, ProviderDraft, ProviderEditParams, ProviderPatch,
     ProviderRemoveParams, ProviderSwitchParams, SecretInput, Settings, SettingsPatch,
+    UsageStatsQuery, UsageStatsReport,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -38,6 +39,9 @@ pub(super) enum Effect {
     Add(FormSubmission),
     Edit(FormSubmission),
     DiscoverModels(FormSubmission),
+    /// The mapping dialog's model list. The dialog is already up and waiting for the result, so
+    /// only the request travels out.
+    DiscoverMappingModels(ModelDiscoverParams),
     CopyProvider(Provider),
     Remove {
         id: String,
@@ -48,6 +52,7 @@ pub(super) enum Effect {
         config: hsin_core::UpstreamProxyConfig,
         password: SecretInput,
     },
+    QueryUsage(UsageStatsQuery),
 }
 
 pub(super) async fn worker(
@@ -57,44 +62,40 @@ pub(super) async fn worker(
 ) {
     while let Some(effect) = effects.recv().await {
         if let Effect::DiscoverModels(form) = effect {
-            let request = ModelDiscoverParams {
-                client: form.client,
-                provider_id: form.id.clone(),
-                base_url: form.base_url.clone(),
-                auth_scheme: form.auth_scheme,
-                secret: if form.secret.is_empty() && form.id.is_some() {
-                    SecretInput::Preserve
-                } else {
-                    SecretInput::Replace(form.secret.to_string())
-                },
-                network_proxy: form.network_proxy.clone(),
-                proxy_password: proxy_password_input(
-                    &form.proxy_password,
-                    form.proxy_password_clear,
-                    form.id.is_some(),
-                ),
+            let request = discovery_request_for_form(&form);
+            let action = match discover(&client, &request).await {
+                Ok(discovery) => Action::ModelsDiscovered { form, discovery },
+                Err(message) => Action::ModelDiscoveryFailed { form, message },
             };
-            match client.call("provider.discover_models", &request).await {
-                Ok(discovery) => {
-                    let _ = actions
-                        .send(Action::ModelsDiscovered { form, discovery })
-                        .await;
-                }
-                Err(error) => {
-                    let _ = actions
-                        .send(Action::ModelDiscoveryFailed {
-                            form,
-                            message: format!("{error:#}"),
-                        })
-                        .await;
-                }
-            }
+            let _ = actions.send(action).await;
+            continue;
+        }
+        if let Effect::DiscoverMappingModels(request) = effect {
+            let action = match discover(&client, &request).await {
+                Ok(discovery) => Action::MappingModelsDiscovered(discovery),
+                Err(message) => Action::MappingModelDiscoveryFailed(message),
+            };
+            let _ = actions.send(action).await;
             continue;
         }
         if let Effect::CopyProvider(provider) = effect {
             match resolve_provider_copy(&client, provider).await {
                 Ok(clipboard) => {
                     let _ = actions.send(Action::ProviderCopied(clipboard)).await;
+                }
+                Err(error) => {
+                    let _ = actions.send(Action::Failed(error_notice(&error))).await;
+                }
+            }
+            continue;
+        }
+        if let Effect::QueryUsage(query) = effect {
+            match client
+                .call::<_, UsageStatsReport>(hsin_ipc::method::STATS_QUERY, &query)
+                .await
+            {
+                Ok(report) => {
+                    let _ = actions.send(Action::UsageLoaded(report)).await;
                 }
                 Err(error) => {
                     let _ = actions.send(Action::Failed(error_notice(&error))).await;
@@ -127,6 +128,39 @@ pub(super) async fn worker(
                 let _ = actions.send(Action::Failed(error_notice(&error))).await;
             }
         }
+    }
+}
+
+/// Run a model lookup, folding any failure into the message the caller reports.
+async fn discover(
+    client: &DaemonClient,
+    request: &ModelDiscoverParams,
+) -> std::result::Result<hsin_core::ModelDiscovery, String> {
+    client
+        .call("provider.discover_models", request)
+        .await
+        .map_err(|error| format!("{error:#}"))
+}
+
+/// The lookup a provider form asks for. An edit reuses the stored credential rather than sending
+/// the empty string the form carries, so a provider whose key is already saved still lists.
+fn discovery_request_for_form(form: &FormSubmission) -> ModelDiscoverParams {
+    ModelDiscoverParams {
+        client: form.client,
+        provider_id: form.id.clone(),
+        base_url: form.base_url.clone(),
+        auth_scheme: form.auth_scheme,
+        secret: if form.secret.is_empty() && form.id.is_some() {
+            SecretInput::Preserve
+        } else {
+            SecretInput::Replace(form.secret.to_string())
+        },
+        network_proxy: form.network_proxy.clone(),
+        proxy_password: proxy_password_input(
+            &form.proxy_password,
+            form.proxy_password_clear,
+            form.id.is_some(),
+        ),
     }
 }
 
@@ -227,7 +261,11 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
             update_upstream_proxy(client, config, password).await
         }
         Effect::DiscoverModels(_) => unreachable!("model discovery is handled by the worker"),
+        Effect::DiscoverMappingModels(_) => {
+            unreachable!("mapping model discovery is handled by the worker")
+        }
         Effect::CopyProvider(_) => unreachable!("provider copying is handled by the worker"),
+        Effect::QueryUsage(_) => unreachable!("usage queries are handled by the worker"),
     }
 }
 

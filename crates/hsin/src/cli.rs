@@ -37,6 +37,8 @@ pub enum Command {
     },
     /// Show daemon and client state.
     Status,
+    /// Show Codex or Claude Code token statistics.
+    Stats(StatsArgs),
     /// Run diagnostics.
     Doctor,
     /// Update hsin to the latest release.
@@ -67,6 +69,25 @@ pub enum Command {
         #[arg(long, hide = true)]
         proxy: bool,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct StatsArgs {
+    /// Client whose token usage will be shown.
+    #[arg(value_enum)]
+    pub client: ClientArg,
+    /// First local calendar date to include.
+    #[arg(long, value_name = "YYYY-MM-DD")]
+    pub from: Option<String>,
+    /// Last local calendar date to include.
+    #[arg(long, value_name = "YYYY-MM-DD")]
+    pub to: Option<String>,
+    /// Include only this Provider ID.
+    #[arg(long)]
+    pub provider: Option<String>,
+    /// Include only this exact model name.
+    #[arg(long)]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -475,6 +496,31 @@ mod tests {
     fn parses_top_level_update() {
         let cli = Cli::try_parse_from(["hsin", "update"]).expect("valid command");
         assert!(matches!(cli.command, Some(Command::Update)));
+    }
+
+    #[test]
+    fn parses_stats_filters() {
+        let cli = Cli::try_parse_from([
+            "hsin",
+            "stats",
+            "codex",
+            "--from",
+            "2026-09-01",
+            "--to",
+            "2026-09-14",
+            "--provider",
+            "provider-1",
+            "--model",
+            "gpt-5",
+        ])
+        .expect("valid command");
+        let Some(Command::Stats(args)) = cli.command else {
+            panic!("expected stats command");
+        };
+        assert_eq!(args.from.as_deref(), Some("2026-09-01"));
+        assert_eq!(args.to.as_deref(), Some("2026-09-14"));
+        assert_eq!(args.provider.as_deref(), Some("provider-1"));
+        assert_eq!(args.model.as_deref(), Some("gpt-5"));
     }
 
     #[test]

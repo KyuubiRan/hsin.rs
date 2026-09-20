@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, header},
     routing::any,
 };
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream};
 use secrecy::ExposeSecret;
 use subtle::ConstantTimeEq;
 use tokio::{net::TcpListener, sync::Semaphore};
@@ -252,10 +252,38 @@ async fn forward(
     for (name, value) in &response_headers {
         builder = builder.header(name, value);
     }
-    let stream = response.bytes_stream().map(move |item| {
-        let _permit = &permit;
-        item
+    let is_sse = response_headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"));
+    let observer = (!image_request).then(|| {
+        state.app.usage_collector().proxy_observer(
+            kind,
+            provider.id.clone(),
+            provider.name.clone(),
+            provider.revision,
+            provider.model.clone(),
+            is_sse,
+        )
     });
+    let upstream_stream = Box::pin(response.bytes_stream());
+    let stream = stream::unfold(
+        (upstream_stream, observer, Some(permit)),
+        |(mut upstream, mut observer, permit)| async move {
+            if let Some(item) = upstream.next().await {
+                if let (Some(observer), Ok(bytes)) = (observer.as_mut(), &item) {
+                    observer.feed(bytes);
+                }
+                Some((item, (upstream, observer, permit)))
+            } else {
+                if let Some(observer) = observer {
+                    observer.finish();
+                }
+                drop(permit);
+                None
+            }
+        },
+    );
     builder.body(Body::from_stream(stream)).unwrap_or_else(|_| {
         text_response(
             StatusCode::INTERNAL_SERVER_ERROR,

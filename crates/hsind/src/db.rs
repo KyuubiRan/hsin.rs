@@ -16,12 +16,12 @@ use crate::{
     },
 };
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 const PROVIDER_COLUMNS: &str = "p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,EXISTS(SELECT 1 FROM provider_secrets configured WHERE configured.provider_id=p.id),p.claude_model_mapping,p.codex_config_name,p.scope,p.codex_image_enabled,p.codex_image_models,p.codex_image_preferred_model,p.network_proxy,EXISTS(SELECT 1 FROM protected_values proxy_secret WHERE proxy_secret.key='provider_proxy_password:' || p.id)";
 
 pub struct Database {
-    connection: Mutex<Connection>,
+    pub(crate) connection: Mutex<Connection>,
 }
 
 pub type KeyRecord = (u32, Vec<u8>, Vec<u8>);
@@ -664,10 +664,17 @@ fn migrate(connection: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,kind TEXT NOT NULL,client TEXT NOT NULL,state TEXT NOT NULL,before_hash TEXT,target_json TEXT NOT NULL,error TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS encryption_keys(version INTEGER PRIMARY KEY,verifier_nonce BLOB NOT NULL,verifier BLOB NOT NULL,created_at INTEGER NOT NULL,is_current INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS protected_values(key TEXT PRIMARY KEY,key_version INTEGER NOT NULL,nonce BLOB NOT NULL,ciphertext BLOB NOT NULL,updated_at INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS usage_events(id INTEGER PRIMARY KEY AUTOINCREMENT,client TEXT NOT NULL CHECK(client IN ('codex','claude')),source TEXT NOT NULL CHECK(source IN ('proxy','session')),provider_id TEXT,provider_name TEXT NOT NULL,provider_revision INTEGER NOT NULL DEFAULT 0,model TEXT NOT NULL,event_at INTEGER NOT NULL,input_tokens INTEGER NOT NULL DEFAULT 0,cache_write_tokens INTEGER NOT NULL DEFAULT 0,cache_read_tokens INTEGER NOT NULL DEFAULT 0,output_tokens INTEGER NOT NULL DEFAULT 0,reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,attribution TEXT NOT NULL CHECK(attribution IN ('exact','inferred','unattributed')),dedup_key TEXT NOT NULL UNIQUE,correlation_key TEXT,created_at INTEGER NOT NULL);
+         CREATE INDEX IF NOT EXISTS usage_events_query_idx ON usage_events(client,event_at,provider_id,model);
+         CREATE INDEX IF NOT EXISTS usage_events_correlation_idx ON usage_events(client,correlation_key,event_at);
+         CREATE TABLE IF NOT EXISTS usage_sync_cursors(path_hash TEXT PRIMARY KEY,client TEXT NOT NULL CHECK(client IN ('codex','claude')),modified_at INTEGER NOT NULL,file_size INTEGER NOT NULL,byte_offset INTEGER NOT NULL,tail_fingerprint TEXT NOT NULL,updated_at INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS usage_routes(id INTEGER PRIMARY KEY AUTOINCREMENT,client TEXT NOT NULL CHECK(client IN ('codex','claude')),effective_at INTEGER NOT NULL,provider_id TEXT,provider_name TEXT NOT NULL,provider_revision INTEGER NOT NULL DEFAULT 0,mode TEXT NOT NULL CHECK(mode IN ('direct','proxy')),UNIQUE(client,effective_at));
+         CREATE INDEX IF NOT EXISTS usage_routes_lookup_idx ON usage_routes(client,effective_at DESC);
+         CREATE TABLE IF NOT EXISTS usage_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL);
          INSERT OR IGNORE INTO client_state(client,mode,config_status,updated_at) VALUES('codex','direct','unmanaged',0),('claude','direct','unmanaged',0);
          INSERT OR IGNORE INTO codex_image_state(id,active_provider_id,updated_at) VALUES(1,NULL,0);
          INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES('language','system',0),('proxy_host','127.0.0.1',0),('proxy_port','9999',0),('proxy_enabled','false',0),('upstream_proxy','{"mode":"direct","manual":{"protocol":"http","host":"127.0.0.1","port":7890,"username":"","password_configured":false}}',0);
-         PRAGMA user_version=8;
+         PRAGMA user_version=9;
          COMMIT;"#
         )?;
     } else {
@@ -746,6 +753,21 @@ fn migrate(connection: &Connection) -> Result<()> {
                  ALTER TABLE providers ADD COLUMN network_proxy TEXT NOT NULL DEFAULT '{\"mode\":\"inherit\",\"manual\":{\"protocol\":\"http\",\"host\":\"127.0.0.1\",\"port\":7890,\"username\":\"\",\"password_configured\":false}}';
                  INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES('upstream_proxy','{\"mode\":\"direct\",\"manual\":{\"protocol\":\"http\",\"host\":\"127.0.0.1\",\"port\":7890,\"username\":\"\",\"password_configured\":false}}',0);
                  PRAGMA user_version=8;
+                 COMMIT;",
+            )?;
+            version = 8;
+        }
+        if version == 8 {
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE usage_events(id INTEGER PRIMARY KEY AUTOINCREMENT,client TEXT NOT NULL CHECK(client IN ('codex','claude')),source TEXT NOT NULL CHECK(source IN ('proxy','session')),provider_id TEXT,provider_name TEXT NOT NULL,provider_revision INTEGER NOT NULL DEFAULT 0,model TEXT NOT NULL,event_at INTEGER NOT NULL,input_tokens INTEGER NOT NULL DEFAULT 0,cache_write_tokens INTEGER NOT NULL DEFAULT 0,cache_read_tokens INTEGER NOT NULL DEFAULT 0,output_tokens INTEGER NOT NULL DEFAULT 0,reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,attribution TEXT NOT NULL CHECK(attribution IN ('exact','inferred','unattributed')),dedup_key TEXT NOT NULL UNIQUE,correlation_key TEXT,created_at INTEGER NOT NULL);
+                 CREATE INDEX usage_events_query_idx ON usage_events(client,event_at,provider_id,model);
+                 CREATE INDEX usage_events_correlation_idx ON usage_events(client,correlation_key,event_at);
+                 CREATE TABLE usage_sync_cursors(path_hash TEXT PRIMARY KEY,client TEXT NOT NULL CHECK(client IN ('codex','claude')),modified_at INTEGER NOT NULL,file_size INTEGER NOT NULL,byte_offset INTEGER NOT NULL,tail_fingerprint TEXT NOT NULL,updated_at INTEGER NOT NULL);
+                 CREATE TABLE usage_routes(id INTEGER PRIMARY KEY AUTOINCREMENT,client TEXT NOT NULL CHECK(client IN ('codex','claude')),effective_at INTEGER NOT NULL,provider_id TEXT,provider_name TEXT NOT NULL,provider_revision INTEGER NOT NULL DEFAULT 0,mode TEXT NOT NULL CHECK(mode IN ('direct','proxy')),UNIQUE(client,effective_at));
+                 CREATE INDEX usage_routes_lookup_idx ON usage_routes(client,effective_at DESC);
+                 CREATE TABLE usage_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL);
+                 PRAGMA user_version=9;
                  COMMIT;",
             )?;
         }
@@ -952,6 +974,40 @@ fn unix_time() -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_eight_database_is_backed_up_and_gains_usage_tables() {
+        let root = std::env::temp_dir().join(format!("hsind-v8-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("db.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("PRAGMA user_version=8;").unwrap();
+        drop(connection);
+
+        let backups = root.join("backups");
+        let db = Database::open(&path, &backups).unwrap();
+        assert_eq!(database_version(&path).unwrap(), 9);
+        for table in [
+            "usage_events",
+            "usage_sync_cursors",
+            "usage_routes",
+            "usage_meta",
+        ] {
+            let exists: bool = db
+                .connection
+                .lock()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "missing {table}");
+        }
+        assert_eq!(fs::read_dir(backups).unwrap().count(), 1);
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     #[allow(clippy::too_many_lines)]
@@ -1282,7 +1338,7 @@ mod tests {
         assert_eq!(provider.scope, ProviderScope::Primary);
         assert!(provider.codex_image.is_inert());
         assert!(db.image_active_provider_id().unwrap().is_none());
-        assert_eq!(database_version(&path).unwrap(), 8);
+        assert_eq!(database_version(&path).unwrap(), 9);
         assert_eq!(fs::read_dir(backups).unwrap().count(), 1);
         drop(db);
         fs::remove_dir_all(root).unwrap();
@@ -1310,7 +1366,7 @@ mod tests {
 
         let backups = root.join("backups");
         let db = Database::open(&path, &backups).unwrap();
-        assert_eq!(database_version(&path).unwrap(), 8);
+        assert_eq!(database_version(&path).unwrap(), 9);
         assert_eq!(
             db.get_provider("p").unwrap().network_proxy,
             ProviderProxyConfig::default()
@@ -1365,7 +1421,7 @@ mod tests {
         assert_eq!(provider.model, None);
         assert!(!provider.official);
         assert!(!provider.credential_configured);
-        assert_eq!(database_version(&path).unwrap(), 8);
+        assert_eq!(database_version(&path).unwrap(), 9);
         assert_eq!(
             provider.codex_config_name.as_deref(),
             Some(hsin_core::DEFAULT_CODEX_CONFIG_NAME)
@@ -1407,7 +1463,7 @@ mod tests {
             db.setting("proxy_enabled").unwrap().as_deref(),
             Some("true")
         );
-        assert_eq!(database_version(&path).unwrap(), 8);
+        assert_eq!(database_version(&path).unwrap(), 9);
         assert_eq!(
             provider.codex_config_name.as_deref(),
             Some(hsin_core::DEFAULT_CODEX_CONFIG_NAME)
@@ -1439,7 +1495,7 @@ mod tests {
             ciphertext: vec![1],
         })
         .unwrap();
-        assert_eq!(database_version(&path).unwrap(), 8);
+        assert_eq!(database_version(&path).unwrap(), 9);
         assert!(db.protected_value("backup").unwrap().is_some());
         drop(db);
         fs::remove_dir_all(root).unwrap();
@@ -1467,7 +1523,7 @@ mod tests {
         drop(connection);
 
         let db = Database::open(&path, &root.join("backups")).unwrap();
-        assert_eq!(database_version(&path).unwrap(), 8);
+        assert_eq!(database_version(&path).unwrap(), 9);
         // Rows written before the column existed read back as "no mapping", not as an error.
         let provider = db.get_provider("p").unwrap();
         assert_eq!(provider.claude_model_mapping, None);
@@ -1516,7 +1572,7 @@ mod tests {
         drop(connection);
 
         let db = Database::open(&path, &root.join("backups")).unwrap();
-        assert_eq!(database_version(&path).unwrap(), 8);
+        assert_eq!(database_version(&path).unwrap(), 9);
         assert_eq!(
             db.get_provider("custom")
                 .unwrap()

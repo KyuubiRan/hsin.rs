@@ -18,7 +18,8 @@ use hsin_core::{
     KeyStoreState, ModelDiscoverParams, ModelDiscovery, ModelUpdate, Provider, ProviderAddParams,
     ProviderEditParams, ProviderListParams, ProviderProxyConfig, ProviderProxyMode,
     ProviderRemoveParams, ProviderScope, ProviderSwitchParams, SecretInput, SecurityStatus,
-    Settings, SettingsPatch, UpstreamProxyConfig, UpstreamProxyMode,
+    Settings, SettingsPatch, UpstreamProxyConfig, UpstreamProxyMode, UsageStatsQuery,
+    UsageStatsReport, UsageSyncResult,
 };
 use parking_lot::RwLock;
 use secrecy::{ExposeSecret, SecretString};
@@ -35,6 +36,7 @@ use crate::{
     model::ProviderInput,
     network_proxy::{ClientOptions, OutboundProxySnapshot, build_client},
     paths::Paths,
+    usage::UsageCollector,
 };
 
 const CODEX_AUTH_BACKUP_KEY: &str = "codex_auth_backup_v1";
@@ -83,6 +85,7 @@ pub struct App {
     shutdown_requested: AtomicBool,
     shutdown: tokio::sync::Notify,
     config_paths: RwLock<HashMap<ClientKind, PathBuf>>,
+    usage: Arc<UsageCollector>,
 }
 
 pub(crate) struct UpstreamRequestSnapshot {
@@ -168,6 +171,15 @@ impl App {
             address: SocketAddr::new(proxy_host, proxy_port),
             revision: 0,
         });
+        let usage = UsageCollector::new(
+            db.clone(),
+            config_paths
+                .get(&ClientKind::Codex)
+                .expect("Codex config path is initialized"),
+            config_paths
+                .get(&ClientKind::Claude)
+                .expect("Claude config path is initialized"),
+        );
         Ok(Arc::new(Self {
             db,
             crypto,
@@ -180,7 +192,39 @@ impl App {
             shutdown_requested: AtomicBool::new(false),
             shutdown: tokio::sync::Notify::new(),
             config_paths: RwLock::new(config_paths),
+            usage,
         }))
+    }
+
+    pub fn initialize_usage(&self) -> Result<()> {
+        self.usage.initialize()
+    }
+
+    pub(crate) fn usage_collector(&self) -> Arc<UsageCollector> {
+        self.usage.clone()
+    }
+
+    pub async fn sync_usage(&self) -> Result<UsageSyncResult> {
+        let collector = self.usage.clone();
+        tokio::task::spawn_blocking(move || collector.sync())
+            .await
+            .map_err(|error| DaemonError::Internal(error.to_string()))?
+    }
+
+    pub async fn query_usage(&self, query: UsageStatsQuery) -> Result<UsageStatsReport> {
+        let collector = self.usage.clone();
+        tokio::task::spawn_blocking(move || {
+            collector.sync()?;
+            collector.query(query)
+        })
+        .await
+        .map_err(|error| DaemonError::Internal(error.to_string()))?
+    }
+
+    fn record_usage_route(&self, client: ClientKind) {
+        if let Err(error) = self.usage.record_current_route(client) {
+            tracing::warn!(code=error.code(), client=%client, "failed to record usage route");
+        }
     }
 
     pub fn proxy_port(&self) -> Result<u16> {
@@ -757,6 +801,15 @@ impl App {
         if image_available_before != self.db.image_active_provider_id()?.is_some() {
             self.reconcile_codex_image_capability()?;
         }
+        if self
+            .db
+            .client_state(provider.client)?
+            .active_provider_id
+            .as_deref()
+            == Some(provider.id.as_str())
+        {
+            self.record_usage_route(provider.client);
+        }
         Ok(provider)
     }
 
@@ -825,11 +878,9 @@ impl App {
             network_proxy,
             proxy_password,
         } = params;
-        if client != ClientKind::Codex {
-            return Err(DaemonError::Invalid(
-                "model discovery is currently supported only for Codex providers".into(),
-            ));
-        }
+        // Claude Code has no discovery endpoint of its own, but the upstream providers its model
+        // tiers are mapped onto do, and the mapping dialog lists them the same way the Codex form
+        // lists its models. The request is the same either way; only the caller differs.
         let input = ProviderInput {
             client,
             name: "model-discovery".into(),
@@ -1012,6 +1063,7 @@ impl App {
         self.db
             .set_active(params.client, &provider.id, "synchronized")?;
         self.db.set_mode(params.client, ConnectionMode::Direct)?;
+        self.record_usage_route(params.client);
         Ok(ImportCurrentResult { provider, imported })
     }
 
@@ -1020,6 +1072,7 @@ impl App {
             self.db
                 .set_active(provider.client, &provider.id, "synchronized")?;
             self.db.set_mode(provider.client, ConnectionMode::Direct)?;
+            self.record_usage_route(provider.client);
             return Ok(());
         }
         let target = self.config_target(provider, ConnectionMode::Direct, None)?;
@@ -1048,7 +1101,9 @@ impl App {
             )?;
             return Err(error);
         }
-        self.db.finish_operation(&operation, "complete", None)
+        self.db.finish_operation(&operation, "complete", None)?;
+        self.record_usage_route(provider.client);
+        Ok(())
     }
 
     pub async fn switch_provider(&self, params: ProviderSwitchParams) -> Result<Provider> {
@@ -1074,6 +1129,7 @@ impl App {
             }
             self.db
                 .set_active(params.client, &provider.id, "synchronized")?;
+            self.record_usage_route(params.client);
             return Ok(provider);
         }
         self.apply_configuration(&provider, ConnectionMode::Direct)?;
@@ -1229,6 +1285,7 @@ impl App {
         )?;
         self.release_claude_model_env_snapshot(&target)?;
         self.db.finish_operation(&operation, "complete", None)?;
+        self.record_usage_route(provider.client);
         Ok(())
     }
 
@@ -4187,6 +4244,58 @@ mod tests {
             .unwrap();
         assert_eq!(discovery.resolved_base_url, format!("http://{address}/v1"));
         assert_eq!(discovery.models, ["gpt-5", "gpt-4.1"]);
+
+        server.abort();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn model_discovery_serves_claude_providers_from_the_same_endpoint() {
+        // Claude Code has no discovery endpoint of its own, so the mapping dialog lists the
+        // upstream provider's models. It reaches the same route as the Codex form, which is why
+        // the client is no longer rejected here.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = Router::new().route(
+            "/models",
+            get(|headers: axum::http::HeaderMap| async move {
+                let key = headers
+                    .get("x-api-key")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("missing");
+                Json(json!({"data": [{"id": format!("model-for-{key}")}]}))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let root =
+            std::env::temp_dir().join(format!("hsind-claude-models-{}", uuid::Uuid::new_v4()));
+        let paths = Paths {
+            database: root.join("hsin.sqlite3"),
+            lock: root.join("hsind.lock"),
+            logs: root.join("logs"),
+            backups: root.join("backups"),
+            home: root.clone(),
+        };
+        let app = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
+        let discovery = app
+            .discover_models(ModelDiscoverParams {
+                client: ClientKind::Claude,
+                provider_id: None,
+                base_url: format!("http://{address}"),
+                auth_scheme: AuthScheme::XApiKey,
+                secret: SecretInput::Replace("claude-key".into()),
+                network_proxy: ProviderProxyConfig::default(),
+                proxy_password: SecretInput::Preserve,
+            })
+            .await
+            .unwrap();
+        assert_eq!(discovery.models, ["model-for-claude-key"]);
+        // A Claude provider keeps the URL it was configured with; there is no Codex-style /v1
+        // rewrite to adopt.
+        assert_eq!(discovery.resolved_base_url, format!("http://{address}"));
 
         server.abort();
         let _ = fs::remove_dir_all(root);

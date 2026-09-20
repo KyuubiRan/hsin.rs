@@ -4,15 +4,17 @@ use std::{
     time::{Duration, Instant},
 };
 
+use chrono::{Local, NaiveDate, TimeZone};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hsin_core::{
     AuthScheme, ClaudeModelMapping, ClaudeModelMappingUpdate, ClientAuthSettings, ClientKind,
     ClientSettings, CodexConfigNameUpdate, CodexImageConfig, ConnectionMode,
     DEFAULT_CODEX_CONFIG_NAME, HSIN_CODEX_CONFIG_NAME, LANGUAGE_EN_US, LANGUAGE_SYSTEM,
-    LANGUAGE_ZH_CN, ModelDiscovery, ModelSlot, ModelUpdate, OPENAI_CODEX_CONFIG_NAME, Provider,
-    ProviderProxyConfig, ProviderProxyMode, ProviderScope, ProxyProtocol, SecretInput, Settings,
-    UpstreamProxyConfig, UpstreamProxyMode, convert_provider_base_url,
-    normalize_generated_provider_name, provider_name_from_url,
+    LANGUAGE_ZH_CN, ModelDiscoverParams, ModelDiscovery, ModelSlot, ModelUpdate,
+    OPENAI_CODEX_CONFIG_NAME, Provider, ProviderProxyConfig, ProviderProxyMode, ProviderScope,
+    ProxyProtocol, SecretInput, Settings, UpstreamProxyConfig, UpstreamProxyMode, UsageStatsQuery,
+    UsageStatsReport, convert_provider_base_url, normalize_generated_provider_name,
+    provider_name_from_url,
 };
 use zeroize::Zeroizing;
 
@@ -37,7 +39,12 @@ pub(super) enum Action {
         form: FormSubmission,
         message: String,
     },
+    /// The model list a mapping row asked for. Only the result travels back: the dialog stays up,
+    /// keys and all, while the daemon answers, so the reply lands in the picker that asked.
+    MappingModelsDiscovered(ModelDiscovery),
+    MappingModelDiscoveryFailed(String),
     ProviderCopied(ProviderClipboard),
+    UsageLoaded(UsageStatsReport),
     /// Drives the timers the UI owns; today only the delete confirmation, which lapses on its own.
     Tick,
 }
@@ -126,12 +133,45 @@ pub(super) enum InputMode {
         selected: usize,
     },
     ModelMapping(ModelMappingForm),
+    MappingModels(Box<MappingModelPicker>),
     DeleteConfirm {
         id: String,
         revision: u64,
         expires_at: Instant,
     },
     Settings(SettingsScreen),
+    Stats(StatsScreen),
+}
+
+pub(super) struct StatsScreen {
+    pub(super) page: StatsPage,
+    pub(super) report: Option<UsageStatsReport>,
+    pub(super) from: String,
+    pub(super) to: String,
+    pub(super) provider_id: Option<String>,
+    pub(super) model: Option<String>,
+    pub(super) filter: Option<StatsFilter>,
+    pub(super) scroll: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StatsPage {
+    Overview,
+    Models,
+}
+
+pub(super) enum StatsFilter {
+    Time {
+        selected: usize,
+        custom_field: usize,
+        cursor: usize,
+    },
+    Provider {
+        selected: usize,
+    },
+    Model {
+        selected: usize,
+    },
 }
 
 pub(super) struct SettingsScreen {
@@ -259,7 +299,7 @@ pub(super) struct MappingTier {
 pub(super) const MAPPING_TIERS: [MappingTier; 4] = [
     MappingTier {
         label: "Fable",
-        default_model: "claude-fable-5",
+        default_model: "claude-fable-5-1",
     },
     MappingTier {
         label: "Opus",
@@ -281,6 +321,59 @@ pub(super) struct MappingRow {
     pub(super) context_1m: bool,
 }
 
+/// Which text row the model-list dialog was opened from, so the chosen ID goes back where the
+/// operator was typing rather than always into the same row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MappingField {
+    Default,
+    Tier(usize),
+}
+
+impl MappingField {
+    /// The label the row carries in the mapping dialog, reused as the picker's title.
+    pub(super) fn label<'a>(&self, i18n: &'a crate::i18n::I18n) -> &'a str {
+        match self {
+            Self::Default => i18n.text("model_mapping_default"),
+            Self::Tier(index) => MAPPING_TIERS.get(*index).map_or("", |tier| tier.label),
+        }
+    }
+}
+
+/// A model-list dialog opened on top of the mapping dialog. It owns the mapping as its base layer:
+/// cancelling folds it back out and the operator is in the row they came from.
+pub(super) struct MappingModelPicker {
+    pub(super) mapping: ModelMappingForm,
+    pub(super) field: MappingField,
+    /// True while the daemon is answering the lookup, so keys are ignored and the dialog cannot be
+    /// dismissed out from under a reply that is on its way.
+    pub(super) discovering: bool,
+    pub(super) models: Vec<String>,
+    pub(super) selected: usize,
+    pub(super) query: String,
+    pub(super) mode: ModelPickerMode,
+    pub(super) warning: Option<String>,
+    /// Caret position, in characters, inside whichever of the search or manual boxes is open.
+    pub(super) cursor: usize,
+}
+
+impl Default for MappingModelPicker {
+    /// An empty dialog. `field` and `mapping` are always filled in by the caller that opens it,
+    /// which is the only place that knows which row was focused.
+    fn default() -> Self {
+        Self {
+            mapping: ModelMappingForm::placeholder(),
+            field: MappingField::Default,
+            discovering: false,
+            models: Vec::new(),
+            selected: 0,
+            query: String::new(),
+            mode: ModelPickerMode::Browse,
+            warning: None,
+            cursor: 0,
+        }
+    }
+}
+
 /// Second step of the Claude provider form: map Claude Code's model tiers onto upstream IDs.
 pub(super) struct ModelMappingForm {
     pub(super) form: FormSubmission,
@@ -296,6 +389,38 @@ pub(super) struct ModelMappingForm {
 }
 
 impl ModelMappingForm {
+    /// An empty mapping, so the live one can be moved into the model picker without cloning a
+    /// `FormSubmission` — which carries the provider secret.
+    fn placeholder() -> Self {
+        Self {
+            form: FormSubmission {
+                id: None,
+                revision: None,
+                client: ClientKind::Claude,
+                name: String::new(),
+                description: String::new(),
+                base_url: String::new(),
+                auth_scheme: AuthScheme::XApiKey,
+                secret: Zeroizing::new(String::new()),
+                model: ModelUpdate::Preserve,
+                codex_config_name: CodexConfigNameUpdate::Preserve,
+                claude_model_mapping: ClaudeModelMappingUpdate::Preserve,
+                scope: ProviderScope::Primary,
+                codex_image: CodexImageConfig::default(),
+                network_proxy: ProviderProxyConfig::default(),
+                proxy_password: Zeroizing::new(String::new()),
+                proxy_password_clear: false,
+                skip_primary_model: false,
+            },
+            enabled: false,
+            default_model: String::new(),
+            default_context_1m: false,
+            rows: [(); 4].map(|()| MappingRow::default()),
+            field: 0,
+            cursor: 0,
+        }
+    }
+
     fn from_existing(form: FormSubmission, existing: Option<&ClaudeModelMapping>) -> Self {
         let slot = |slot: Option<&ModelSlot>| {
             slot.map_or_else(MappingRow::default, |slot| MappingRow {
@@ -360,13 +485,18 @@ impl ModelMappingForm {
         (!mapping.is_inert()).then_some(mapping)
     }
 
-    /// The text row with focus: the default model, then one per tier.
-    fn focused_text(&mut self) -> Option<&mut String> {
-        match self.field {
+    /// The text row at `field`; the master toggle carries none.
+    pub(super) fn row_text_mut(&mut self, field: usize) -> Option<&mut String> {
+        match field {
             0 => None,
             1 => Some(&mut self.default_model),
             field => Some(&mut self.rows[field - 2].model),
         }
+    }
+
+    /// The text row with focus: the default model, then one per tier.
+    fn focused_text(&mut self) -> Option<&mut String> {
+        self.row_text_mut(self.field)
     }
 }
 
@@ -459,14 +589,45 @@ impl State {
                 self.loading = false;
                 self.notice = None;
             }
+            Action::MappingModelsDiscovered(discovery) => {
+                self.apply_mapping_models(discovery.models, None);
+            }
+            Action::MappingModelDiscoveryFailed(message) => {
+                self.apply_mapping_models(Vec::new(), Some(message));
+            }
             Action::ProviderCopied(clipboard) => {
                 self.clipboard = Some(clipboard);
                 self.notice = Some("@provider_copied".into());
                 self.loading = false;
             }
+            Action::UsageLoaded(report) => {
+                if let InputMode::Stats(screen) = &mut self.input {
+                    screen.report = Some(report);
+                }
+                self.loading = false;
+            }
             Action::Key(key) => return self.reduce_key(key),
         }
         Transition::Continue
+    }
+
+    /// Fold a finished lookup into the dialog that asked for it.
+    ///
+    /// The dialog has been up the whole time — it ignores keys while `discovering` — so this fills
+    /// in the list it was waiting for and nothing else. A provider with no `/models` endpoint lands
+    /// here too: the list stays empty, the footer reports why, and `m` still takes a typed ID, so a
+    /// failed lookup is a dead end for the list rather than for the dialog.
+    fn apply_mapping_models(&mut self, models: Vec<String>, warning: Option<String>) {
+        if let InputMode::MappingModels(picker) = &mut self.input {
+            picker.models = models;
+            picker.warning = warning;
+            picker.selected = 0;
+            picker.mode = ModelPickerMode::Browse;
+            picker.cursor = 0;
+            picker.discovering = false;
+        }
+        self.loading = false;
+        self.notice = None;
     }
 
     fn apply_loaded(
@@ -545,6 +706,12 @@ impl State {
     fn reduce_key(&mut self, key: KeyEvent) -> Transition {
         if matches!(&self.input, InputMode::Form(form) if form.discovering_models) {
             return Transition::Continue;
+        }
+        if matches!(self.input, InputMode::Stats(_)) {
+            return self.reduce_stats_key(key);
+        }
+        if matches!(self.input, InputMode::MappingModels(_)) {
+            return self.reduce_mapping_models_key(key);
         }
         let current_mode = self.mode();
         let proxy_enabled = self.proxy_enabled;
@@ -740,16 +907,31 @@ impl State {
                         mapping.cursor = 0;
                     }
                 }
-                // Tab completes the ghost default instead of moving focus; the model rows are the
-                // only place in the TUI where a suggested value is worth one keystroke.
+                // Tab opens the provider's own model list on any model row, the same gesture the
+                // Codex form uses. It replaces the older tab-completes-the-ghost-default, which
+                // could only ever offer the first-party default; that fill now sits on →, where it
+                // costs nothing to reach and no longer occupies the key that opens the list.
                 KeyCode::Tab => {
-                    if let Some(row) = mapping.field.checked_sub(2)
-                        && mapping.rows[row].model.trim().is_empty()
-                    {
+                    if let Some(field) = mapping_field(mapping.field) {
+                        let picker = MappingModelPicker {
+                            field,
+                            mapping: std::mem::replace(mapping, ModelMappingForm::placeholder()),
+                            ..MappingModelPicker::default()
+                        };
+                        self.input = InputMode::MappingModels(Box::new(picker));
+                        return self.discover_mapping_models();
+                    }
+                }
+                // On a model row → takes the tier's default ID; ←/→ on the master toggle flip it,
+                // and on a row that already carries a model they move the caret as usual.
+                KeyCode::Right if mapping.field != 0 => {
+                    if let Some(row) = quick_fill_row(mapping) {
                         MAPPING_TIERS[row]
                             .default_model
                             .clone_into(&mut mapping.rows[row].model);
                         mapping.cursor = caret_end(&mapping.rows[row].model);
+                    } else {
+                        edit_mapping_row(mapping, key);
                     }
                 }
                 // On the master switch ←/→ flip it; on a text row they move the caret through the
@@ -780,16 +962,7 @@ impl State {
                     self.input = InputMode::Normal;
                 }
                 _ => {
-                    let cursor = &mut mapping.cursor;
-                    match mapping.field {
-                        0 => {}
-                        1 => {
-                            edit_text(&mut mapping.default_model, cursor, key);
-                        }
-                        field => {
-                            edit_text(&mut mapping.rows[field - 2].model, cursor, key);
-                        }
-                    }
+                    edit_mapping_row(mapping, key);
                 }
             },
             InputMode::Models(picker) => match &mut picker.mode {
@@ -1490,6 +1663,16 @@ impl State {
                 }
                 KeyCode::Up | KeyCode::Char('i') => self.selected = self.selected.saturating_sub(1),
                 KeyCode::Char('r') => self.queue(Effect::Refresh),
+                KeyCode::Char('s') => {
+                    if self.image_section {
+                        self.notice = Some("@stats_image_unsupported".into());
+                    } else {
+                        let screen = default_stats_screen();
+                        let query = stats_query(self.client, &screen);
+                        self.input = InputMode::Stats(screen);
+                        self.queue_without_mode_change(Effect::QueryUsage(query));
+                    }
+                }
                 KeyCode::Char('p') => {
                     if self.image_section {
                         self.notice = Some("@codex_image_proxy_managed".into());
@@ -1653,6 +1836,10 @@ impl State {
                 }
                 _ => {}
             },
+            InputMode::Stats(_) => unreachable!("stats input is handled before home input"),
+            InputMode::MappingModels(_) => {
+                unreachable!("mapping model input is handled before home input")
+            }
         }
         Transition::Continue
     }
@@ -1661,6 +1848,326 @@ impl State {
         self.pending_effect = Some(effect);
         self.loading = true;
         self.notice = None;
+    }
+
+    fn queue_without_mode_change(&mut self, effect: Effect) {
+        self.pending_effect = Some(effect);
+        self.loading = true;
+        self.notice = None;
+    }
+
+    /// Ask the daemon for the provider's model list and open the dialog that will show it.
+    ///
+    /// A lookup needs the same endpoint, credential, and outbound proxy the provider was entered
+    /// with — the provider does not exist yet when the form is adding one — which is why the
+    /// request is assembled from the form rather than from the stored provider.
+    fn discover_mapping_models(&mut self) -> Transition {
+        let InputMode::MappingModels(mut picker) = std::mem::take(&mut self.input) else {
+            unreachable!("mapping model discovery requires the mapping picker");
+        };
+        match mapping_discovery_request(&picker.mapping.form) {
+            Ok(request) => {
+                // The dialog stays up and ignores keys while the daemon answers, so the reply has
+                // somewhere to land and nothing else can be opened in the meantime.
+                picker.discovering = true;
+                self.input = InputMode::MappingModels(picker);
+                self.queue(Effect::DiscoverMappingModels(request));
+            }
+            Err(message) => {
+                self.input = InputMode::MappingModels(picker);
+                self.notice = Some(message.into());
+            }
+        }
+        Transition::Continue
+    }
+
+    /// The model-list dialog opened from a mapping row. It owns the mapping while it is up, so
+    /// every path here either folds back into the mapping dialog or drops the picker entirely.
+    #[allow(clippy::too_many_lines)]
+    fn reduce_mapping_models_key(&mut self, key: KeyEvent) -> Transition {
+        let InputMode::MappingModels(mut picker) = std::mem::take(&mut self.input) else {
+            unreachable!("mapping picker reducer requires the mapping picker");
+        };
+        if picker.discovering {
+            self.input = InputMode::MappingModels(picker);
+            return Transition::Continue;
+        }
+        picker.warning = None;
+        // Set when the dialog closes; the mapping is moved back out to the mapping dialog at the
+        // end, so that every closing path cannot leave it behind.
+        let mut close = false;
+        match &mut picker.mode {
+            ModelPickerMode::Browse => match key.code {
+                // Esc unwinds one layer at a time: out of a committed search first, then the
+                // dialog, so a filtered list is never abandoned without the operator seeing all
+                // of it again.
+                KeyCode::Esc if !picker.query.is_empty() => {
+                    picker.query.clear();
+                    picker.selected = 0;
+                }
+                KeyCode::Esc => close = true,
+                KeyCode::Char('s') => {
+                    picker.mode = ModelPickerMode::Search;
+                    picker.cursor = caret_end(&picker.query);
+                }
+                KeyCode::Char('m') => {
+                    picker.mode = ModelPickerMode::Manual(String::new());
+                    picker.cursor = 0;
+                }
+                KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+                KeyCode::Down => {
+                    let count = visible_mapping_models(&picker).len();
+                    picker.selected = (picker.selected + 1).min(count);
+                }
+                KeyCode::Enter => {
+                    let chosen = selected_mapping_model(&picker).map(str::to_owned);
+                    if let Some(model) = chosen {
+                        mapping_insert(&mut picker.mapping, picker.field, &model);
+                        close = true;
+                    }
+                }
+                // A row carrying its own model has nothing to offer, so → keeps its usual job of
+                // leaving the dialog; only an empty row is asking for a suggestion.
+                KeyCode::Right => {
+                    if !picker.query.is_empty() || !picker.models.is_empty() {
+                        picker.mode = ModelPickerMode::Search;
+                        picker.cursor = caret_end(&picker.query);
+                    } else {
+                        close = true;
+                    }
+                }
+                _ => {}
+            },
+            ModelPickerMode::Search => match key.code {
+                KeyCode::Esc | KeyCode::Enter => picker.mode = ModelPickerMode::Browse,
+                _ => {
+                    if edit_text(&mut picker.query, &mut picker.cursor, key) {
+                        picker.selected = 0;
+                    }
+                }
+            },
+            ModelPickerMode::Manual(value) => match key.code {
+                KeyCode::Esc => picker.mode = ModelPickerMode::Browse,
+                KeyCode::Enter if !value.trim().is_empty() => {
+                    let model = value.trim().to_owned();
+                    mapping_insert(&mut picker.mapping, picker.field, &model);
+                    close = true;
+                }
+                _ => {
+                    edit_text(value, &mut picker.cursor, key);
+                }
+            },
+        }
+        self.input = if close {
+            InputMode::ModelMapping(picker.mapping)
+        } else {
+            InputMode::MappingModels(picker)
+        };
+        Transition::Continue
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn reduce_stats_key(&mut self, key: KeyEvent) -> Transition {
+        let InputMode::Stats(mut screen) = std::mem::take(&mut self.input) else {
+            unreachable!("stats reducer requires stats mode");
+        };
+        let mut keep = true;
+        if let Some(filter) = &mut screen.filter {
+            match filter {
+                StatsFilter::Time {
+                    selected,
+                    custom_field,
+                    cursor,
+                } => match key.code {
+                    KeyCode::Esc => screen.filter = None,
+                    KeyCode::Left | KeyCode::Char('j') if *selected < 4 => {
+                        *selected = selected.saturating_sub(1);
+                    }
+                    KeyCode::Right | KeyCode::Char('l') if *selected < 4 => {
+                        *selected = (*selected + 1).min(4);
+                    }
+                    KeyCode::Up => *selected = selected.saturating_sub(1),
+                    KeyCode::Down => *selected = (*selected + 1).min(4),
+                    KeyCode::Tab if *selected == 4 => {
+                        *custom_field = (*custom_field + 1) % 2;
+                        *cursor = if *custom_field == 0 {
+                            screen.from.chars().count()
+                        } else {
+                            screen.to.chars().count()
+                        };
+                    }
+                    KeyCode::Enter => {
+                        if apply_time_preset(&mut screen) {
+                            screen.filter = None;
+                            self.queue_without_mode_change(Effect::QueryUsage(stats_query(
+                                self.client,
+                                &screen,
+                            )));
+                        } else {
+                            self.notice = Some("@stats_invalid_date".into());
+                        }
+                    }
+                    _ if *selected == 4 => {
+                        let field = if *custom_field == 0 {
+                            &mut screen.from
+                        } else {
+                            &mut screen.to
+                        };
+                        edit_text(field, cursor, key);
+                    }
+                    _ => {}
+                },
+                StatsFilter::Provider { selected } => {
+                    let count = screen
+                        .report
+                        .as_ref()
+                        .map_or(1, |report| report.filters.providers.len() + 1);
+                    match key.code {
+                        KeyCode::Esc => screen.filter = None,
+                        KeyCode::Up | KeyCode::Char('i') => {
+                            *selected = selected.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('k') => {
+                            *selected = (*selected + 1).min(count.saturating_sub(1));
+                        }
+                        KeyCode::Enter => {
+                            screen.provider_id = selected.checked_sub(1).and_then(|index| {
+                                screen
+                                    .report
+                                    .as_ref()?
+                                    .filters
+                                    .providers
+                                    .get(index)
+                                    .map(|provider| provider.id.clone())
+                            });
+                            screen.filter = None;
+                            self.queue_without_mode_change(Effect::QueryUsage(stats_query(
+                                self.client,
+                                &screen,
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+                StatsFilter::Model { selected } => {
+                    let count = screen
+                        .report
+                        .as_ref()
+                        .map_or(1, |report| report.filters.models.len() + 1);
+                    match key.code {
+                        KeyCode::Esc => screen.filter = None,
+                        KeyCode::Up | KeyCode::Char('i') => {
+                            *selected = selected.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('k') => {
+                            *selected = (*selected + 1).min(count.saturating_sub(1));
+                        }
+                        KeyCode::Enter => {
+                            screen.model = selected.checked_sub(1).and_then(|index| {
+                                screen.report.as_ref()?.filters.models.get(index).cloned()
+                            });
+                            screen.filter = None;
+                            self.queue_without_mode_change(Effect::QueryUsage(stats_query(
+                                self.client,
+                                &screen,
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('s') => keep = false,
+                KeyCode::Char('1') => screen.page = StatsPage::Overview,
+                KeyCode::Char('2') => screen.page = StatsPage::Models,
+                KeyCode::Char('t') => {
+                    screen.filter = Some(StatsFilter::Time {
+                        selected: 2,
+                        custom_field: 0,
+                        cursor: screen.from.chars().count(),
+                    });
+                }
+                KeyCode::Char('p') => {
+                    let selected = screen
+                        .provider_id
+                        .as_ref()
+                        .and_then(|id| {
+                            screen
+                                .report
+                                .as_ref()?
+                                .filters
+                                .providers
+                                .iter()
+                                .position(|provider| &provider.id == id)
+                                .map(|index| index + 1)
+                        })
+                        .unwrap_or(0);
+                    screen.filter = Some(StatsFilter::Provider { selected });
+                }
+                KeyCode::Char('m') => {
+                    let selected = screen
+                        .model
+                        .as_ref()
+                        .and_then(|model| {
+                            screen
+                                .report
+                                .as_ref()?
+                                .filters
+                                .models
+                                .iter()
+                                .position(|value| value == model)
+                                .map(|index| index + 1)
+                        })
+                        .unwrap_or(0);
+                    screen.filter = Some(StatsFilter::Model { selected });
+                }
+                KeyCode::Char('r') => self.queue_without_mode_change(Effect::QueryUsage(
+                    stats_query(self.client, &screen),
+                )),
+                KeyCode::Down | KeyCode::Char('k') => {
+                    screen.scroll = screen.scroll.saturating_add(1);
+                }
+                KeyCode::Up | KeyCode::Char('i') => {
+                    screen.scroll = screen.scroll.saturating_sub(1);
+                }
+                KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => {
+                    let clients = self.visible_clients();
+                    if let Some(index) = clients.iter().position(|client| *client == self.client)
+                        && let Some(client) = clients.get((index + 1) % clients.len())
+                    {
+                        self.client = *client;
+                        screen.provider_id = None;
+                        screen.model = None;
+                        screen.report = None;
+                        self.queue_without_mode_change(Effect::QueryUsage(stats_query(
+                            self.client,
+                            &screen,
+                        )));
+                    }
+                }
+                KeyCode::BackTab | KeyCode::Left | KeyCode::Char('j') => {
+                    let clients = self.visible_clients();
+                    if let Some(index) = clients.iter().position(|client| *client == self.client)
+                        && !clients.is_empty()
+                    {
+                        self.client = clients[(index + clients.len() - 1) % clients.len()];
+                        screen.provider_id = None;
+                        screen.model = None;
+                        screen.report = None;
+                        self.queue_without_mode_change(Effect::QueryUsage(stats_query(
+                            self.client,
+                            &screen,
+                        )));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if keep {
+            self.input = InputMode::Stats(screen);
+        }
+        Transition::Continue
     }
 
     pub(super) fn take_effect(&mut self) -> Option<Effect> {
@@ -2153,6 +2660,99 @@ fn mapping_row_caret_end(mapping: &ModelMappingForm) -> usize {
     }
 }
 
+/// The model row `field` refers to, or `None` on the master toggle.
+fn mapping_field(field: usize) -> Option<MappingField> {
+    match field {
+        0 => None,
+        1 => Some(MappingField::Default),
+        field => Some(MappingField::Tier(field - 2)),
+    }
+}
+
+/// The tier row → should quick-fill: a model row, with focus, and nothing typed in it yet.
+///
+/// An empty row is the one case where the operator has not stated an intent, so the first-party
+/// default is a safe guess. Once a row carries text, → goes back to being the caret key on it.
+fn quick_fill_row(mapping: &ModelMappingForm) -> Option<usize> {
+    if !mapping.enabled {
+        return None;
+    }
+    let row = mapping.field.checked_sub(2)?;
+    mapping.rows[row].model.trim().is_empty().then_some(row)
+}
+
+/// The text row at `field`, or `None` on the master toggle, which carries none.
+fn mapping_row_text(mapping: &mut ModelMappingForm, field: usize) -> Option<&mut String> {
+    match field {
+        0 => None,
+        1 => Some(&mut mapping.default_model),
+        field => Some(&mut mapping.rows[field - 2].model),
+    }
+}
+
+/// Route a key into the mapping row with focus; the master toggle carries no text.
+fn edit_mapping_row(mapping: &mut ModelMappingForm, key: KeyEvent) {
+    let field = mapping.field;
+    match field {
+        0 => {}
+        1 => {
+            edit_text(&mut mapping.default_model, &mut mapping.cursor, key);
+        }
+        field => {
+            edit_text(&mut mapping.rows[field - 2].model, &mut mapping.cursor, key);
+        }
+    }
+}
+
+/// Write `model` into the mapping row the picker was opened from, replacing what was there.
+///
+/// Choosing from the list is a statement of intent, so it overwrites rather than appending the
+/// way typing at the caret does.
+fn mapping_insert(mapping: &mut ModelMappingForm, field: MappingField, model: &str) {
+    let row = match field {
+        MappingField::Default => 1,
+        MappingField::Tier(index) => index + 2,
+    };
+    if let Some(text) = mapping_row_text(mapping, row) {
+        model.clone_into(text);
+    }
+    mapping.field = row;
+    mapping.cursor = caret_end(model);
+}
+
+fn mapping_discovery_request(form: &FormSubmission) -> Result<ModelDiscoverParams, &'static str> {
+    let base_url = form.base_url.trim();
+    if base_url.is_empty() {
+        return Err("validation_base_url_required");
+    }
+    Ok(ModelDiscoverParams {
+        client: ClientKind::Claude,
+        provider_id: form.id.clone(),
+        base_url: base_url.to_owned(),
+        auth_scheme: form.auth_scheme,
+        secret: if form.secret.is_empty() && form.id.is_some() {
+            SecretInput::Preserve
+        } else {
+            SecretInput::Replace(form.secret.to_string())
+        },
+        network_proxy: form.network_proxy.clone(),
+        proxy_password: match (form.proxy_password_clear, form.id.is_some()) {
+            (true, _) => SecretInput::Clear,
+            (false, existing) => {
+                if form.proxy_password.is_empty() {
+                    if existing {
+                        SecretInput::Preserve
+                    } else {
+                        SecretInput::Clear
+                    }
+                } else {
+                    SecretInput::Replace(form.proxy_password.to_string())
+                }
+            }
+        },
+    })
+}
+
 /// The text of the form field with focus; the auth scheme field carries none.
 fn form_field_text(form: &ProviderForm) -> &str {
     match form.field {
@@ -2359,6 +2959,62 @@ fn image_model_rank(model: &str) -> u8 {
     }
 }
 
+fn default_stats_screen() -> StatsScreen {
+    let to = Local::now().date_naive();
+    let from = to - chrono::Duration::days(29);
+    StatsScreen {
+        page: StatsPage::Overview,
+        report: None,
+        from: from.format("%Y-%m-%d").to_string(),
+        to: to.format("%Y-%m-%d").to_string(),
+        provider_id: None,
+        model: None,
+        filter: None,
+        scroll: 0,
+    }
+}
+
+fn apply_time_preset(screen: &mut StatsScreen) -> bool {
+    let selected = match &screen.filter {
+        Some(StatsFilter::Time { selected, .. }) => *selected,
+        _ => return false,
+    };
+    let to = Local::now().date_naive();
+    if selected < 4 {
+        let days = [1, 7, 30, 90][selected];
+        screen.to = to.format("%Y-%m-%d").to_string();
+        screen.from = (to - chrono::Duration::days(days - 1))
+            .format("%Y-%m-%d")
+            .to_string();
+        return true;
+    }
+    let Ok(from) = NaiveDate::parse_from_str(&screen.from, "%Y-%m-%d") else {
+        return false;
+    };
+    let Ok(to) = NaiveDate::parse_from_str(&screen.to, "%Y-%m-%d") else {
+        return false;
+    };
+    from <= to
+}
+
+fn stats_query(client: ClientKind, screen: &StatsScreen) -> UsageStatsQuery {
+    let today = Local::now().date_naive();
+    let from = NaiveDate::parse_from_str(&screen.from, "%Y-%m-%d").unwrap_or(today);
+    let to = NaiveDate::parse_from_str(&screen.to, "%Y-%m-%d").unwrap_or(today);
+    let timestamp = |date: NaiveDate| {
+        date.and_hms_opt(0, 0, 0)
+            .and_then(|value| Local.from_local_datetime(&value).earliest())
+            .map_or(0, |value| value.timestamp())
+    };
+    UsageStatsQuery {
+        client,
+        from: timestamp(from),
+        to: timestamp(to + chrono::Duration::days(1)),
+        provider_id: screen.provider_id.clone(),
+        model: screen.model.clone(),
+    }
+}
+
 pub(super) fn visible_models(picker: &ModelPicker) -> Vec<&str> {
     let query = picker.query.to_ascii_lowercase();
     picker
@@ -2378,6 +3034,24 @@ fn selected_model(picker: &ModelPicker) -> Option<&str> {
         .selected
         .checked_sub(1)
         .and_then(|index| visible_models(picker).get(index).copied())
+}
+
+pub(super) fn visible_mapping_models(picker: &MappingModelPicker) -> Vec<&str> {
+    let query = picker.query.to_ascii_lowercase();
+    picker
+        .models
+        .iter()
+        .filter(|model| query.is_empty() || model.to_ascii_lowercase().contains(&query))
+        .map(String::as_str)
+        .collect()
+}
+
+/// The model under the cursor, or `None` while no model is chosen.
+///
+/// The mapping dialog has no "leave the model alone" row — unlike the Codex picker, every row
+/// here is a value the mapping writes — so entry `0` is the first model rather than a no-op.
+pub(super) fn selected_mapping_model(picker: &MappingModelPicker) -> Option<&str> {
+    visible_mapping_models(picker).get(picker.selected).copied()
 }
 
 pub(super) fn visible_image_models(picker: &ImageModelPicker) -> Vec<&str> {

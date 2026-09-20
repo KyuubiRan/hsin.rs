@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use hsin_core::{
     ClientKind, ImportCurrentParams, ModeSetParams, ModelDiscoverParams, PROTOCOL_VERSION,
-    ProviderListParams, SettingsPatch, VERSION_CODE,
+    ProviderListParams, SettingsPatch, UsageStatsQuery, VERSION_CODE,
 };
 use hsin_ipc::{
     HelloParams, HelloResult, IpcListener, JsonRpcRequest, JsonRpcResponse, RpcError, capability,
@@ -107,6 +107,7 @@ async fn serve_connection(
                         capability::CONFIG_SAGA.into(),
                         capability::MODEL_DISCOVERY.into(),
                         capability::CODEX_IMAGE.into(),
+                        capability::USAGE_STATS.into(),
                     ],
                 })
             }) {
@@ -191,6 +192,10 @@ async fn dispatch(
             .await
         ),
         method::STATUS => call!(app.status()),
+        method::STATS_SYNC => call!(app.sync_usage().await),
+        method::STATS_QUERY => {
+            call!(async { app.query_usage(parse::<UsageStatsQuery>(params)?).await }.await)
+        }
         method::DOCTOR => call!(app.doctor()),
         method::SETTINGS_GET => call!(app.settings()),
         method::SETTINGS_SET => {

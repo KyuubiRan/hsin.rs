@@ -63,6 +63,8 @@ pub mod method {
     pub const SECURITY_IMPORT_RECOVERY_KEY: &str = "security.import_recovery_key";
     pub const SECURITY_ROTATE_KEY: &str = "security.rotate_key";
     pub const CREDENTIAL_RESOLVE: &str = "credential.resolve";
+    pub const STATS_SYNC: &str = "stats.sync";
+    pub const STATS_QUERY: &str = "stats.query";
     pub const DAEMON_SHUTDOWN: &str = "daemon.shutdown";
 }
 
@@ -74,6 +76,7 @@ pub mod capability {
     pub const CONFIG_SAGA: &str = "config_saga.v1";
     pub const MODEL_DISCOVERY: &str = "model_discovery.v1";
     pub const CODEX_IMAGE: &str = "codex_image.v1";
+    pub const USAGE_STATS: &str = "usage_stats.v1";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
