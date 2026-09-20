@@ -51,9 +51,14 @@ jobs:
             echo "::error::could not read VERSION_CODE from $previous_tag"
             exit 1
           fi
-          expected_code=$((previous_code + 1))
-          if [ "$current_code" -ne "$expected_code" ]; then
-            echo "::error::VERSION_CODE must be $expected_code for $TAG; found $current_code (previous release: $previous_tag)"
+          # The code must move forward, but need not land exactly one past the
+          # last release: a compatibility change may already have incremented it
+          # before the release-only commit, and that commit must not bump twice.
+          # What this still rejects is a release that forgot to increment at all
+          # or reused a code a shipped daemon already answers to, since either
+          # would leave two builds sharing one compatibility identity.
+          if [ "$current_code" -le "$previous_code" ]; then
+            echo "::error::VERSION_CODE must be greater than $previous_code for $TAG; found $current_code (previous release: $previous_tag)"
             exit 1
           fi
 
