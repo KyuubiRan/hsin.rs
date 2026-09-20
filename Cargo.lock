@@ -1153,7 +1153,7 @@ dependencies = [
 
 [[package]]
 name = "hsin"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1174,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "hsin-core"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -1183,7 +1183,7 @@ dependencies = [
 
 [[package]]
 name = "hsin-ipc"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "hsin-core",
  "interprocess",
@@ -1197,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "hsind"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "atomic-write-file",
