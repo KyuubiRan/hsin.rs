@@ -4,7 +4,9 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
+    },
 };
 
 use crate::i18n::I18n;
@@ -12,7 +14,7 @@ use crate::i18n::I18n;
 use super::super::{
     state::{SettingsPage, SettingsScreen, State},
     theme::{MUTED, RED, WHITE},
-    widgets::display_width,
+    widgets::{centered_fixed, display_width, draw_input_field},
 };
 
 #[allow(clippy::too_many_lines)]
@@ -330,6 +332,15 @@ pub(super) fn draw_settings_screen(
                         i18n.text("off")
                     }),
                 ),
+                (ClientKind::Codex, 2 | 3) => (
+                    i18n.text(if *selected == 2 {
+                        "context_max_presets"
+                    } else {
+                        "context_compact_presets"
+                    }),
+                    i18n.text("settings_context_presets_description"),
+                    None,
+                ),
                 _ => (
                     i18n.text("import_current"),
                     i18n.text("settings_import_current_description"),
@@ -366,6 +377,10 @@ pub(super) fn draw_settings_screen(
                     option_width,
                 ));
             }
+            if *client == ClientKind::Codex {
+                items.push(ListItem::new(i18n.text("context_max_presets")));
+                items.push(ListItem::new(i18n.text("context_compact_presets")));
+            }
             items.push(ListItem::new(i18n.text("import_current")));
             (
                 items,
@@ -374,6 +389,36 @@ pub(super) fn draw_settings_screen(
                 detail_title,
                 description,
                 current,
+            )
+        }
+        SettingsPage::ContextPresets {
+            kind,
+            selected,
+            editor,
+            delete_armed,
+        } => {
+            let presets = kind.presets(&state.client_settings);
+            let description = if editor.is_some() {
+                i18n.text("settings_context_preset_input_description")
+            } else if delete_armed.is_some() {
+                i18n.text("settings_context_preset_delete_description")
+            } else {
+                i18n.text("settings_context_presets_description")
+            };
+            (
+                presets
+                    .iter()
+                    .map(|value| ListItem::new(value.to_string()))
+                    .collect(),
+                *selected,
+                i18n.text(if *kind == super::super::state::ContextKind::Maximum {
+                    "context_max_presets"
+                } else {
+                    "context_compact_presets"
+                }),
+                i18n.text(kind.label()),
+                description,
+                None,
             )
         }
         SettingsPage::ClientVisibility { selected } => {
@@ -486,6 +531,34 @@ pub(super) fn draw_settings_screen(
         ),
         columns[1],
     );
+
+    if let SettingsPage::ContextPresets {
+        editor: Some(editor),
+        ..
+    } = &screen.page
+    {
+        let popup = centered_fixed(area, 48, 5);
+        frame.render_widget(Clear, popup);
+        let block = Block::default()
+            .title(i18n.text(if editor.original.is_some() {
+                "context_preset_edit"
+            } else {
+                "context_preset_add"
+            }))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(RED));
+        let inner = block.inner(popup);
+        frame.render_widget(block, popup);
+        draw_input_field(
+            frame,
+            inner,
+            i18n.text("context_preset_tokens"),
+            &editor.value,
+            None,
+            Some(editor.cursor),
+            true,
+        );
+    }
 }
 
 fn upstream_proxy_mode_label(mode: UpstreamProxyMode, i18n: &I18n) -> &str {

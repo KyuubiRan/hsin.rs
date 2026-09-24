@@ -64,6 +64,7 @@ const fn assume_held() -> bool {
 pub struct DaemonClient {
     inner: tokio::sync::Mutex<hsin_ipc::IpcClient>,
     daemon_version: String,
+    required_capabilities_supported: bool,
 }
 
 impl DaemonClient {
@@ -81,6 +82,7 @@ impl DaemonClient {
         Ok(Self {
             inner: tokio::sync::Mutex::new(inner),
             daemon_version: hello.daemon_version,
+            required_capabilities_supported: has_required_capabilities(&hello.capabilities),
         })
     }
 
@@ -111,13 +113,18 @@ impl DaemonClient {
     /// this, a release that fixes only daemon behaviour never reaches anyone who
     /// already had hsin installed.
     async fn reinstall_if_stale(self) -> Result<Self> {
-        if self.daemon_version == env!("CARGO_PKG_VERSION") {
+        if !daemon_needs_reinstall(&self.daemon_version, self.required_capabilities_supported) {
             return Ok(self);
         }
         // Reinstalling stops the daemon, so let go of the connection first.
         drop(self);
         bootstrap::install_and_start().await?;
-        Self::wait_until_ready(None).await
+        let client = Self::wait_until_ready(None).await?;
+        anyhow::ensure!(
+            client.required_capabilities_supported,
+            "installed hsind does not support Codex tuning settings"
+        );
+        Ok(client)
     }
 
     async fn wait_for_running_daemon(mut last_error: anyhow::Error) -> Result<Self> {
@@ -187,6 +194,19 @@ impl DaemonClient {
     pub async fn security_status(&self) -> Result<SecurityStatus> {
         self.call("security.status", &json!({})).await
     }
+}
+
+fn daemon_needs_reinstall(version: &str, required_capabilities_supported: bool) -> bool {
+    version != env!("CARGO_PKG_VERSION") || !required_capabilities_supported
+}
+
+fn has_required_capabilities(capabilities: &[String]) -> bool {
+    [
+        hsin_ipc::capability::CONTEXT_PRESETS,
+        hsin_ipc::capability::PLAN_MODE_REASONING,
+    ]
+    .iter()
+    .all(|required| capabilities.iter().any(|capability| capability == required))
 }
 
 /// A missing socket only says the daemon is not listening. Point at the daemon
@@ -290,6 +310,20 @@ fn decode_client_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_without_current_codex_tuning_is_reinstalled_even_at_same_version() {
+        assert!(daemon_needs_reinstall(env!("CARGO_PKG_VERSION"), false));
+        assert!(daemon_needs_reinstall("older-version", true));
+        assert!(!daemon_needs_reinstall(env!("CARGO_PKG_VERSION"), true));
+        assert!(!has_required_capabilities(&[
+            hsin_ipc::capability::CONTEXT_PRESETS.into(),
+        ]));
+        assert!(has_required_capabilities(&[
+            hsin_ipc::capability::CONTEXT_PRESETS.into(),
+            hsin_ipc::capability::PLAN_MODE_REASONING.into(),
+        ]));
+    }
 
     #[test]
     fn only_compatibility_failures_require_daemon_reinstallation() {

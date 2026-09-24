@@ -108,6 +108,8 @@ async fn serve_connection(
                         capability::MODEL_DISCOVERY.into(),
                         capability::CODEX_IMAGE.into(),
                         capability::USAGE_STATS.into(),
+                        capability::CONTEXT_PRESETS.into(),
+                        capability::PLAN_MODE_REASONING.into(),
                     ],
                 })
             }) {
@@ -273,3 +275,82 @@ fn failure(id: u64, error: &DaemonError) -> JsonRpcResponse<Value> {
     JsonRpcResponse::failure(id, RpcError::application(error.into()))
 }
 use secrecy::ExposeSecret;
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, fs, sync::Arc};
+
+    use hsin_core::{ClientSettings, Settings, SettingsPatch};
+    use parking_lot::Mutex;
+
+    use super::{dispatch, method};
+    use crate::{app::App, crypto::KeyStore, error::Result, paths::Paths};
+
+    #[derive(Default)]
+    struct MemoryStore(Mutex<HashMap<u32, String>>);
+
+    impl KeyStore for MemoryStore {
+        fn load(&self, version: u32) -> Result<Option<String>> {
+            Ok(self.0.lock().get(&version).cloned())
+        }
+
+        fn store(&self, version: u32, value: &str) -> Result<()> {
+            self.0.lock().insert(version, value.to_owned());
+            Ok(())
+        }
+
+        fn delete(&self, version: u32) -> Result<()> {
+            self.0.lock().remove(&version);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn context_presets_survive_settings_rpc_and_daemon_reopen() {
+        let root = std::env::temp_dir().join(format!("hsind-context-rpc-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::for_home(root.clone());
+        let store = Arc::new(MemoryStore::default());
+        let app = App::open_with_store(&paths, store.clone()).unwrap();
+        let clients = ClientSettings {
+            codex_context_max_presets: vec![128_000, 272_000, 1_000_000],
+            codex_context_compact_presets: vec![100_000, 258_000, 900_000],
+            ..ClientSettings::default()
+        };
+        let patch = SettingsPatch {
+            clients: Some(clients.clone()),
+            ..SettingsPatch::default()
+        };
+
+        let value = dispatch(
+            app.clone(),
+            1,
+            method::SETTINGS_SET,
+            serde_json::to_value(patch).unwrap(),
+        )
+        .await
+        .into_result()
+        .unwrap();
+        assert_eq!(
+            serde_json::from_value::<Settings>(value).unwrap().clients,
+            clients
+        );
+        drop(app);
+
+        let reopened = App::open_with_store(&paths, store).unwrap();
+        let value = dispatch(
+            reopened.clone(),
+            2,
+            method::SETTINGS_GET,
+            serde_json::json!({}),
+        )
+        .await
+        .into_result()
+        .unwrap();
+        assert_eq!(
+            serde_json::from_value::<Settings>(value).unwrap().clients,
+            clients
+        );
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+}

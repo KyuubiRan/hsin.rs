@@ -18,8 +18,8 @@ use toml_edit::{DocumentMut, ImDocument, Item, Table, value};
 use zeroize::{Zeroize, Zeroizing};
 
 use hsin_core::{
-    CLAUDE_MODEL_ENV_KEYS, CLAUDE_MODEL_NAME_ENV_KEYS, DEFAULT_CODEX_CONFIG_NAME,
-    OPENAI_CODEX_CONFIG_NAME,
+    CLAUDE_MODEL_ENV_KEYS, CLAUDE_MODEL_NAME_ENV_KEYS, CodexTuningSettings,
+    DEFAULT_CODEX_CONFIG_NAME, OPENAI_CODEX_CONFIG_NAME,
 };
 
 use crate::{
@@ -534,7 +534,10 @@ pub fn patch_codex_with_credential(
     credential: Option<&str>,
 ) -> Result<String> {
     if target.provider.official {
-        return remove_codex_hsin_configuration(text);
+        return patch_codex_tuning(
+            remove_codex_hsin_configuration(text)?,
+            target.provider.codex_tuning,
+        );
     }
 
     let mut output = text.to_owned();
@@ -599,7 +602,70 @@ pub fn patch_codex_with_credential(
         None => append_toml_table(&mut output, &provider_block),
     }
     parse_toml(&output)?;
+    patch_codex_tuning(output, target.provider.codex_tuning)
+}
+
+fn patch_codex_tuning(mut output: String, tuning: CodexTuningSettings) -> Result<String> {
+    if tuning.context.enabled {
+        patch_codex_token_limit(
+            &mut output,
+            "model_context_window",
+            tuning.context.max_tokens,
+        )?;
+        patch_codex_token_limit(
+            &mut output,
+            "model_auto_compact_token_limit",
+            tuning.context.compact_tokens,
+        )?;
+    }
+    if let Some(effort) = tuning.reasoning_effort.as_config_value() {
+        patch_codex_top_level(&mut output, "model_reasoning_effort", Some(value(effort)))?;
+    }
+    if let Some(effort) = tuning.plan_mode_reasoning_effort.as_config_value() {
+        patch_codex_top_level(
+            &mut output,
+            "plan_mode_reasoning_effort",
+            Some(value(effort)),
+        )?;
+    }
+    parse_toml(&output)?;
     Ok(output)
+}
+
+fn patch_codex_token_limit(output: &mut String, key: &str, tokens: Option<u64>) -> Result<()> {
+    let item = tokens
+        .map(|tokens| {
+            i64::try_from(tokens)
+                .map(value)
+                .map_err(|_| DaemonError::Invalid("Codex token limit exceeds TOML range".into()))
+        })
+        .transpose()?;
+    patch_codex_top_level(output, key, item)
+}
+
+fn patch_codex_top_level(output: &mut String, key: &str, item: Option<Item>) -> Result<()> {
+    let document = parse_toml(output)?;
+    match (document.get(key), item) {
+        (Some(existing), Some(item)) => {
+            let span = existing
+                .span()
+                .ok_or_else(|| DaemonError::Config(format!("{key} has no source span")))?;
+            output.replace_range(span, &item.to_string());
+        }
+        (Some(existing), None) => {
+            let span = existing
+                .span()
+                .ok_or_else(|| DaemonError::Config(format!("{key} has no source span")))?;
+            output.replace_range(line_range(span, output), "");
+        }
+        (None, Some(item)) => {
+            let insertion =
+                top_level_property_insertion(&document, output, &format!("{key} = {item}"));
+            output.insert_str(insertion.offset, &insertion.text);
+        }
+        (None, None) => {}
+    }
+    Ok(())
 }
 
 /// Hand Codex configuration back to its native provider selection.
@@ -1607,6 +1673,7 @@ mod tests {
                 claude_model_mapping: None,
                 scope: hsin_core::ProviderScope::Primary,
                 codex_image: hsin_core::CodexImageConfig::default(),
+                codex_tuning: CodexTuningSettings::default(),
                 network_proxy: hsin_core::ProviderProxyConfig::default(),
             },
             credential_command: "/opt/hsin".into(),
@@ -1620,6 +1687,50 @@ mod tests {
             codex_auth_before_hash: None,
             claude_model_env_before: None,
         }
+    }
+
+    #[test]
+    fn codex_tuning_only_owns_enabled_context_keys_and_selected_effort() {
+        let original = "# keep\r\nmodel_context_window = 128000\r\nmodel_auto_compact_token_limit = 96000\r\nmodel_reasoning_effort = \"medium\" # user\r\nplan_mode_reasoning_effort = \"low\" # user\r\nmodel = \"keep-model\"\r\n[features]\r\nweb_search = true\r\n";
+        let mut codex = target(ClientKind::Codex);
+        codex.provider.codex_tuning.context.max_tokens = Some(272_000);
+        codex.provider.codex_tuning.context.compact_tokens = Some(250_000);
+        let disabled = patch_codex(original, &codex).unwrap();
+        assert!(disabled.contains("model_context_window = 128000\r\n"));
+        assert!(disabled.contains("model_auto_compact_token_limit = 96000\r\n"));
+        assert!(disabled.contains("model_reasoning_effort = \"medium\" # user\r\n"));
+        assert!(disabled.contains("plan_mode_reasoning_effort = \"low\" # user\r\n"));
+
+        codex.provider.codex_tuning.context.enabled = true;
+        codex.provider.codex_tuning.reasoning_effort = hsin_core::CodexReasoningEffort::Max;
+        codex.provider.codex_tuning.plan_mode_reasoning_effort =
+            hsin_core::CodexReasoningEffort::High;
+        let enabled = patch_codex(&disabled, &codex).unwrap();
+        assert!(enabled.contains("model_context_window = 272000\r\n"));
+        assert!(enabled.contains("model_auto_compact_token_limit = 250000\r\n"));
+        assert!(enabled.contains("model_reasoning_effort = \"max\" # user\r\n"));
+        assert!(enabled.contains("plan_mode_reasoning_effort = \"high\" # user\r\n"));
+        assert!(enabled.contains("model = \"keep-model\"\r\n"));
+        assert!(enabled.contains("[features]\r\nweb_search = true\r\n"));
+        assert_eq!(patch_codex(&enabled, &codex).unwrap(), enabled);
+
+        codex.provider.codex_tuning.context.max_tokens = None;
+        codex.provider.codex_tuning.context.compact_tokens = None;
+        codex.provider.codex_tuning.reasoning_effort = hsin_core::CodexReasoningEffort::Unchanged;
+        codex.provider.codex_tuning.plan_mode_reasoning_effort =
+            hsin_core::CodexReasoningEffort::Unchanged;
+        let cleared = patch_codex(&enabled, &codex).unwrap();
+        assert!(!cleared.contains("model_context_window ="));
+        assert!(!cleared.contains("model_auto_compact_token_limit ="));
+        assert!(cleared.contains("model_reasoning_effort = \"max\" # user"));
+        assert!(cleared.contains("plan_mode_reasoning_effort = \"high\" # user"));
+
+        codex.provider.official = true;
+        codex.provider.codex_tuning.context.max_tokens = Some(1_000_000);
+        let official = patch_codex(&cleared, &codex).unwrap();
+        assert!(official.contains("model_context_window = 1000000"));
+        assert!(!official.contains("[model_providers.hsin]"));
+        assert!(official.contains("model = \"keep-model\""));
     }
 
     #[test]
@@ -1791,6 +1902,7 @@ mod tests {
             claude_model_mapping: None,
             scope: hsin_core::ProviderScope::Primary,
             codex_image: hsin_core::CodexImageConfig::default(),
+            codex_tuning: CodexTuningSettings::default(),
             network_proxy: hsin_core::ProviderProxyConfig::default(),
         };
         let patched = patch_codex(
@@ -1843,6 +1955,7 @@ mod tests {
             claude_model_mapping: None,
             scope: hsin_core::ProviderScope::Primary,
             codex_image: hsin_core::CodexImageConfig::default(),
+            codex_tuning: CodexTuningSettings::default(),
             network_proxy: hsin_core::ProviderProxyConfig::default(),
         };
         let patched = patch_claude(
@@ -2150,6 +2263,7 @@ mod tests {
             claude_model_mapping: None,
             scope: hsin_core::ProviderScope::Primary,
             codex_image: hsin_core::CodexImageConfig::default(),
+            codex_tuning: CodexTuningSettings::default(),
             network_proxy: hsin_core::ProviderProxyConfig::default(),
         };
         assert_eq!(

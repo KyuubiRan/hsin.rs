@@ -27,7 +27,7 @@ use home::{draw_details, draw_provider_list, draw_search};
 use image_picker::{draw_image_import, draw_image_models, draw_image_source};
 use mapping_models::draw_mapping_models;
 use model_mapping::draw_model_mapping;
-use model_picker::draw_models;
+use model_picker::{draw_context_picker, draw_models};
 use provider_form::draw_form;
 #[cfg(test)]
 pub(super) use provider_form::form_field_areas;
@@ -99,12 +99,19 @@ pub(super) fn draw(frame: &mut Frame<'_>, state: &mut State, i18n: &I18n) {
         draw_footer(frame, rows[3], state, i18n);
         return;
     }
+    if let InputMode::ContextPicker(picker) = &state.input {
+        draw_form(frame, overlay, &picker.form, i18n);
+        draw_context_picker(frame, overlay, picker, &state.client_settings, i18n);
+        draw_footer(frame, rows[3], state, i18n);
+        return;
+    }
 
     match &state.input {
         // The delete confirmation is only a footer prompt, so the provider list stays readable
         // while it is armed and nothing has to be redrawn here.
         InputMode::Search { .. } | InputMode::Normal | InputMode::DeleteConfirm { .. } => {}
         InputMode::Form(_) => unreachable!("provider form is drawn over the footer"),
+        InputMode::ContextPicker(_) => unreachable!("context picker is drawn over the form"),
         InputMode::Models(picker) => draw_models(frame, rows[2], picker, i18n),
         InputMode::ImageModels(picker) => draw_image_models(frame, rows[2], picker, i18n),
         InputMode::ImageSource { selected } => {

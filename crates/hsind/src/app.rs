@@ -361,6 +361,7 @@ impl App {
             claude_model_mapping: None,
             scope: ProviderScope::Primary,
             codex_image: hsin_core::CodexImageConfig::default(),
+            codex_tuning: hsin_core::CodexTuningSettings::default(),
             network_proxy: ProviderProxyConfig::default(),
             revision: 1,
         };
@@ -398,6 +399,7 @@ impl App {
             claude_model_mapping: None,
             scope: ProviderScope::Primary,
             codex_image: hsin_core::CodexImageConfig::default(),
+            codex_tuning: hsin_core::CodexTuningSettings::default(),
             network_proxy: ProviderProxyConfig::default(),
         };
         let mut provider = Database::new_provider(&input)?;
@@ -542,6 +544,7 @@ impl App {
             claude_model_mapping: draft.claude_model_mapping,
             scope: draft.scope,
             codex_image: draft.codex_image,
+            codex_tuning: draft.codex_tuning,
             network_proxy,
         };
         let mut provider = Database::new_provider(&input)?;
@@ -591,6 +594,7 @@ impl App {
             CodexImageConfigUpdate::Preserve => current.codex_image.clone(),
             CodexImageConfigUpdate::Set(config) => config,
         };
+        let codex_tuning = params.patch.codex_tuning.unwrap_or(current.codex_tuning);
         let codex_config_name = match params.patch.codex_config_name {
             CodexConfigNameUpdate::Preserve => current.codex_config_name.clone(),
             CodexConfigNameUpdate::Set(name) => Some(name),
@@ -639,6 +643,7 @@ impl App {
             claude_model_mapping,
             scope: current.scope,
             codex_image,
+            codex_tuning,
             network_proxy,
         };
         input.validate()?;
@@ -660,6 +665,7 @@ impl App {
                 .codex_image
                 .normalized()
                 .map_err(|error| DaemonError::Invalid(error.to_string()))?,
+            codex_tuning: input.codex_tuning,
             network_proxy: input.network_proxy.clone(),
             revision: current.revision.saturating_add(1),
         };
@@ -671,7 +677,7 @@ impl App {
             && (active_direct
                 || mapping_changed
                 || config_name_changed
-                || (provider.client == ClientKind::Codex && provider.model.is_some()));
+                || provider.client == ClientKind::Codex);
         if active_direct
             && !matches!(
                 (provider.client, provider.auth_scheme),
@@ -892,6 +898,7 @@ impl App {
             claude_model_mapping: None,
             scope: ProviderScope::Primary,
             codex_image: hsin_core::CodexImageConfig::default(),
+            codex_tuning: hsin_core::CodexTuningSettings::default(),
             network_proxy: network_proxy.clone(),
         };
         input.validate()?;
@@ -1121,7 +1128,7 @@ impl App {
         let _ = self.db.secret(&provider.id)?;
         let state = self.db.client_state(params.client)?;
         if state.mode == ConnectionMode::Proxy {
-            if (provider.client == ClientKind::Codex && provider.model.is_some())
+            if provider.client == ClientKind::Codex
                 || self.claude_model_mapping_transition(&provider)?
             {
                 self.apply_configuration(&provider, ConnectionMode::Proxy)?;
@@ -2681,6 +2688,7 @@ mod tests {
                     claude_model_mapping: None,
                     scope: ProviderScope::Primary,
                     codex_image: hsin_core::CodexImageConfig::default(),
+                    codex_tuning: hsin_core::CodexTuningSettings::default(),
                     network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("provider-key".into()),
@@ -2837,6 +2845,7 @@ mod tests {
                 claude_model_mapping: None,
                 scope: ProviderScope::Primary,
                 codex_image: hsin_core::CodexImageConfig::default(),
+                codex_tuning: hsin_core::CodexTuningSettings::default(),
                 network_proxy: ProviderProxyConfig::default(),
             },
             secret: SecretInput::Replace(secret.into()),
@@ -2853,6 +2862,199 @@ mod tests {
         let preview = providers[0].credential_preview.as_deref().unwrap();
         assert_eq!(preview, "sk-abc***yz");
         assert!(!serde_json::to_string(&providers).unwrap().contains(secret));
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn proxy_codex_binding_tracks_switches_and_active_edits_without_a_model() {
+        let root = std::env::temp_dir().join(format!(
+            "hsind-codex-proxy-binding-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = Paths::for_home(root.clone());
+        let codex_config = root.join("codex/config.toml");
+        let app = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
+        *app.config_paths.write() = HashMap::from([
+            (ClientKind::Codex, codex_config.clone()),
+            (ClientKind::Claude, root.join("claude/settings.json")),
+        ]);
+        let draft = hsin_core::ProviderDraft {
+            client: ClientKind::Codex,
+            name: "First".into(),
+            description: String::new(),
+            base_url: "https://first.example.test/v1".into(),
+            auth_scheme: AuthScheme::Bearer,
+            model: None,
+            codex_config_name: None,
+            claude_model_mapping: None,
+            scope: ProviderScope::Primary,
+            codex_image: hsin_core::CodexImageConfig::default(),
+            codex_tuning: hsin_core::CodexTuningSettings::default(),
+            network_proxy: ProviderProxyConfig::default(),
+        };
+        let first = app
+            .add_provider(ProviderAddParams {
+                provider: draft.clone(),
+                secret: SecretInput::Replace("first-secret".into()),
+                proxy_password: SecretInput::Preserve,
+            })
+            .await
+            .unwrap();
+        let second = app
+            .add_provider(ProviderAddParams {
+                provider: hsin_core::ProviderDraft {
+                    name: "Second".into(),
+                    base_url: "https://second.example.test/v1".into(),
+                    ..draft
+                },
+                secret: SecretInput::Replace("second-secret".into()),
+                proxy_password: SecretInput::Preserve,
+            })
+            .await
+            .unwrap();
+        app.apply_configuration(&first, ConnectionMode::Proxy)
+            .unwrap();
+
+        let binding = || {
+            let text = fs::read_to_string(&codex_config).unwrap();
+            let document = text.parse::<toml_edit::DocumentMut>().unwrap();
+            document["model_providers"]["hsin"]["auth"]["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|argument| argument.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        let assert_binding = |provider: &Provider| {
+            let args = binding();
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--provider-id", &provider.id])
+            );
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--revision", &provider.revision.to_string()])
+            );
+            assert!(args.contains(&"--proxy".to_owned()));
+            assert!(
+                app.credential(
+                    ClientKind::Codex,
+                    Some(&provider.id),
+                    Some(provider.revision),
+                    true,
+                )
+                .is_ok()
+            );
+        };
+        assert_binding(&first);
+        app.switch_provider(ProviderSwitchParams {
+            client: ClientKind::Codex,
+            provider_id: second.id.clone(),
+        })
+        .await
+        .unwrap();
+        assert_binding(&second);
+        assert!(matches!(
+            app.credential(ClientKind::Codex, Some(&first.id), Some(first.revision), true),
+            Err(DaemonError::Conflict(message)) if message == "proxy credential provider binding is stale"
+        ));
+
+        let edited = app
+            .edit_provider(ProviderEditParams {
+                id: second.id.clone(),
+                expected_revision: second.revision,
+                patch: hsin_core::ProviderPatch {
+                    name: Some("Second updated".into()),
+                    ..hsin_core::ProviderPatch::default()
+                },
+                secret: SecretInput::Preserve,
+                proxy_password: SecretInput::Preserve,
+            })
+            .await
+            .unwrap();
+        assert_binding(&edited);
+        assert!(matches!(
+            app.credential(ClientKind::Codex, Some(&second.id), Some(second.revision), true),
+            Err(DaemonError::Conflict(message)) if message == "credential provider binding is stale"
+        ));
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn codex_tuning_follows_the_selected_provider() {
+        let root =
+            std::env::temp_dir().join(format!("hsind-codex-tuning-{}", uuid::Uuid::new_v4()));
+        let paths = Paths::for_home(root.clone());
+        let codex_config = root.join("codex/config.toml");
+        fs::create_dir_all(codex_config.parent().unwrap()).unwrap();
+        fs::write(
+            &codex_config,
+            "# keep\nmodel_context_window = 4096\nmodel_auto_compact_token_limit = 2048\nmodel_reasoning_effort = \"low\"\n",
+        )
+        .unwrap();
+        let app = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
+        *app.config_paths.write() = HashMap::from([
+            (ClientKind::Codex, codex_config.clone()),
+            (ClientKind::Claude, root.join("claude/settings.json")),
+        ]);
+        let official = app.ensure_official_provider(ClientKind::Codex).unwrap();
+        app.apply_configuration(&official, ConnectionMode::Direct)
+            .unwrap();
+
+        let mut first = official.clone();
+        first.id = uuid::Uuid::new_v4().to_string();
+        first.name = "First tuned".into();
+        first.codex_tuning.context.enabled = true;
+        first.codex_tuning.context.max_tokens = Some(272_000);
+        first.codex_tuning.context.compact_tokens = None;
+        first.codex_tuning.reasoning_effort = hsin_core::CodexReasoningEffort::High;
+        app.db.insert_provider(&first, None, None).unwrap();
+
+        let mut second = official;
+        second.id = uuid::Uuid::new_v4().to_string();
+        second.name = "Second tuned".into();
+        second.codex_tuning.context.enabled = true;
+        second.codex_tuning.context.max_tokens = Some(1_000_000);
+        second.codex_tuning.context.compact_tokens = Some(272_000);
+        second.codex_tuning.reasoning_effort = hsin_core::CodexReasoningEffort::Max;
+        app.db.insert_provider(&second, None, None).unwrap();
+
+        app.apply_configuration(&first, ConnectionMode::Direct)
+            .unwrap();
+        let first_text = fs::read_to_string(&codex_config).unwrap();
+        assert!(first_text.contains("model_context_window = 272000"));
+        assert!(!first_text.contains("model_auto_compact_token_limit ="));
+        assert!(first_text.contains("model_reasoning_effort = \"high\""));
+        app.apply_configuration(&second, ConnectionMode::Direct)
+            .unwrap();
+        let second_text = fs::read_to_string(&codex_config).unwrap();
+        assert!(second_text.contains("model_context_window = 1000000"));
+        assert!(second_text.contains("model_auto_compact_token_limit = 272000"));
+        assert!(second_text.contains("model_reasoning_effort = \"max\""));
+        assert_eq!(
+            app.db.get_provider(&first.id).unwrap().codex_tuning,
+            first.codex_tuning
+        );
+        assert_eq!(
+            app.db.get_provider(&second.id).unwrap().codex_tuning,
+            second.codex_tuning
+        );
+
+        let target = app
+            .config_target(&first, ConnectionMode::Direct, None)
+            .unwrap();
+        leave_pending_configuration_operation(&app, &codex_config, &target);
+        app.recover_operations().unwrap();
+        assert!(
+            fs::read_to_string(&codex_config)
+                .unwrap()
+                .contains("model_context_window = 272000")
+        );
+
         drop(app);
         fs::remove_dir_all(root).unwrap();
     }
@@ -2889,6 +3091,7 @@ mod tests {
                     claude_model_mapping: None,
                     scope: ProviderScope::Primary,
                     codex_image: hsin_core::CodexImageConfig::default(),
+                    codex_tuning: hsin_core::CodexTuningSettings::default(),
                     network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("router-secret".into()),
@@ -2911,6 +3114,15 @@ mod tests {
                     codex_config_name: CodexConfigNameUpdate::Set(
                         hsin_core::OPENAI_CODEX_CONFIG_NAME.into(),
                     ),
+                    codex_tuning: Some(hsin_core::CodexTuningSettings {
+                        context: hsin_core::CodexContextOverride {
+                            enabled: true,
+                            max_tokens: Some(272_000),
+                            compact_tokens: None,
+                        },
+                        reasoning_effort: hsin_core::CodexReasoningEffort::High,
+                        plan_mode_reasoning_effort: hsin_core::CodexReasoningEffort::Medium,
+                    }),
                     ..hsin_core::ProviderPatch::default()
                 },
                 secret: SecretInput::Preserve,
@@ -2923,6 +3135,13 @@ mod tests {
         assert!(direct_config.contains("[model_providers.hsin]"));
         assert!(direct_config.contains("name = \"OpenAI\""));
         assert!(direct_config.contains("base_url = \"https://router.example.test/v1\""));
+        assert!(direct_config.contains("model_context_window = 272000"));
+        assert!(direct_config.contains("model_reasoning_effort = \"high\""));
+        assert!(direct_config.contains("plan_mode_reasoning_effort = \"medium\""));
+        assert_eq!(
+            app.db.get_provider(&direct.id).unwrap().codex_tuning,
+            direct.codex_tuning
+        );
 
         app.db
             .set_mode(ClientKind::Codex, ConnectionMode::Proxy)
@@ -2935,6 +3154,15 @@ mod tests {
                     codex_config_name: CodexConfigNameUpdate::Set(
                         hsin_core::HSIN_CODEX_CONFIG_NAME.into(),
                     ),
+                    codex_tuning: Some(hsin_core::CodexTuningSettings {
+                        context: hsin_core::CodexContextOverride {
+                            enabled: true,
+                            max_tokens: Some(1_000_000),
+                            compact_tokens: Some(272_000),
+                        },
+                        reasoning_effort: hsin_core::CodexReasoningEffort::Ultra,
+                        plan_mode_reasoning_effort: hsin_core::CodexReasoningEffort::Max,
+                    }),
                     ..hsin_core::ProviderPatch::default()
                 },
                 secret: SecretInput::Preserve,
@@ -2945,6 +3173,14 @@ mod tests {
         let proxy_config = fs::read_to_string(&codex_config).unwrap();
         assert!(proxy_config.contains("name = \"hsin\""));
         assert!(proxy_config.contains("base_url = \"http://127.0.0.1:9999/codex/v1\""));
+        assert!(proxy_config.contains("model_context_window = 1000000"));
+        assert!(proxy_config.contains("model_auto_compact_token_limit = 272000"));
+        assert!(proxy_config.contains("model_reasoning_effort = \"ultra\""));
+        assert!(proxy_config.contains("plan_mode_reasoning_effort = \"max\""));
+        assert_eq!(
+            app.db.get_provider(&proxy.id).unwrap().codex_tuning,
+            proxy.codex_tuning
+        );
 
         app.edit_provider(ProviderEditParams {
             id: proxy.id,
@@ -2982,6 +3218,8 @@ mod tests {
         let clients = ClientSettings {
             order: vec![ClientKind::Claude, ClientKind::Codex],
             visible: vec![ClientKind::Claude],
+            codex_context_max_presets: vec![128_000, 272_000, 1_000_000],
+            ..ClientSettings::default()
         };
         let settings = app
             .update_settings(SettingsPatch {
@@ -3009,6 +3247,7 @@ mod tests {
                 clients: Some(ClientSettings {
                     order: ClientKind::ALL.to_vec(),
                     visible: Vec::new(),
+                    ..ClientSettings::default()
                 }),
                 client_auth: None,
                 codex_preserve_official_auth: None,
@@ -3056,6 +3295,7 @@ mod tests {
                     claude_model_mapping: None,
                     scope: ProviderScope::Primary,
                     codex_image: hsin_core::CodexImageConfig::default(),
+                    codex_tuning: hsin_core::CodexTuningSettings::default(),
                     network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("sk-client-auth-secret".into()),
@@ -3327,6 +3567,7 @@ mod tests {
                     claude_model_mapping: None,
                     scope: ProviderScope::Primary,
                     codex_image: hsin_core::CodexImageConfig::default(),
+                    codex_tuning: hsin_core::CodexTuningSettings::default(),
                     network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("no-backup-secret".into()),
@@ -3448,6 +3689,7 @@ mod tests {
                     claude_model_mapping: None,
                     scope: ProviderScope::Primary,
                     codex_image: hsin_core::CodexImageConfig::default(),
+                    codex_tuning: hsin_core::CodexTuningSettings::default(),
                     network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("recovery-secret".into()),
@@ -3554,6 +3796,7 @@ mod tests {
                     claude_model_mapping: None,
                     scope: ProviderScope::Primary,
                     codex_image: hsin_core::CodexImageConfig::default(),
+                    codex_tuning: hsin_core::CodexTuningSettings::default(),
                     network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("preservation-recovery-secret".into()),
@@ -3629,6 +3872,7 @@ mod tests {
                     claude_model_mapping: None,
                     scope: ProviderScope::Primary,
                     codex_image: hsin_core::CodexImageConfig::default(),
+                    codex_tuning: hsin_core::CodexTuningSettings::default(),
                     network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("upgrade-secret".into()),
@@ -3702,6 +3946,7 @@ mod tests {
                     claude_model_mapping: None,
                     scope: ProviderScope::Primary,
                     codex_image: hsin_core::CodexImageConfig::default(),
+                    codex_tuning: hsin_core::CodexTuningSettings::default(),
                     network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("helper-secret".into()),
@@ -3915,6 +4160,7 @@ mod tests {
                     claude_model_mapping: None,
                     scope: ProviderScope::Primary,
                     codex_image: hsin_core::CodexImageConfig::default(),
+                    codex_tuning: hsin_core::CodexTuningSettings::default(),
                     network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("import-secret".into()),
@@ -3992,6 +4238,7 @@ mod tests {
                     claude_model_mapping: None,
                     scope: ProviderScope::Primary,
                     codex_image: hsin_core::CodexImageConfig::default(),
+                    codex_tuning: hsin_core::CodexTuningSettings::default(),
                     network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("recovery-secret".into()),
@@ -4408,6 +4655,7 @@ mod tests {
                     claude_model_mapping: None,
                     scope: ProviderScope::Primary,
                     codex_image: hsin_core::CodexImageConfig::default(),
+                    codex_tuning: hsin_core::CodexTuningSettings::default(),
                     network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("codex-secret".into()),
@@ -4428,6 +4676,7 @@ mod tests {
                     claude_model_mapping: None,
                     scope: ProviderScope::Primary,
                     codex_image: hsin_core::CodexImageConfig::default(),
+                    codex_tuning: hsin_core::CodexTuningSettings::default(),
                     network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("claude-secret".into()),
@@ -4597,6 +4846,7 @@ mod tests {
                     claude_model_mapping: None,
                     scope: ProviderScope::Primary,
                     codex_image: hsin_core::CodexImageConfig::default(),
+                    codex_tuning: hsin_core::CodexTuningSettings::default(),
                     network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("claude-secret".into()),
@@ -4794,6 +5044,7 @@ mod tests {
                     }),
                     scope: ProviderScope::Primary,
                     codex_image: hsin_core::CodexImageConfig::default(),
+                    codex_tuning: hsin_core::CodexTuningSettings::default(),
                     network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("mapped-secret".into()),
@@ -4814,6 +5065,7 @@ mod tests {
                     claude_model_mapping: None,
                     scope: ProviderScope::Primary,
                     codex_image: hsin_core::CodexImageConfig::default(),
+                    codex_tuning: hsin_core::CodexTuningSettings::default(),
                     network_proxy: ProviderProxyConfig::default(),
                 },
                 secret: SecretInput::Replace("unmapped-secret".into()),

@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use hsin_core::{
     ClaudeModelMappingUpdate, ClientAuthUpdate, ClientKind, ClientSettings, CodexConfigNameUpdate,
     CodexImageConfigUpdate, CodexImageListParams, CodexImageSwitchParams, ConnectionMode,
@@ -303,6 +303,7 @@ pub(super) fn provider_add_params(form: FormSubmission) -> ProviderAddParams {
             claude_model_mapping,
             scope: form.scope,
             codex_image: form.codex_image,
+            codex_tuning: form.codex_tuning,
             network_proxy: form.network_proxy,
         },
         proxy_password,
@@ -334,6 +335,7 @@ pub(super) fn provider_edit_params(form: FormSubmission) -> Result<ProviderEditP
             codex_config_name: form.codex_config_name,
             claude_model_mapping: form.claude_model_mapping,
             codex_image: CodexImageConfigUpdate::Set(form.codex_image),
+            codex_tuning: Some(form.codex_tuning),
             network_proxy: Some(form.network_proxy),
         },
         secret: if form.secret.is_empty() {
@@ -504,7 +506,7 @@ async fn update_clients(
     client: &DaemonClient,
     clients: ClientSettings,
 ) -> Result<Option<&'static str>> {
-    let _: Value = client
+    let updated: Settings = client
         .call(
             "settings.set",
             &SettingsPatch {
@@ -512,7 +514,7 @@ async fn update_clients(
                 proxy_host: None,
                 proxy_port: None,
                 proxy_enabled: None,
-                clients: Some(clients),
+                clients: Some(clients.clone()),
                 client_auth: None,
                 codex_preserve_official_auth: None,
                 claude_model_names_enabled: None,
@@ -520,6 +522,10 @@ async fn update_clients(
             },
         )
         .await?;
+    ensure!(
+        updated.clients == clients,
+        "hsind did not retain client settings; reopen hsin to update the daemon"
+    );
     Ok(Some("client_settings_changed"))
 }
 

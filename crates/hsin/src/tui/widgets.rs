@@ -10,7 +10,10 @@ use unicode_width::UnicodeWidthChar;
 use crate::i18n::I18n;
 
 use super::{
-    state::{InputMode, ModelPickerMode, SettingsPage, State},
+    state::{
+        InputMode, ModelPickerMode, SettingsPage, State, form_context_compact_field,
+        form_context_max_field,
+    },
     theme::{INPUT_BG, MUTED, RED, WHITE},
 };
 
@@ -116,7 +119,14 @@ fn footer_help(state: &State, i18n: &I18n) -> String {
             "help"
         }),
         InputMode::Search { .. } => i18n.text("search_help"),
+        InputMode::Form(form)
+            if form_context_max_field(form) == Some(form.field)
+                || form_context_compact_field(form) == Some(form.field) =>
+        {
+            i18n.text("context_form_help")
+        }
         InputMode::Form(_) => i18n.text("form_help"),
+        InputMode::ContextPicker(_) => i18n.text("context_picker_help"),
         InputMode::Models(picker) => model_help(&picker.mode, i18n, "model_help"),
         InputMode::MappingModels(picker) => {
             if picker.discovering {
@@ -151,6 +161,10 @@ fn footer_help(state: &State, i18n: &I18n) -> String {
             SettingsPage::ClientOrder { .. } => i18n.text("settings_client_order_help"),
             SettingsPage::ClientVisibility { .. } => i18n.text("settings_client_visibility_help"),
             SettingsPage::ClientConfig { .. } => i18n.text("settings_client_auth_help"),
+            SettingsPage::ContextPresets {
+                editor: Some(_), ..
+            } => i18n.text("settings_context_preset_input_help"),
+            SettingsPage::ContextPresets { .. } => i18n.text("settings_context_presets_help"),
             SettingsPage::Language { .. } | SettingsPage::Clients { .. } => {
                 i18n.text("settings_submenu_help")
             }

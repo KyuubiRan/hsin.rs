@@ -1,3 +1,4 @@
+use hsin_core::ClientSettings;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -8,12 +9,47 @@ use ratatui::{
 use crate::i18n::I18n;
 
 use super::super::{
-    state::{ModelPicker, ModelPickerMode, visible_models},
+    state::{ContextPicker, ModelPicker, ModelPickerMode, visible_models},
     theme::RED,
     widgets::{
         centered_fixed, content_width, display_width, draw_input_field, draw_list_scroll_indicators,
     },
 };
+
+pub(super) fn draw_context_picker(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    picker: &ContextPicker,
+    settings: &ClientSettings,
+    i18n: &I18n,
+) {
+    let presets = picker.kind.presets(settings);
+    let width = content_width(area, 20, 32, 50);
+    let height = u16::try_from(presets.len().saturating_add(3).min(14)).unwrap_or(14);
+    let popup = centered_fixed(area, width, height);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(i18n.text(picker.kind.label()))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(RED));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let items = std::iter::once(ListItem::new(i18n.text("context_preset_empty")))
+        .chain(presets.iter().map(|value| ListItem::new(value.to_string())))
+        .collect::<Vec<_>>();
+    let mut state = ListState::default().with_selected(Some(picker.selected.min(presets.len())));
+    frame.render_stateful_widget(
+        List::new(items).highlight_symbol("› ").highlight_style(
+            Style::default()
+                .fg(RED)
+                .bg(Color::Rgb(55, 28, 32))
+                .add_modifier(Modifier::BOLD),
+        ),
+        inner,
+        &mut state,
+    );
+    draw_list_scroll_indicators(frame, popup, inner, &state, (0..=presets.len()).map(|_| 1));
+}
 
 pub(super) fn draw_models(frame: &mut Frame<'_>, area: Rect, picker: &ModelPicker, i18n: &I18n) {
     let models = visible_models(picker);

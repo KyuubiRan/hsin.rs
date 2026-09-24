@@ -1302,6 +1302,7 @@ mod tests {
                 claude_model_mapping: None,
                 scope: ProviderScope::Primary,
                 codex_image: CodexImageConfig::default(),
+                codex_tuning: hsin_core::CodexTuningSettings::default(),
                 network_proxy: ProviderProxyConfig::default(),
             })
             .expect("provider");

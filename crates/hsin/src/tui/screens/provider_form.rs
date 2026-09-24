@@ -13,10 +13,11 @@ use crate::i18n::I18n;
 
 use super::super::{
     state::{
-        ProviderForm, form_auth_field, form_description_field, form_field_count, form_image_field,
-        form_network_proxy_field, form_proxy_host_field, form_proxy_password_field,
+        ProviderForm, form_auth_field, form_context_compact_field, form_context_max_field,
+        form_description_field, form_field_count, form_image_field, form_network_proxy_field,
+        form_plan_reasoning_field, form_proxy_host_field, form_proxy_password_field,
         form_proxy_port_field, form_proxy_protocol_field, form_proxy_username_field,
-        primary_codex_form,
+        form_reasoning_field, primary_codex_form,
     },
     theme::{INPUT_BG, RED, WHITE},
     widgets::{
@@ -131,6 +132,8 @@ fn form_popup(
         display_width(values.secret),
         display_width(values.auth),
         display_width(&values.remote_compaction),
+        display_width(&form.context_max),
+        display_width(&form.context_compact),
         display_width(&values.image_generation),
         display_width(&values.network_proxy),
         display_width(&form.network_proxy.manual.host),
@@ -205,6 +208,64 @@ fn draw_form_field(
             area,
             i18n.text("remote_compaction"),
             &values.remote_compaction,
+            form.field == index,
+        ),
+        5 if primary_codex_form(form) => draw_choice_field(
+            frame,
+            area,
+            i18n.text("codex_context_override"),
+            &format!(
+                "‹ {} ›",
+                if form.codex_tuning.context.enabled {
+                    i18n.text("enabled")
+                } else {
+                    i18n.text("disabled")
+                }
+            ),
+            form.field == index,
+        ),
+        index if form_context_max_field(form) == Some(index) => draw_input_field(
+            frame,
+            area,
+            i18n.text("codex_context_max"),
+            &form.context_max,
+            Some(i18n.text("empty")),
+            (form.field == index).then_some(form.cursor),
+            true,
+        ),
+        index if form_context_compact_field(form) == Some(index) => draw_input_field(
+            frame,
+            area,
+            i18n.text("codex_context_compact"),
+            &form.context_compact,
+            Some(i18n.text("empty")),
+            (form.field == index).then_some(form.cursor),
+            true,
+        ),
+        index if form_reasoning_field(form) == Some(index) => draw_choice_field(
+            frame,
+            area,
+            i18n.text("codex_reasoning_effort"),
+            &format!(
+                "‹ {} ›",
+                form.codex_tuning
+                    .reasoning_effort
+                    .as_config_value()
+                    .unwrap_or(i18n.text("unchanged"))
+            ),
+            form.field == index,
+        ),
+        index if form_plan_reasoning_field(form) == Some(index) => draw_choice_field(
+            frame,
+            area,
+            i18n.text("codex_plan_reasoning_effort"),
+            &format!(
+                "‹ {} ›",
+                form.codex_tuning
+                    .plan_mode_reasoning_effort
+                    .as_config_value()
+                    .unwrap_or(i18n.text("unchanged"))
+            ),
             form.field == index,
         ),
         index if form_image_field(form) == Some(index) => draw_choice_field(

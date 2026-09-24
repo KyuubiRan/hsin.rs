@@ -11,9 +11,9 @@ use url::Url;
 /// Wire protocol version implemented by this workspace.
 pub const PROTOCOL_VERSION: u32 = 2;
 /// Monotonic CLI/daemon release compatibility code. Every published workspace
-/// version must be exactly one greater than the preceding release so a new CLI
-/// always replaces an older daemon.
-pub const VERSION_CODE: u32 = 30;
+/// version must be greater than the preceding release so a new CLI always
+/// replaces an older daemon.
+pub const VERSION_CODE: u32 = 31;
 
 pub const HSIN_CODEX_CONFIG_NAME: &str = "hsin";
 pub const OPENAI_CODEX_CONFIG_NAME: &str = "OpenAI";
@@ -125,6 +125,10 @@ pub struct ClientSettings {
     pub order: Vec<ClientKind>,
     #[serde(default = "default_client_order")]
     pub visible: Vec<ClientKind>,
+    #[serde(default = "default_codex_context_max_presets")]
+    pub codex_context_max_presets: Vec<u64>,
+    #[serde(default = "default_codex_context_compact_presets")]
+    pub codex_context_compact_presets: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +190,8 @@ impl ClientSettings {
                         .count()
                         == 1
             })
+            && valid_context_presets(&self.codex_context_max_presets)
+            && valid_context_presets(&self.codex_context_compact_presets)
     }
 
     #[must_use]
@@ -203,12 +209,29 @@ impl Default for ClientSettings {
         Self {
             order: default_client_order(),
             visible: default_client_order(),
+            codex_context_max_presets: default_codex_context_max_presets(),
+            codex_context_compact_presets: default_codex_context_compact_presets(),
         }
     }
 }
 
 fn default_client_order() -> Vec<ClientKind> {
     ClientKind::ALL.to_vec()
+}
+
+fn default_codex_context_max_presets() -> Vec<u64> {
+    vec![272_000, 1_000_000]
+}
+
+fn default_codex_context_compact_presets() -> Vec<u64> {
+    vec![258_000, 900_000]
+}
+
+fn valid_context_presets(values: &[u64]) -> bool {
+    values
+        .iter()
+        .all(|value| *value > 0 && i64::try_from(*value).is_ok())
+        && values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -801,6 +824,8 @@ pub struct Provider {
     #[serde(default)]
     pub codex_image: CodexImageConfig,
     #[serde(default)]
+    pub codex_tuning: CodexTuningSettings,
+    #[serde(default)]
     pub network_proxy: ProviderProxyConfig,
     pub revision: u64,
 }
@@ -826,6 +851,7 @@ impl Provider {
             claude_model_mapping: self.claude_model_mapping.clone(),
             scope: self.scope,
             codex_image: self.codex_image.clone(),
+            codex_tuning: self.codex_tuning,
             network_proxy: self.network_proxy.clone(),
         }
         .validate()
@@ -960,6 +986,8 @@ pub struct ProviderDraft {
     #[serde(default)]
     pub codex_image: CodexImageConfig,
     #[serde(default)]
+    pub codex_tuning: CodexTuningSettings,
+    #[serde(default)]
     pub network_proxy: ProviderProxyConfig,
 }
 
@@ -996,6 +1024,14 @@ impl ProviderDraft {
             mapping.validate(self.client)?;
         }
         let image = self.codex_image.normalized()?;
+        if !self.codex_tuning.is_valid() {
+            return Err(ValidationError::new("codex_tuning", "invalid_token_limit"));
+        }
+        if (self.client != ClientKind::Codex || self.scope != ProviderScope::Primary)
+            && self.codex_tuning != CodexTuningSettings::default()
+        {
+            return Err(ValidationError::new("codex_tuning", "unsupported_client"));
+        }
         self.network_proxy.validate()?;
         match self.client {
             ClientKind::Claude if self.scope != ProviderScope::Primary || !image.is_inert() => {
@@ -1086,6 +1122,8 @@ pub struct ProviderPatch {
     pub claude_model_mapping: ClaudeModelMappingUpdate,
     #[serde(default, skip_serializing_if = "CodexImageConfigUpdate::is_preserve")]
     pub codex_image: CodexImageConfigUpdate,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_tuning: Option<CodexTuningSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_proxy: Option<ProviderProxyConfig>,
 }
@@ -1456,6 +1494,64 @@ pub struct Settings {
     pub claude_model_names_enabled: bool,
     #[serde(default)]
     pub upstream_proxy: UpstreamProxyConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexContextOverride {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    #[serde(default)]
+    pub compact_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexReasoningEffort {
+    #[default]
+    Unchanged,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Ultra,
+    Max,
+}
+
+impl CodexReasoningEffort {
+    #[must_use]
+    pub const fn as_config_value(self) -> Option<&'static str> {
+        match self {
+            Self::Unchanged => None,
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::Xhigh => Some("xhigh"),
+            Self::Ultra => Some("ultra"),
+            Self::Max => Some("max"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexTuningSettings {
+    #[serde(default)]
+    pub context: CodexContextOverride,
+    #[serde(default)]
+    pub reasoning_effort: CodexReasoningEffort,
+    #[serde(default)]
+    pub plan_mode_reasoning_effort: CodexReasoningEffort,
+}
+
+impl CodexTuningSettings {
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        [self.context.max_tokens, self.context.compact_tokens]
+            .into_iter()
+            .flatten()
+            .all(|tokens| tokens > 0 && i64::try_from(tokens).is_ok())
+    }
 }
 
 pub const LANGUAGE_SYSTEM: &str = "system";
@@ -1871,6 +1967,7 @@ mod tests {
             claude_model_mapping: None,
             scope: ProviderScope::ImageOnly,
             codex_image: CodexImageConfig::default(),
+            codex_tuning: CodexTuningSettings::default(),
             network_proxy: ProviderProxyConfig::default(),
         };
         assert_eq!(
@@ -1899,6 +1996,7 @@ mod tests {
         let reordered = ClientSettings {
             order: vec![ClientKind::Claude, ClientKind::Codex],
             visible: vec![ClientKind::Codex, ClientKind::Claude],
+            ..ClientSettings::default()
         };
         assert!(reordered.is_valid());
         assert_eq!(
@@ -1910,6 +2008,7 @@ mod tests {
             !ClientSettings {
                 order: ClientKind::ALL.to_vec(),
                 visible: Vec::new(),
+                ..ClientSettings::default()
             }
             .is_valid()
         );
@@ -1917,9 +2016,31 @@ mod tests {
             !ClientSettings {
                 order: vec![ClientKind::Codex, ClientKind::Codex],
                 visible: vec![ClientKind::Codex],
+                ..ClientSettings::default()
             }
             .is_valid()
         );
+    }
+
+    #[test]
+    fn context_presets_default_for_old_settings_and_require_sorted_unique_limits() {
+        let old: ClientSettings = serde_json::from_value(serde_json::json!({
+            "order": ["codex", "claude"],
+            "visible": ["codex", "claude"]
+        }))
+        .unwrap();
+        assert_eq!(old.codex_context_max_presets, [272_000, 1_000_000]);
+        assert_eq!(old.codex_context_compact_presets, [258_000, 900_000]);
+
+        let mut invalid = old;
+        invalid.codex_context_max_presets = vec![1_000_000, 272_000];
+        assert!(!invalid.is_valid());
+        invalid.codex_context_max_presets = vec![272_000, 272_000];
+        assert!(!invalid.is_valid());
+        invalid.codex_context_max_presets = vec![0];
+        assert!(!invalid.is_valid());
+        invalid.codex_context_max_presets.clear();
+        assert!(invalid.is_valid());
     }
 
     #[test]
@@ -1937,6 +2058,19 @@ mod tests {
     }
 
     #[test]
+    fn older_codex_tuning_defaults_plan_mode_to_unchanged() {
+        let tuning: CodexTuningSettings = serde_json::from_value(serde_json::json!({
+            "reasoning_effort": "high"
+        }))
+        .unwrap();
+        assert_eq!(tuning.reasoning_effort, CodexReasoningEffort::High);
+        assert_eq!(
+            tuning.plan_mode_reasoning_effort,
+            CodexReasoningEffort::Unchanged
+        );
+    }
+
+    #[test]
     fn provider_validation_rejects_unsafe_urls() {
         let valid = ProviderDraft {
             client: ClientKind::Codex,
@@ -1949,6 +2083,7 @@ mod tests {
             claude_model_mapping: None,
             scope: ProviderScope::Primary,
             codex_image: CodexImageConfig::default(),
+            codex_tuning: CodexTuningSettings::default(),
             network_proxy: ProviderProxyConfig::default(),
         };
         assert!(valid.validate().is_ok());

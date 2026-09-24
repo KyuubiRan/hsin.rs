@@ -77,6 +77,8 @@ pub mod capability {
     pub const MODEL_DISCOVERY: &str = "model_discovery.v1";
     pub const CODEX_IMAGE: &str = "codex_image.v1";
     pub const USAGE_STATS: &str = "usage_stats.v1";
+    pub const CONTEXT_PRESETS: &str = "context_presets.v1";
+    pub const PLAN_MODE_REASONING: &str = "plan_mode_reasoning.v1";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

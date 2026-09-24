@@ -509,6 +509,7 @@ fn make_verifier(key: &[u8; KEY_BYTES], version: u32) -> Result<(Vec<u8>, Vec<u8
         claude_model_mapping: None,
         scope: hsin_core::ProviderScope::Primary,
         codex_image: hsin_core::CodexImageConfig::default(),
+        codex_tuning: hsin_core::CodexTuningSettings::default(),
         network_proxy: hsin_core::ProviderProxyConfig::default(),
         revision: 0,
     };
@@ -533,6 +534,7 @@ fn verify_key(key: &[u8; KEY_BYTES], version: u32, nonce: &[u8], verifier: &[u8]
         claude_model_mapping: None,
         scope: hsin_core::ProviderScope::Primary,
         codex_image: hsin_core::CodexImageConfig::default(),
+        codex_tuning: hsin_core::CodexTuningSettings::default(),
         network_proxy: hsin_core::ProviderProxyConfig::default(),
         revision: 0,
     };
@@ -705,6 +707,7 @@ mod tests {
                 claude_model_mapping: None,
                 scope: hsin_core::ProviderScope::Primary,
                 codex_image: hsin_core::CodexImageConfig::default(),
+                codex_tuning: hsin_core::CodexTuningSettings::default(),
                 network_proxy: hsin_core::ProviderProxyConfig::default(),
             })
             .unwrap();

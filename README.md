@@ -161,6 +161,25 @@ provider key or an environment-variable value into Codex configuration. Enable
 this only after signing in through the Official provider; enabling it also turns
 Hsin Auth back on. Enabling **Disable custom Auth** later turns preservation off.
 
+Each primary Codex Provider's add/edit form has **Context override**,
+**Reasoning effort**, and **Plan mode reasoning effort** above
+**Configure image generation**. The
+context switch expands maximum context and auto-compaction threshold inline.
+On either context field, Tab opens a sorted list of saved token presets and an
+empty choice; values can also be entered directly. Settings -> Client
+configuration -> Codex configuration manages separate lists for maximum context
+(initially 272,000 and 1,000,000) and auto-compaction (initially 258,000 and
+900,000). Press `a` to add or `e` to edit a token count in a dialog, or `d`
+twice to delete one. Up/Down moves between form fields. When the
+override is off, hsin leaves both keys untouched; when it is on, an empty field
+removes its key. Both reasoning effort controls cycle independently through do
+not modify, `low`, `medium`, `high`, `xhigh`, `ultra`, and `max`. Each Provider
+saves its own choices and applies them on activation; do not modify leaves the
+existing value alone.
+New Codex Image provider selections prefer `gpt-image-2.5-sunburst` when the
+provider lists it (then `gpt-image-2.5-flare`); the Claude Opus mapping suggests
+`claude-opus-5-5` for a new, otherwise empty row.
+
 Press `s` on a Codex or Claude Code TUI page to open token statistics. Hsin
 combines exact usage observed by its local proxy with usage metadata from new
 Codex and Claude Code session-log entries, so official-login and direct-mode

@@ -8,13 +8,13 @@ use chrono::{Local, NaiveDate, TimeZone};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hsin_core::{
     AuthScheme, ClaudeModelMapping, ClaudeModelMappingUpdate, ClientAuthSettings, ClientKind,
-    ClientSettings, CodexConfigNameUpdate, CodexImageConfig, ConnectionMode,
-    DEFAULT_CODEX_CONFIG_NAME, HSIN_CODEX_CONFIG_NAME, LANGUAGE_EN_US, LANGUAGE_SYSTEM,
-    LANGUAGE_ZH_CN, ModelDiscoverParams, ModelDiscovery, ModelSlot, ModelUpdate,
-    OPENAI_CODEX_CONFIG_NAME, Provider, ProviderProxyConfig, ProviderProxyMode, ProviderScope,
-    ProxyProtocol, SecretInput, Settings, UpstreamProxyConfig, UpstreamProxyMode, UsageStatsQuery,
-    UsageStatsReport, convert_provider_base_url, normalize_generated_provider_name,
-    provider_name_from_url,
+    ClientSettings, CodexConfigNameUpdate, CodexImageConfig, CodexReasoningEffort,
+    CodexTuningSettings, ConnectionMode, DEFAULT_CODEX_CONFIG_NAME, HSIN_CODEX_CONFIG_NAME,
+    LANGUAGE_EN_US, LANGUAGE_SYSTEM, LANGUAGE_ZH_CN, ModelDiscoverParams, ModelDiscovery,
+    ModelSlot, ModelUpdate, OPENAI_CODEX_CONFIG_NAME, Provider, ProviderProxyConfig,
+    ProviderProxyMode, ProviderScope, ProxyProtocol, SecretInput, Settings, UpstreamProxyConfig,
+    UpstreamProxyMode, UsageStatsQuery, UsageStatsReport, convert_provider_base_url,
+    normalize_generated_provider_name, provider_name_from_url,
 };
 use zeroize::Zeroizing;
 
@@ -124,6 +124,7 @@ pub(super) enum InputMode {
         cursor: usize,
     },
     Form(ProviderForm),
+    ContextPicker(Box<ContextPicker>),
     Models(ModelPicker),
     ImageModels(ImageModelPicker),
     ImageSource {
@@ -209,6 +210,12 @@ pub(super) enum SettingsPage {
         client: ClientKind,
         selected: usize,
     },
+    ContextPresets {
+        kind: ContextKind,
+        selected: usize,
+        editor: Option<ContextPresetEditor>,
+        delete_armed: Option<(u64, Instant)>,
+    },
     ClientVisibility {
         selected: usize,
     },
@@ -240,10 +247,54 @@ pub(super) struct ProviderForm {
     pub(super) claude_model_mapping: Option<ClaudeModelMapping>,
     pub(super) scope: ProviderScope,
     pub(super) codex_image: CodexImageConfig,
+    pub(super) codex_tuning: CodexTuningSettings,
+    pub(super) context_max: String,
+    pub(super) context_compact: String,
     pub(super) network_proxy: ProviderProxyConfig,
     pub(super) proxy_port: String,
     pub(super) proxy_password: Zeroizing<String>,
     pub(super) proxy_password_clear: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ContextKind {
+    Maximum,
+    Compact,
+}
+
+impl ContextKind {
+    pub(super) fn presets(self, settings: &ClientSettings) -> &[u64] {
+        match self {
+            Self::Maximum => &settings.codex_context_max_presets,
+            Self::Compact => &settings.codex_context_compact_presets,
+        }
+    }
+
+    fn presets_mut(self, settings: &mut ClientSettings) -> &mut Vec<u64> {
+        match self {
+            Self::Maximum => &mut settings.codex_context_max_presets,
+            Self::Compact => &mut settings.codex_context_compact_presets,
+        }
+    }
+
+    pub(super) const fn label(self) -> &'static str {
+        match self {
+            Self::Maximum => "codex_context_max",
+            Self::Compact => "codex_context_compact",
+        }
+    }
+}
+
+pub(super) struct ContextPicker {
+    pub(super) form: ProviderForm,
+    pub(super) kind: ContextKind,
+    pub(super) selected: usize,
+}
+
+pub(super) struct ContextPresetEditor {
+    pub(super) original: Option<u64>,
+    pub(super) value: String,
+    pub(super) cursor: usize,
 }
 
 pub(super) struct ProviderClipboard {
@@ -265,6 +316,7 @@ pub(super) struct FormSubmission {
     pub(super) claude_model_mapping: ClaudeModelMappingUpdate,
     pub(super) scope: ProviderScope,
     pub(super) codex_image: CodexImageConfig,
+    pub(super) codex_tuning: CodexTuningSettings,
     pub(super) network_proxy: ProviderProxyConfig,
     pub(super) proxy_password: Zeroizing<String>,
     pub(super) proxy_password_clear: bool,
@@ -303,7 +355,7 @@ pub(super) const MAPPING_TIERS: [MappingTier; 4] = [
     },
     MappingTier {
         label: "Opus",
-        default_model: "claude-opus-5",
+        default_model: "claude-opus-5-5",
     },
     MappingTier {
         label: "Sonnet",
@@ -407,6 +459,7 @@ impl ModelMappingForm {
                 claude_model_mapping: ClaudeModelMappingUpdate::Preserve,
                 scope: ProviderScope::Primary,
                 codex_image: CodexImageConfig::default(),
+                codex_tuning: CodexTuningSettings::default(),
                 network_proxy: ProviderProxyConfig::default(),
                 proxy_password: Zeroizing::new(String::new()),
                 proxy_password_clear: false,
@@ -536,6 +589,14 @@ impl State {
                     && Instant::now() >= *expires_at
                 {
                     self.input = InputMode::Normal;
+                }
+                if let InputMode::Settings(SettingsScreen {
+                    page: SettingsPage::ContextPresets { delete_armed, .. },
+                    ..
+                }) = &mut self.input
+                    && delete_armed.is_some_and(|(_, expires_at)| Instant::now() >= expires_at)
+                {
+                    *delete_armed = None;
                 }
             }
             Action::Failed(message) => {
@@ -746,6 +807,35 @@ impl State {
             _ => {}
         }
         match &mut self.input {
+            InputMode::ContextPicker(picker) => match key.code {
+                KeyCode::Esc => {
+                    let replacement = new_provider_form(picker.form.client, picker.form.scope);
+                    self.input = InputMode::Form(std::mem::replace(&mut picker.form, replacement));
+                }
+                KeyCode::Up | KeyCode::Char('i') => {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('k') => {
+                    picker.selected =
+                        (picker.selected + 1).min(picker.kind.presets(&client_settings).len());
+                }
+                KeyCode::Enter => {
+                    let value = if picker.selected == 0 {
+                        String::new()
+                    } else {
+                        picker.kind.presets(&client_settings)[picker.selected - 1].to_string()
+                    };
+                    let target = match picker.kind {
+                        ContextKind::Maximum => &mut picker.form.context_max,
+                        ContextKind::Compact => &mut picker.form.context_compact,
+                    };
+                    *target = value;
+                    picker.form.cursor = target.chars().count();
+                    let replacement = new_provider_form(picker.form.client, picker.form.scope);
+                    self.input = InputMode::Form(std::mem::replace(&mut picker.form, replacement));
+                }
+                _ => {}
+            },
             InputMode::Search { query, cursor } => match key.code {
                 KeyCode::Enter => {
                     let committed = std::mem::take(query);
@@ -777,6 +867,32 @@ impl State {
                     form.cursor = 0;
                 }
                 KeyCode::Esc => self.input = InputMode::Normal,
+                KeyCode::Tab
+                    if form_context_max_field(form) == Some(form.field)
+                        || form_context_compact_field(form) == Some(form.field) =>
+                {
+                    let kind = if form_context_max_field(form) == Some(form.field) {
+                        ContextKind::Maximum
+                    } else {
+                        ContextKind::Compact
+                    };
+                    let current = match kind {
+                        ContextKind::Maximum => &form.context_max,
+                        ContextKind::Compact => &form.context_compact,
+                    };
+                    let selected = kind
+                        .presets(&client_settings)
+                        .iter()
+                        .position(|preset| current == &preset.to_string())
+                        .map_or(0, |index| index + 1);
+                    let replacement = new_provider_form(form.client, form.scope);
+                    let form = std::mem::replace(form, replacement);
+                    self.input = InputMode::ContextPicker(Box::new(ContextPicker {
+                        form,
+                        kind,
+                        selected,
+                    }));
+                }
                 KeyCode::Tab | KeyCode::Down => {
                     form.field = (form.field + 1) % form_field_count(form);
                     form.cursor = caret_end(form_field_text(form));
@@ -806,6 +922,27 @@ impl State {
                             OPENAI_CODEX_CONFIG_NAME
                         }
                         .into();
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('j' | 'l' | ' ')
+                    if primary_codex_form(form) && form.field == 5 =>
+                {
+                    form.codex_tuning.context.enabled = !form.codex_tuning.context.enabled;
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('j' | 'l' | ' ')
+                    if form_reasoning_field(form) == Some(form.field) =>
+                {
+                    form.codex_tuning.reasoning_effort = cycle_codex_reasoning_effort(
+                        form.codex_tuning.reasoning_effort,
+                        matches!(key.code, KeyCode::Left | KeyCode::Char('j')),
+                    );
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Char('j' | 'l' | ' ')
+                    if form_plan_reasoning_field(form) == Some(form.field) =>
+                {
+                    form.codex_tuning.plan_mode_reasoning_effort = cycle_codex_reasoning_effort(
+                        form.codex_tuning.plan_mode_reasoning_effort,
+                        matches!(key.code, KeyCode::Left | KeyCode::Char('j')),
+                    );
                 }
                 KeyCode::Left | KeyCode::Char('j')
                     if form.field == form_network_proxy_field(form) =>
@@ -860,12 +997,30 @@ impl State {
                     let proxy_port_field = form_proxy_port_field(form);
                     let proxy_username_field = form_proxy_username_field(form);
                     let proxy_password_field = form_proxy_password_field(form);
+                    let context_max_field = form_context_max_field(form);
+                    let context_compact_field = form_context_compact_field(form);
                     let cursor = &mut form.cursor;
                     match form.field {
                         0 => edit_text(&mut form.base_url, cursor, key),
                         1 => edit_text(&mut form.secret, cursor, key),
                         2 => edit_text(&mut form.name, cursor, key),
                         3 if primary_codex => edit_text(&mut form.codex_config_name, cursor, key),
+                        field if context_max_field == Some(field) => {
+                            if matches!(key.code, KeyCode::Char(character) if !character.is_ascii_digit())
+                            {
+                                false
+                            } else {
+                                edit_text(&mut form.context_max, cursor, key)
+                            }
+                        }
+                        field if context_compact_field == Some(field) => {
+                            if matches!(key.code, KeyCode::Char(character) if !character.is_ascii_digit())
+                            {
+                                false
+                            } else {
+                                edit_text(&mut form.context_compact, cursor, key)
+                            }
+                        }
                         field if field == description_field => {
                             edit_text(&mut form.description, cursor, key)
                         }
@@ -1531,7 +1686,22 @@ impl State {
                         *selected = selected.saturating_sub(1);
                     }
                     KeyCode::Down | KeyCode::Char('k') => {
-                        *selected = (*selected + 1).min(2);
+                        *selected =
+                            (*selected + 1).min(if *client == ClientKind::Codex { 4 } else { 2 });
+                    }
+                    KeyCode::Enter
+                        if *client == ClientKind::Codex && matches!(*selected, 2 | 3) =>
+                    {
+                        screen.page = SettingsPage::ContextPresets {
+                            kind: if *selected == 2 {
+                                ContextKind::Maximum
+                            } else {
+                                ContextKind::Compact
+                            },
+                            selected: 0,
+                            editor: None,
+                            delete_armed: None,
+                        };
                     }
                     KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
                         if *selected <= 1 =>
@@ -1557,6 +1727,107 @@ impl State {
                     }
                     _ => {}
                 },
+                SettingsPage::ContextPresets {
+                    kind,
+                    selected,
+                    editor,
+                    delete_armed,
+                } => {
+                    if self.loading {
+                        return Transition::Continue;
+                    }
+                    if let Some(input) = editor {
+                        match key.code {
+                            KeyCode::Esc => *editor = None,
+                            KeyCode::Char('u' | 'U')
+                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                input.value.clear();
+                                input.cursor = 0;
+                            }
+                            KeyCode::Enter => match parse_context_limit(&input.value) {
+                                Ok(Some(tokens)) => {
+                                    if input.original == Some(tokens) {
+                                        *editor = None;
+                                    } else {
+                                        let mut updated = client_settings.clone();
+                                        let presets = kind.presets_mut(&mut updated);
+                                        if presets.binary_search(&tokens).is_ok() {
+                                            self.notice = Some("@context_preset_duplicate".into());
+                                        } else {
+                                            if let Some(original) = input.original {
+                                                presets.retain(|value| *value != original);
+                                            }
+                                            let index = presets.binary_search(&tokens).unwrap_err();
+                                            presets.insert(index, tokens);
+                                            *selected = index;
+                                            *editor = None;
+                                            self.pending_effect = Some(Effect::SetClients(updated));
+                                            self.loading = true;
+                                        }
+                                    }
+                                }
+                                _ => self.notice = Some("@validation_codex_context_limit".into()),
+                            },
+                            KeyCode::Char(character)
+                                if !character.is_ascii_digit() || input.value.len() >= 19 => {}
+                            _ => {
+                                edit_text(&mut input.value, &mut input.cursor, key);
+                            }
+                        }
+                    } else {
+                        let presets = kind.presets(&client_settings);
+                        if key.code != KeyCode::Char('d') {
+                            *delete_armed = None;
+                        }
+                        match key.code {
+                            KeyCode::Esc => {
+                                screen.page = SettingsPage::ClientConfig {
+                                    client: ClientKind::Codex,
+                                    selected: if *kind == ContextKind::Maximum { 2 } else { 3 },
+                                };
+                            }
+                            KeyCode::Up | KeyCode::Char('i') => {
+                                *selected = selected.saturating_sub(1);
+                            }
+                            KeyCode::Down | KeyCode::Char('k') => {
+                                *selected = (*selected + 1).min(presets.len().saturating_sub(1));
+                            }
+                            KeyCode::Char('a') => {
+                                *editor = Some(ContextPresetEditor {
+                                    original: None,
+                                    value: String::new(),
+                                    cursor: 0,
+                                });
+                            }
+                            KeyCode::Char('e') if let Some(&tokens) = presets.get(*selected) => {
+                                let value = tokens.to_string();
+                                *editor = Some(ContextPresetEditor {
+                                    original: Some(tokens),
+                                    cursor: value.len(),
+                                    value,
+                                });
+                            }
+                            KeyCode::Char('d') if let Some(&tokens) = presets.get(*selected) => {
+                                if delete_armed.is_some_and(|(armed, deadline)| {
+                                    armed == tokens && Instant::now() < deadline
+                                }) {
+                                    let mut updated = client_settings.clone();
+                                    kind.presets_mut(&mut updated).remove(*selected);
+                                    *selected = (*selected)
+                                        .min(kind.presets(&updated).len().saturating_sub(1));
+                                    *delete_armed = None;
+                                    self.pending_effect = Some(Effect::SetClients(updated));
+                                    self.loading = true;
+                                } else {
+                                    *delete_armed =
+                                        Some((tokens, Instant::now() + DELETE_CONFIRM_WINDOW));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 SettingsPage::ClientVisibility { selected } => match key.code {
                     KeyCode::Esc => {
                         screen.page = SettingsPage::Clients { selected: 2 };
@@ -1788,6 +2059,29 @@ impl State {
                             .flatten(),
                         scope: ProviderScope::Primary,
                         codex_image: CodexImageConfig::default(),
+                        context_max: if source.client == self.client {
+                            source
+                                .codex_tuning
+                                .context
+                                .max_tokens
+                                .map_or_else(String::new, |tokens| tokens.to_string())
+                        } else {
+                            String::new()
+                        },
+                        context_compact: if source.client == self.client {
+                            source
+                                .codex_tuning
+                                .context
+                                .compact_tokens
+                                .map_or_else(String::new, |tokens| tokens.to_string())
+                        } else {
+                            String::new()
+                        },
+                        codex_tuning: if source.client == self.client {
+                            source.codex_tuning
+                        } else {
+                            CodexTuningSettings::default()
+                        },
                         network_proxy: source.network_proxy.clone(),
                         proxy_port: source.network_proxy.manual.port.to_string(),
                         proxy_password: Zeroizing::new(String::new()),
@@ -2339,6 +2633,8 @@ fn clear_form_field(form: &mut ProviderForm) {
         1 => form.secret.clear(),
         2 => form.name.clear(),
         3 if primary_codex_form(form) => form.codex_config_name.clear(),
+        field if form_context_max_field(form) == Some(field) => form.context_max.clear(),
+        field if form_context_compact_field(form) == Some(field) => form.context_compact.clear(),
         field if field == form_description_field(form) => form.description.clear(),
         field if form_proxy_host_field(form) == Some(field) => {
             form.network_proxy.manual.host.clear();
@@ -2355,7 +2651,7 @@ fn clear_form_field(form: &mut ProviderForm) {
     }
 }
 
-fn new_provider_form(client: ClientKind, scope: ProviderScope) -> ProviderForm {
+pub(super) fn new_provider_form(client: ClientKind, scope: ProviderScope) -> ProviderForm {
     ProviderForm {
         id: None,
         revision: None,
@@ -2385,6 +2681,9 @@ fn new_provider_form(client: ClientKind, scope: ProviderScope) -> ProviderForm {
             enabled: scope == ProviderScope::ImageOnly,
             ..CodexImageConfig::default()
         },
+        codex_tuning: CodexTuningSettings::default(),
+        context_max: String::new(),
+        context_compact: String::new(),
         network_proxy: ProviderProxyConfig::default(),
         proxy_port: hsin_core::ManualProxyConfig::default().port.to_string(),
         proxy_password: Zeroizing::new(String::new()),
@@ -2420,6 +2719,17 @@ fn provider_form(provider: Provider) -> ProviderForm {
         claude_model_mapping: provider.claude_model_mapping,
         scope: provider.scope,
         codex_image: provider.codex_image,
+        context_max: provider
+            .codex_tuning
+            .context
+            .max_tokens
+            .map_or_else(String::new, |tokens| tokens.to_string()),
+        context_compact: provider
+            .codex_tuning
+            .context
+            .compact_tokens
+            .map_or_else(String::new, |tokens| tokens.to_string()),
+        codex_tuning: provider.codex_tuning,
         proxy_port: provider.network_proxy.manual.port.to_string(),
         network_proxy: provider.network_proxy,
         proxy_password: Zeroizing::new(String::new()),
@@ -2444,6 +2754,7 @@ fn image_edit_submission(provider: &Provider, enabled: bool) -> FormSubmission {
         claude_model_mapping: ClaudeModelMappingUpdate::Preserve,
         scope: provider.scope,
         codex_image,
+        codex_tuning: provider.codex_tuning,
         network_proxy: provider.network_proxy.clone(),
         proxy_password: Zeroizing::new(String::new()),
         proxy_password_clear: false,
@@ -2486,6 +2797,13 @@ pub(super) fn take_form_submission(
     if form.description.chars().count() > 1024 {
         return Err("validation_description_too_long");
     }
+    let mut codex_tuning = form.codex_tuning;
+    if primary_codex_form(form) {
+        codex_tuning.context.max_tokens = parse_context_limit(&form.context_max)
+            .map_err(|()| "validation_codex_context_limit")?;
+        codex_tuning.context.compact_tokens = parse_context_limit(&form.context_compact)
+            .map_err(|()| "validation_codex_context_limit")?;
+    }
     let mut network_proxy = form.network_proxy.clone();
     if network_proxy.mode == ProviderProxyMode::Manual {
         network_proxy.manual.port = form
@@ -2527,6 +2845,7 @@ pub(super) fn take_form_submission(
         claude_model_mapping: ClaudeModelMappingUpdate::Preserve,
         scope: form.scope,
         codex_image: form.codex_image.clone(),
+        codex_tuning,
         network_proxy,
         proxy_password: std::mem::take(&mut form.proxy_password),
         proxy_password_clear: form.proxy_password_clear,
@@ -2760,6 +3079,8 @@ fn form_field_text(form: &ProviderForm) -> &str {
         1 => &form.secret,
         2 => &form.name,
         3 if primary_codex_form(form) => &form.codex_config_name,
+        field if form_context_max_field(form) == Some(field) => &form.context_max,
+        field if form_context_compact_field(form) == Some(field) => &form.context_compact,
         field if field == form_description_field(form) => &form.description,
         field if form_proxy_host_field(form) == Some(field) => &form.network_proxy.manual.host,
         field if form_proxy_port_field(form) == Some(field) => &form.proxy_port,
@@ -2789,7 +3110,47 @@ pub(super) const fn form_auth_field(form: &ProviderForm) -> usize {
 }
 
 pub(super) const fn form_network_proxy_field(form: &ProviderForm) -> usize {
-    if primary_codex_form(form) { 6 } else { 3 }
+    if primary_codex_form(form) {
+        form_image_field(form).unwrap() + 1
+    } else {
+        3
+    }
+}
+
+pub(super) const fn form_context_max_field(form: &ProviderForm) -> Option<usize> {
+    if primary_codex_form(form) && form.codex_tuning.context.enabled {
+        Some(6)
+    } else {
+        None
+    }
+}
+
+pub(super) const fn form_context_compact_field(form: &ProviderForm) -> Option<usize> {
+    if primary_codex_form(form) && form.codex_tuning.context.enabled {
+        Some(7)
+    } else {
+        None
+    }
+}
+
+pub(super) const fn form_reasoning_field(form: &ProviderForm) -> Option<usize> {
+    if primary_codex_form(form) {
+        Some(if form.codex_tuning.context.enabled {
+            8
+        } else {
+            6
+        })
+    } else {
+        None
+    }
+}
+
+pub(super) const fn form_plan_reasoning_field(form: &ProviderForm) -> Option<usize> {
+    if primary_codex_form(form) {
+        Some(form_reasoning_field(form).unwrap() + 1)
+    } else {
+        None
+    }
 }
 
 pub(super) const fn form_proxy_protocol_field(form: &ProviderForm) -> Option<usize> {
@@ -2838,7 +3199,7 @@ pub(super) const fn provider_uses_manual_proxy(form: &ProviderForm) -> bool {
 
 pub(super) const fn form_image_field(form: &ProviderForm) -> Option<usize> {
     if primary_codex_form(form) {
-        Some(5)
+        Some(form_plan_reasoning_field(form).unwrap() + 1)
     } else {
         None
     }
@@ -2897,6 +3258,7 @@ fn take_submission(form: &mut FormSubmission) -> FormSubmission {
         claude_model_mapping: std::mem::take(&mut form.claude_model_mapping),
         scope: form.scope,
         codex_image: std::mem::take(&mut form.codex_image),
+        codex_tuning: form.codex_tuning,
         network_proxy: std::mem::take(&mut form.network_proxy),
         proxy_password: std::mem::take(&mut form.proxy_password),
         proxy_password_clear: form.proxy_password_clear,
@@ -2926,10 +3288,18 @@ fn image_model_picker(
         .collect::<BTreeSet<_>>();
     let mut preferred = form.codex_image.preferred_model.clone();
     if checked.is_empty()
-        && let Some(default) = models
-            .iter()
-            .find(|model| model.eq_ignore_ascii_case("gpt-image-2"))
-            .cloned()
+        && let Some(default) = [
+            "gpt-image-2.5-sunburst",
+            "gpt-image-2.5-flare",
+            "gpt-image-2",
+        ]
+        .iter()
+        .find_map(|candidate| {
+            models
+                .iter()
+                .find(|model| model.eq_ignore_ascii_case(candidate))
+                .cloned()
+        })
     {
         checked.insert(default.clone());
         preferred = Some(default);
@@ -2950,13 +3320,45 @@ fn image_model_picker(
 
 fn image_model_rank(model: &str) -> u8 {
     let model = model.to_ascii_lowercase();
-    if model.contains("gpt-image") {
+    if model == "gpt-image-2.5-sunburst" {
         0
-    } else if model.contains("image") {
+    } else if model == "gpt-image-2.5-flare" {
         1
-    } else {
+    } else if model.contains("gpt-image") {
         2
+    } else if model.contains("image") {
+        3
+    } else {
+        4
     }
+}
+
+fn parse_context_limit(text: &str) -> Result<Option<u64>, ()> {
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let tokens = text.trim().parse::<u64>().map_err(|_| ())?;
+    (tokens > 0 && i64::try_from(tokens).is_ok())
+        .then_some(tokens)
+        .map(Some)
+        .ok_or(())
+}
+
+fn cycle_codex_reasoning_effort(
+    current: CodexReasoningEffort,
+    backwards: bool,
+) -> CodexReasoningEffort {
+    use CodexReasoningEffort::{High, Low, Max, Medium, Ultra, Unchanged, Xhigh};
+    const OPTIONS: [CodexReasoningEffort; 7] = [Unchanged, Low, Medium, High, Xhigh, Ultra, Max];
+    let index = OPTIONS
+        .iter()
+        .position(|option| *option == current)
+        .unwrap_or(0);
+    OPTIONS[if backwards {
+        (index + OPTIONS.len() - 1) % OPTIONS.len()
+    } else {
+        (index + 1) % OPTIONS.len()
+    }]
 }
 
 fn default_stats_screen() -> StatsScreen {

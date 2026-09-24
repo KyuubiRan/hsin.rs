@@ -11,14 +11,14 @@ use rusqlite::{Connection, DatabaseName, OptionalExtension, TransactionBehavior,
 use crate::{
     error::{DaemonError, Result},
     model::{
-        AuthScheme, ClientKind, ClientState, CodexImageConfig, ConnectionMode, Provider,
-        ProviderInput, ProviderProxyConfig, ProviderScope,
+        AuthScheme, ClientKind, ClientState, CodexImageConfig, CodexTuningSettings, ConnectionMode,
+        Provider, ProviderInput, ProviderProxyConfig, ProviderScope,
     },
 };
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
-const PROVIDER_COLUMNS: &str = "p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,EXISTS(SELECT 1 FROM provider_secrets configured WHERE configured.provider_id=p.id),p.claude_model_mapping,p.codex_config_name,p.scope,p.codex_image_enabled,p.codex_image_models,p.codex_image_preferred_model,p.network_proxy,EXISTS(SELECT 1 FROM protected_values proxy_secret WHERE proxy_secret.key='provider_proxy_password:' || p.id)";
+const PROVIDER_COLUMNS: &str = "p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,EXISTS(SELECT 1 FROM provider_secrets configured WHERE configured.provider_id=p.id),p.claude_model_mapping,p.codex_config_name,p.scope,p.codex_image_enabled,p.codex_image_models,p.codex_image_preferred_model,p.network_proxy,EXISTS(SELECT 1 FROM protected_values proxy_secret WHERE proxy_secret.key='provider_proxy_password:' || p.id),p.codex_tuning";
 
 pub struct Database {
     pub(crate) connection: Mutex<Connection>,
@@ -175,6 +175,7 @@ impl Database {
                 .codex_image
                 .normalized()
                 .map_err(|error| DaemonError::Invalid(error.to_string()))?,
+            codex_tuning: input.codex_tuning,
             network_proxy: input.network_proxy.clone(),
             revision: 1,
         })
@@ -190,8 +191,8 @@ impl Database {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = unix_time()?;
         transaction.execute(
-            "INSERT INTO providers(id,client,name,description,base_url,auth_scheme,model,revision,official,claude_model_mapping,codex_config_name,scope,codex_image_enabled,codex_image_models,codex_image_preferred_model,network_proxy,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?17)",
-            params![provider.id, provider.client.to_string(), provider.name, provider.description, provider.base_url, provider.auth_scheme.to_string(), provider.model, provider.revision, provider.official, encode_model_mapping(provider)?, provider.codex_config_name, provider.scope.to_string(), provider.codex_image.enabled, encode_image_models(provider)?, provider.codex_image.preferred_model, encode_network_proxy(provider)?, now],
+            "INSERT INTO providers(id,client,name,description,base_url,auth_scheme,model,revision,official,claude_model_mapping,codex_config_name,scope,codex_image_enabled,codex_image_models,codex_image_preferred_model,network_proxy,codex_tuning,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?18)",
+            params![provider.id, provider.client.to_string(), provider.name, provider.description, provider.base_url, provider.auth_scheme.to_string(), provider.model, provider.revision, provider.official, encode_model_mapping(provider)?, provider.codex_config_name, provider.scope.to_string(), provider.codex_image.enabled, encode_image_models(provider)?, provider.codex_image.preferred_model, encode_network_proxy(provider)?, serde_json::to_string(&provider.codex_tuning)?, now],
         ).map_err(map_constraint)?;
         if let Some(secret) = secret {
             upsert_secret(&transaction, secret, now)?;
@@ -220,8 +221,8 @@ impl Database {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = unix_time()?;
         let changed = transaction.execute(
-            "UPDATE providers SET name=?1,description=?2,base_url=?3,auth_scheme=?4,model=?5,claude_model_mapping=?6,codex_config_name=?7,codex_image_enabled=?8,codex_image_models=?9,codex_image_preferred_model=?10,network_proxy=?11,revision=revision+1,updated_at=?12 WHERE id=?13 AND client=?14 AND scope=?15 AND revision=?16",
-            params![provider.name, provider.description, provider.base_url, provider.auth_scheme.to_string(), provider.model, encode_model_mapping(provider)?, provider.codex_config_name, provider.codex_image.enabled, encode_image_models(provider)?, provider.codex_image.preferred_model, encode_network_proxy(provider)?, now, provider.id, provider.client.to_string(), provider.scope.to_string(), expected_revision],
+            "UPDATE providers SET name=?1,description=?2,base_url=?3,auth_scheme=?4,model=?5,claude_model_mapping=?6,codex_config_name=?7,codex_image_enabled=?8,codex_image_models=?9,codex_image_preferred_model=?10,network_proxy=?11,codex_tuning=?12,revision=revision+1,updated_at=?13 WHERE id=?14 AND client=?15 AND scope=?16 AND revision=?17",
+            params![provider.name, provider.description, provider.base_url, provider.auth_scheme.to_string(), provider.model, encode_model_mapping(provider)?, provider.codex_config_name, provider.codex_image.enabled, encode_image_models(provider)?, provider.codex_image.preferred_model, encode_network_proxy(provider)?, serde_json::to_string(&provider.codex_tuning)?, now, provider.id, provider.client.to_string(), provider.scope.to_string(), expected_revision],
         ).map_err(map_constraint)?;
         if changed == 0 {
             return Err(DaemonError::Conflict(
@@ -656,7 +657,7 @@ fn migrate(connection: &Connection) -> Result<()> {
     if version == 0 {
         connection.execute_batch(
             r#"BEGIN IMMEDIATE;
-         CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY,client TEXT NOT NULL CHECK(client IN ('codex','claude')),name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',base_url TEXT NOT NULL,auth_scheme TEXT NOT NULL CHECK(auth_scheme IN ('bearer','x_api_key','oauth')),model TEXT,revision INTEGER NOT NULL,official INTEGER NOT NULL DEFAULT 0,claude_model_mapping TEXT,codex_config_name TEXT,scope TEXT NOT NULL DEFAULT 'primary' CHECK(scope IN ('primary','image_only')),codex_image_enabled INTEGER NOT NULL DEFAULT 0,codex_image_models TEXT NOT NULL DEFAULT '[]',codex_image_preferred_model TEXT,network_proxy TEXT NOT NULL DEFAULT '{"mode":"inherit","manual":{"protocol":"http","host":"127.0.0.1","port":7890,"username":"","password_configured":false}}',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(client,scope,name));
+         CREATE TABLE IF NOT EXISTS providers(id TEXT PRIMARY KEY,client TEXT NOT NULL CHECK(client IN ('codex','claude')),name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',base_url TEXT NOT NULL,auth_scheme TEXT NOT NULL CHECK(auth_scheme IN ('bearer','x_api_key','oauth')),model TEXT,revision INTEGER NOT NULL,official INTEGER NOT NULL DEFAULT 0,claude_model_mapping TEXT,codex_config_name TEXT,scope TEXT NOT NULL DEFAULT 'primary' CHECK(scope IN ('primary','image_only')),codex_image_enabled INTEGER NOT NULL DEFAULT 0,codex_image_models TEXT NOT NULL DEFAULT '[]',codex_image_preferred_model TEXT,network_proxy TEXT NOT NULL DEFAULT '{"mode":"inherit","manual":{"protocol":"http","host":"127.0.0.1","port":7890,"username":"","password_configured":false}}',codex_tuning TEXT NOT NULL DEFAULT '{}',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(client,scope,name));
          CREATE TABLE IF NOT EXISTS provider_secrets(provider_id TEXT PRIMARY KEY REFERENCES providers(id) ON DELETE CASCADE,key_version INTEGER NOT NULL,nonce BLOB NOT NULL,ciphertext BLOB NOT NULL,updated_at INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS client_state(client TEXT PRIMARY KEY CHECK(client IN ('codex','claude')),active_provider_id TEXT REFERENCES providers(id),mode TEXT NOT NULL CHECK(mode IN ('direct','proxy')),config_status TEXT NOT NULL,updated_at INTEGER NOT NULL);
          CREATE TABLE IF NOT EXISTS codex_image_state(id INTEGER PRIMARY KEY CHECK(id=1),active_provider_id TEXT REFERENCES providers(id) ON DELETE SET NULL,updated_at INTEGER NOT NULL);
@@ -674,7 +675,7 @@ fn migrate(connection: &Connection) -> Result<()> {
          INSERT OR IGNORE INTO client_state(client,mode,config_status,updated_at) VALUES('codex','direct','unmanaged',0),('claude','direct','unmanaged',0);
          INSERT OR IGNORE INTO codex_image_state(id,active_provider_id,updated_at) VALUES(1,NULL,0);
          INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES('language','system',0),('proxy_host','127.0.0.1',0),('proxy_port','9999',0),('proxy_enabled','false',0),('upstream_proxy','{"mode":"direct","manual":{"protocol":"http","host":"127.0.0.1","port":7890,"username":"","password_configured":false}}',0);
-         PRAGMA user_version=9;
+         PRAGMA user_version=10;
          COMMIT;"#
         )?;
     } else {
@@ -768,6 +769,15 @@ fn migrate(connection: &Connection) -> Result<()> {
                  CREATE INDEX usage_routes_lookup_idx ON usage_routes(client,effective_at DESC);
                  CREATE TABLE usage_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL);
                  PRAGMA user_version=9;
+                 COMMIT;",
+            )?;
+            version = 9;
+        }
+        if version == 9 {
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE providers ADD COLUMN codex_tuning TEXT NOT NULL DEFAULT '{}';
+                 PRAGMA user_version=10;
                  COMMIT;",
             )?;
         }
@@ -885,6 +895,14 @@ fn provider_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Provider> {
             preferred_model: row.get(15)?,
         },
         network_proxy,
+        codex_tuning: serde_json::from_str::<CodexTuningSettings>(&row.get::<_, String>(18)?)
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    18,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
         claude_model_mapping: mapping
             .as_deref()
             .map(serde_json::from_str)
@@ -930,10 +948,10 @@ fn provider_secret_from_row(
 ) -> rusqlite::Result<(Provider, EncryptedSecret)> {
     let provider = provider_from_row(row)?;
     let secret = EncryptedSecret {
-        provider_id: row.get(18)?,
-        key_version: row.get(19)?,
-        nonce: row.get(20)?,
-        ciphertext: row.get(21)?,
+        provider_id: row.get(19)?,
+        key_version: row.get(20)?,
+        nonce: row.get(21)?,
+        ciphertext: row.get(22)?,
     };
     Ok((provider, secret))
 }
@@ -976,17 +994,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn version_nine_providers_gain_independent_codex_tuning() {
+        let root = std::env::temp_dir().join(format!("hsind-v9-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("db.sqlite");
+        let backups = root.join("backups");
+        let db = Database::open(&path, &backups).unwrap();
+        let provider = db
+            .add_provider(&ProviderInput {
+                client: ClientKind::Codex,
+                name: "Existing".into(),
+                description: String::new(),
+                base_url: "https://example.test/v1".into(),
+                auth_scheme: AuthScheme::Bearer,
+                model: None,
+                codex_config_name: None,
+                claude_model_mapping: None,
+                scope: ProviderScope::Primary,
+                codex_image: CodexImageConfig::default(),
+                codex_tuning: CodexTuningSettings::default(),
+                network_proxy: ProviderProxyConfig::default(),
+            })
+            .unwrap();
+        drop(db);
+
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("ALTER TABLE providers DROP COLUMN codex_tuning; PRAGMA user_version=9;")
+            .unwrap();
+        drop(connection);
+
+        let db = Database::open(&path, &backups).unwrap();
+        assert_eq!(database_version(&path).unwrap(), 10);
+        let restored = db.get_provider(&provider.id).unwrap();
+        assert_eq!(restored.name, "Existing");
+        assert_eq!(restored.codex_tuning, CodexTuningSettings::default());
+        assert_eq!(fs::read_dir(backups).unwrap().count(), 1);
+        drop(db);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn version_eight_database_is_backed_up_and_gains_usage_tables() {
         let root = std::env::temp_dir().join(format!("hsind-v8-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("db.sqlite");
         let connection = Connection::open(&path).unwrap();
-        connection.execute_batch("PRAGMA user_version=8;").unwrap();
+        connection
+            .execute_batch("CREATE TABLE providers(id TEXT PRIMARY KEY); PRAGMA user_version=8;")
+            .unwrap();
         drop(connection);
 
         let backups = root.join("backups");
         let db = Database::open(&path, &backups).unwrap();
-        assert_eq!(database_version(&path).unwrap(), 9);
+        assert_eq!(database_version(&path).unwrap(), 10);
         for table in [
             "usage_events",
             "usage_sync_cursors",
@@ -1032,6 +1093,7 @@ mod tests {
                 claude_model_mapping: None,
                 scope: ProviderScope::Primary,
                 codex_image: CodexImageConfig::default(),
+                codex_tuning: CodexTuningSettings::default(),
                 network_proxy: ProviderProxyConfig::default(),
             })
             .unwrap();
@@ -1051,6 +1113,7 @@ mod tests {
             claude_model_mapping: None,
             scope: ProviderScope::Primary,
             codex_image: CodexImageConfig::default(),
+            codex_tuning: CodexTuningSettings::default(),
             network_proxy: ProviderProxyConfig::default(),
         })
         .unwrap();
@@ -1067,6 +1130,7 @@ mod tests {
             claude_model_mapping: None,
             scope: ProviderScope::Primary,
             codex_image: CodexImageConfig::default(),
+            codex_tuning: CodexTuningSettings::default(),
             network_proxy: ProviderProxyConfig::default(),
         })
         .unwrap();
@@ -1147,6 +1211,7 @@ mod tests {
             claude_model_mapping: None,
             scope: ProviderScope::Primary,
             codex_image: CodexImageConfig::default(),
+            codex_tuning: CodexTuningSettings::default(),
             network_proxy: ProviderProxyConfig {
                 mode: hsin_core::ProviderProxyMode::Manual,
                 manual: hsin_core::ManualProxyConfig {
@@ -1210,6 +1275,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn image_scope_filtering_and_active_lifecycle_are_independent() {
         let root = std::env::temp_dir().join(format!("hsind-image-db-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
@@ -1231,6 +1297,7 @@ mod tests {
                 claude_model_mapping: None,
                 scope: ProviderScope::Primary,
                 codex_image: CodexImageConfig::default(),
+                codex_tuning: CodexTuningSettings::default(),
                 network_proxy: ProviderProxyConfig::default(),
             })
             .unwrap();
@@ -1246,6 +1313,7 @@ mod tests {
                 claude_model_mapping: None,
                 scope: ProviderScope::ImageOnly,
                 codex_image: image(true),
+                codex_tuning: CodexTuningSettings::default(),
                 network_proxy: ProviderProxyConfig::default(),
             })
             .unwrap();
@@ -1268,6 +1336,7 @@ mod tests {
                 claude_model_mapping: None,
                 scope: ProviderScope::ImageOnly,
                 codex_image: image(true),
+                codex_tuning: CodexTuningSettings::default(),
                 network_proxy: ProviderProxyConfig::default(),
             })
             .unwrap();
@@ -1338,7 +1407,7 @@ mod tests {
         assert_eq!(provider.scope, ProviderScope::Primary);
         assert!(provider.codex_image.is_inert());
         assert!(db.image_active_provider_id().unwrap().is_none());
-        assert_eq!(database_version(&path).unwrap(), 9);
+        assert_eq!(database_version(&path).unwrap(), 10);
         assert_eq!(fs::read_dir(backups).unwrap().count(), 1);
         drop(db);
         fs::remove_dir_all(root).unwrap();
@@ -1366,7 +1435,7 @@ mod tests {
 
         let backups = root.join("backups");
         let db = Database::open(&path, &backups).unwrap();
-        assert_eq!(database_version(&path).unwrap(), 9);
+        assert_eq!(database_version(&path).unwrap(), 10);
         assert_eq!(
             db.get_provider("p").unwrap().network_proxy,
             ProviderProxyConfig::default()
@@ -1421,7 +1490,7 @@ mod tests {
         assert_eq!(provider.model, None);
         assert!(!provider.official);
         assert!(!provider.credential_configured);
-        assert_eq!(database_version(&path).unwrap(), 9);
+        assert_eq!(database_version(&path).unwrap(), 10);
         assert_eq!(
             provider.codex_config_name.as_deref(),
             Some(hsin_core::DEFAULT_CODEX_CONFIG_NAME)
@@ -1463,7 +1532,7 @@ mod tests {
             db.setting("proxy_enabled").unwrap().as_deref(),
             Some("true")
         );
-        assert_eq!(database_version(&path).unwrap(), 9);
+        assert_eq!(database_version(&path).unwrap(), 10);
         assert_eq!(
             provider.codex_config_name.as_deref(),
             Some(hsin_core::DEFAULT_CODEX_CONFIG_NAME)
@@ -1495,7 +1564,7 @@ mod tests {
             ciphertext: vec![1],
         })
         .unwrap();
-        assert_eq!(database_version(&path).unwrap(), 9);
+        assert_eq!(database_version(&path).unwrap(), 10);
         assert!(db.protected_value("backup").unwrap().is_some());
         drop(db);
         fs::remove_dir_all(root).unwrap();
@@ -1523,7 +1592,7 @@ mod tests {
         drop(connection);
 
         let db = Database::open(&path, &root.join("backups")).unwrap();
-        assert_eq!(database_version(&path).unwrap(), 9);
+        assert_eq!(database_version(&path).unwrap(), 10);
         // Rows written before the column existed read back as "no mapping", not as an error.
         let provider = db.get_provider("p").unwrap();
         assert_eq!(provider.claude_model_mapping, None);
@@ -1572,7 +1641,7 @@ mod tests {
         drop(connection);
 
         let db = Database::open(&path, &root.join("backups")).unwrap();
-        assert_eq!(database_version(&path).unwrap(), 9);
+        assert_eq!(database_version(&path).unwrap(), 10);
         assert_eq!(
             db.get_provider("custom")
                 .unwrap()

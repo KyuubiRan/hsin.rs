@@ -2,12 +2,13 @@ use super::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hsin_core::{
     AuthScheme, ClaudeModelMapping, ClaudeModelMappingUpdate, ClientKind, ClientSettings,
-    CodexConfigNameUpdate, CodexImageConfig, ConnectionMode, DEFAULT_CODEX_CONFIG_NAME,
-    HSIN_CODEX_CONFIG_NAME, LANGUAGE_EN_US, LANGUAGE_SYSTEM, LANGUAGE_ZH_CN, ModelDiscovery,
-    ModelSlot, ModelUpdate, OPENAI_CODEX_CONFIG_NAME, Provider, ProviderProxyMode, ProviderScope,
-    ProxyProtocol, SecretInput, Settings, UpstreamProxyMode, UsageAttributionCounts,
-    UsageDailyBucket, UsageFilterOptions, UsageModelBreakdown, UsageProviderBreakdown,
-    UsageProviderOption, UsageStatsQuery, UsageStatsReport, UsageTokenSummary,
+    CodexConfigNameUpdate, CodexContextOverride, CodexImageConfig, CodexReasoningEffort,
+    CodexTuningSettings, ConnectionMode, DEFAULT_CODEX_CONFIG_NAME, HSIN_CODEX_CONFIG_NAME,
+    LANGUAGE_EN_US, LANGUAGE_SYSTEM, LANGUAGE_ZH_CN, ModelDiscovery, ModelSlot, ModelUpdate,
+    OPENAI_CODEX_CONFIG_NAME, Provider, ProviderProxyMode, ProviderScope, ProxyProtocol,
+    SecretInput, Settings, UpstreamProxyMode, UsageAttributionCounts, UsageDailyBucket,
+    UsageFilterOptions, UsageModelBreakdown, UsageProviderBreakdown, UsageProviderOption,
+    UsageStatsQuery, UsageStatsReport, UsageTokenSummary,
 };
 use ratatui::{
     backend::TestBackend,
@@ -20,10 +21,11 @@ use super::{
     effects::{provider_add_params, provider_edit_params},
     screens::{TITLE, VERSION_LABEL, form_field_areas},
     state::{
-        DELETE_CONFIRM_WINDOW, FormSubmission, HomeSection, ImageModelPicker, InputMode,
-        ModelPicker, ModelPickerMode, ProviderClipboard, ProviderForm, SettingsPage,
+        ContextKind, DELETE_CONFIRM_WINDOW, FormSubmission, HomeSection, ImageModelPicker,
+        InputMode, ModelPicker, ModelPickerMode, ProviderClipboard, ProviderForm, SettingsPage,
         SettingsScreen, form_field_count, form_image_field, form_network_proxy_field,
-        form_proxy_password_field, form_proxy_protocol_field, take_form_submission,
+        form_plan_reasoning_field, form_proxy_password_field, form_proxy_protocol_field,
+        new_provider_form, take_form_submission,
     },
     theme::{INPUT_BG, RED, WHITE},
     widgets::centered_fixed,
@@ -117,6 +119,7 @@ fn submission() -> FormSubmission {
         claude_model_mapping: ClaudeModelMappingUpdate::Preserve,
         scope: hsin_core::ProviderScope::Primary,
         codex_image: hsin_core::CodexImageConfig::default(),
+        codex_tuning: CodexTuningSettings::default(),
         network_proxy: hsin_core::ProviderProxyConfig::default(),
         proxy_password: Zeroizing::new(String::new()),
         proxy_password_clear: false,
@@ -140,6 +143,7 @@ fn example_provider() -> Provider {
         claude_model_mapping: None,
         scope: hsin_core::ProviderScope::Primary,
         codex_image: hsin_core::CodexImageConfig::default(),
+        codex_tuning: CodexTuningSettings::default(),
         network_proxy: hsin_core::ProviderProxyConfig::default(),
         revision: 1,
     }
@@ -213,13 +217,13 @@ fn codex_image_checkbox_flows_from_primary_model_to_ranked_multi_select() {
     form.base_url = "https://images.example.test/v1".into();
     form.secret = Zeroizing::new("secret".into());
     form.name = "Images".into();
-    form.field = 5;
+    form.field = form_image_field(form).unwrap();
     state.reduce(key(KeyCode::Char(' ')));
     let InputMode::Form(form) = &mut state.input else {
         panic!("checkbox must stay in the form");
     };
     assert!(form.codex_image.enabled);
-    form.field = 7;
+    form.field = form_field_count(form) - 1;
     state.reduce(key(KeyCode::Enter));
     let Some(Effect::DiscoverModels(form)) = state.take_effect() else {
         panic!("form must discover models");
@@ -262,6 +266,46 @@ fn codex_image_checkbox_flows_from_primary_model_to_ranked_multi_select() {
         submission.codex_image.preferred_model.as_deref(),
         Some("gpt-image-1")
     );
+}
+
+#[test]
+fn new_image_provider_prefers_sunburst_then_flare_when_discovered() {
+    let mut state = State::default();
+    let mut form = submission();
+    form.scope = ProviderScope::ImageOnly;
+    form.codex_image.enabled = true;
+    state.reduce(Action::ModelsDiscovered {
+        form,
+        discovery: ModelDiscovery {
+            resolved_base_url: "https://api.example.test/v1".into(),
+            models: vec![
+                "gpt-image-2".into(),
+                "gpt-image-2.5-flare".into(),
+                "gpt-image-2.5-sunburst".into(),
+            ],
+        },
+    });
+    let InputMode::ImageModels(picker) = &state.input else {
+        panic!("expected image model picker");
+    };
+    assert_eq!(picker.models[0], "gpt-image-2.5-sunburst");
+    assert_eq!(picker.preferred.as_deref(), Some("gpt-image-2.5-sunburst"));
+    assert_eq!(picker.checked.len(), 1);
+
+    let mut form = submission();
+    form.scope = ProviderScope::ImageOnly;
+    form.codex_image.enabled = true;
+    state.reduce(Action::ModelsDiscovered {
+        form,
+        discovery: ModelDiscovery {
+            resolved_base_url: "https://api.example.test/v1".into(),
+            models: vec!["gpt-image-2".into(), "gpt-image-2.5-flare".into()],
+        },
+    });
+    let InputMode::ImageModels(picker) = &state.input else {
+        panic!("expected image model picker");
+    };
+    assert_eq!(picker.preferred.as_deref(), Some("gpt-image-2.5-flare"));
 }
 
 #[test]
@@ -422,6 +466,9 @@ fn a_second_d_only_deletes_while_the_confirmation_is_still_armed() {
             .all(|cell| cell.fg == RED)
     );
 
+    if let InputMode::DeleteConfirm { expires_at, .. } = &mut state.input {
+        *expires_at = std::time::Instant::now() + DELETE_CONFIRM_WINDOW;
+    }
     state.reduce(Action::Tick);
     assert!(
         matches!(state.input, InputMode::DeleteConfirm { .. }),
@@ -463,6 +510,7 @@ fn client_switching_follows_visibility_and_configured_order() {
         client_settings: ClientSettings {
             order: vec![ClientKind::Claude, ClientKind::Codex],
             visible: vec![ClientKind::Claude, ClientKind::Codex],
+            ..ClientSettings::default()
         },
         ..State::default()
     };
@@ -486,6 +534,7 @@ fn loaded_settings_switch_away_from_a_hidden_current_client() {
             clients: ClientSettings {
                 order: vec![ClientKind::Codex, ClientKind::Claude],
                 visible: vec![ClientKind::Claude],
+                ..ClientSettings::default()
             },
             ..Settings::default()
         },
@@ -537,7 +586,7 @@ fn client_order_moves_the_selected_client_before_saving() {
     state.reduce(key(KeyCode::Enter));
     assert!(matches!(
         state.take_effect(),
-        Some(Effect::SetClients(ClientSettings { order, visible }))
+        Some(Effect::SetClients(ClientSettings { order, visible, .. }))
             if order == [ClientKind::Claude, ClientKind::Codex]
                 && visible == [ClientKind::Claude, ClientKind::Codex]
     ));
@@ -611,6 +660,269 @@ fn codex_client_configuration_toggles_official_auth_preservation() {
         state.take_effect(),
         Some(Effect::SetCodexOfficialAuthPreservation(false))
     ));
+}
+
+#[test]
+fn codex_provider_form_chooses_context_presets_from_tab_list() {
+    let mut form = new_provider_form(ClientKind::Codex, ProviderScope::Primary);
+    form.base_url = "https://api.example.test/v1".into();
+    form.secret = Zeroizing::new("secret".into());
+    let mut state = State {
+        loading: false,
+        input: InputMode::Form(form),
+        ..State::default()
+    };
+    for _ in 0..5 {
+        state.reduce(key(KeyCode::Down));
+    }
+    state.reduce(key(KeyCode::Right));
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Tab));
+    assert!(matches!(state.input, InputMode::ContextPicker(_)));
+    let rendered = render(&mut state, 100, 32);
+    assert!(rendered.contains("272000"));
+    assert!(rendered.contains("1000000"));
+    assert!(rendered.contains("Leave empty"));
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Enter));
+    let InputMode::Form(form) = &state.input else {
+        panic!("expected form");
+    };
+    assert_eq!(form.context_max, "272000");
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Tab));
+    state.reduce(key(KeyCode::Tab));
+    assert!(matches!(state.input, InputMode::ContextPicker(_)));
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Enter));
+    let InputMode::Form(form) = &mut state.input else {
+        panic!("expected provider form");
+    };
+    assert_eq!(form.field, 7);
+    assert_eq!(form_image_field(form), Some(10));
+    let submission = take_form_submission(form).unwrap();
+    assert_eq!(
+        submission.codex_tuning.context,
+        CodexContextOverride {
+            enabled: true,
+            max_tokens: Some(272_000),
+            compact_tokens: Some(900_000),
+        }
+    );
+    assert_eq!(
+        provider_add_params(submission)
+            .provider
+            .codex_tuning
+            .context
+            .max_tokens,
+        Some(272_000)
+    );
+}
+
+#[test]
+fn context_picker_can_clear_or_cancel_without_losing_manual_input() {
+    let mut form = new_provider_form(ClientKind::Codex, ProviderScope::Primary);
+    form.codex_tuning.context.enabled = true;
+    form.field = 6;
+    form.context_max = "123456".into();
+    let mut state = State {
+        input: InputMode::Form(form),
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Tab));
+    state.reduce(key(KeyCode::Esc));
+    assert!(matches!(&state.input, InputMode::Form(form) if form.context_max == "123456"));
+    state.reduce(key(KeyCode::Tab));
+    state.reduce(key(KeyCode::Enter));
+    assert!(matches!(&state.input, InputMode::Form(form) if form.context_max.is_empty()));
+}
+
+#[test]
+fn codex_context_presets_add_sorted_and_delete_on_second_d() {
+    let mut state = State {
+        loading: false,
+        input: InputMode::Settings(SettingsScreen {
+            selected: 2,
+            page: SettingsPage::ClientConfig {
+                client: ClientKind::Codex,
+                selected: 2,
+            },
+        }),
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Enter));
+    assert!(matches!(
+        &state.input,
+        InputMode::Settings(SettingsScreen {
+            page: SettingsPage::ContextPresets { .. },
+            ..
+        })
+    ));
+    state.reduce(key(KeyCode::Char('a')));
+    let rendered = render(&mut state, 80, 24);
+    assert!(rendered.contains("Add preset"));
+    assert!(rendered.contains("Tokens"));
+    for digit in "500000".chars() {
+        state.reduce(key(KeyCode::Char(digit)));
+    }
+    state.reduce(key(KeyCode::Enter));
+    let Some(Effect::SetClients(updated)) = state.take_effect() else {
+        panic!("expected settings save");
+    };
+    assert_eq!(
+        updated.codex_context_max_presets,
+        [272_000, 500_000, 1_000_000]
+    );
+    state.client_settings = updated;
+    state.loading = false;
+    state.reduce(key(KeyCode::Char('d')));
+    assert!(state.take_effect().is_none());
+    state.reduce(key(KeyCode::Char('d')));
+    let Some(Effect::SetClients(updated)) = state.take_effect() else {
+        panic!("expected settings save");
+    };
+    assert_eq!(updated.codex_context_max_presets, [272_000, 1_000_000]);
+    assert_eq!(updated.codex_context_compact_presets, [258_000, 900_000]);
+}
+
+#[test]
+fn codex_context_preset_editor_prefills_reorders_and_rejects_duplicates() {
+    let mut state = State {
+        loading: false,
+        input: InputMode::Settings(SettingsScreen {
+            selected: 2,
+            page: SettingsPage::ContextPresets {
+                kind: ContextKind::Compact,
+                selected: 1,
+                editor: None,
+                delete_armed: None,
+            },
+        }),
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Char('e')));
+    let rendered = render(&mut state, 80, 24);
+    assert!(rendered.contains("Edit preset"));
+    assert!(rendered.contains("900000"));
+    state.reduce(Action::Key(KeyEvent::new(
+        KeyCode::Char('u'),
+        KeyModifiers::CONTROL,
+    )));
+    for digit in "100000".chars() {
+        state.reduce(key(KeyCode::Char(digit)));
+    }
+    state.reduce(key(KeyCode::Enter));
+    let Some(Effect::SetClients(updated)) = state.take_effect() else {
+        panic!("expected settings save");
+    };
+    assert_eq!(updated.codex_context_compact_presets, [100_000, 258_000]);
+    assert!(matches!(
+        &state.input,
+        InputMode::Settings(SettingsScreen {
+            page: SettingsPage::ContextPresets {
+                selected: 0,
+                editor: None,
+                ..
+            },
+            ..
+        })
+    ));
+
+    state.client_settings = updated;
+    state.loading = false;
+    state.reduce(key(KeyCode::Char('e')));
+    state.reduce(Action::Key(KeyEvent::new(
+        KeyCode::Char('u'),
+        KeyModifiers::CONTROL,
+    )));
+    for digit in "258000".chars() {
+        state.reduce(key(KeyCode::Char(digit)));
+    }
+    state.reduce(key(KeyCode::Enter));
+    assert!(state.take_effect().is_none());
+    assert_eq!(state.notice.as_deref(), Some("@context_preset_duplicate"));
+    state.reduce(key(KeyCode::Esc));
+    assert!(matches!(
+        &state.input,
+        InputMode::Settings(SettingsScreen {
+            page: SettingsPage::ContextPresets { editor: None, .. },
+            ..
+        })
+    ));
+    assert_eq!(
+        state.client_settings.codex_context_compact_presets,
+        [100_000, 258_000]
+    );
+}
+
+#[test]
+fn codex_provider_form_cycles_reasoning_effort_without_global_settings() {
+    let mut form = new_provider_form(ClientKind::Codex, ProviderScope::Primary);
+    form.field = 6;
+    let mut state = State {
+        loading: false,
+        input: InputMode::Form(form),
+        ..State::default()
+    };
+    for expected in [
+        CodexReasoningEffort::Low,
+        CodexReasoningEffort::Medium,
+        CodexReasoningEffort::High,
+        CodexReasoningEffort::Xhigh,
+        CodexReasoningEffort::Ultra,
+        CodexReasoningEffort::Max,
+        CodexReasoningEffort::Unchanged,
+    ] {
+        state.reduce(key(KeyCode::Right));
+        let InputMode::Form(form) = &state.input else {
+            panic!("expected provider form");
+        };
+        assert_eq!(form.codex_tuning.reasoning_effort, expected);
+    }
+    state.reduce(key(KeyCode::Left));
+    let InputMode::Form(form) = &state.input else {
+        panic!("expected provider form");
+    };
+    assert_eq!(
+        form.codex_tuning.reasoning_effort,
+        CodexReasoningEffort::Max
+    );
+}
+
+#[test]
+fn codex_provider_form_cycles_plan_mode_reasoning_independently() {
+    let mut form = new_provider_form(ClientKind::Codex, ProviderScope::Primary);
+    form.field = form_plan_reasoning_field(&form).unwrap();
+    let mut state = State {
+        loading: false,
+        input: InputMode::Form(form),
+        ..State::default()
+    };
+    let rendered = render(&mut state, 100, 32);
+    assert!(rendered.contains("Plan mode reasoning effort"));
+    assert!(rendered.contains("‹ Do not modify ›"));
+    state.reduce(key(KeyCode::Right));
+    let InputMode::Form(form) = &state.input else {
+        panic!("expected provider form");
+    };
+    assert_eq!(
+        form.codex_tuning.reasoning_effort,
+        CodexReasoningEffort::Unchanged
+    );
+    assert_eq!(
+        form.codex_tuning.plan_mode_reasoning_effort,
+        CodexReasoningEffort::Low
+    );
+    state.reduce(key(KeyCode::Left));
+    let InputMode::Form(form) = &state.input else {
+        panic!("expected provider form");
+    };
+    assert_eq!(
+        form.codex_tuning.plan_mode_reasoning_effort,
+        CodexReasoningEffort::Unchanged
+    );
+    assert_eq!(form_image_field(form), Some(form.field + 1));
 }
 
 #[test]
@@ -1045,25 +1357,25 @@ fn provider_proxy_defaults_to_global_and_expands_manual_override_fields() {
         ..State::default()
     };
     state.reduce(key(KeyCode::Char('a')));
-    for _ in 0..6 {
+    for _ in 0..9 {
         state.reduce(key(KeyCode::Down));
     }
     assert!(matches!(
         &state.input,
         InputMode::Form(form)
             if form.network_proxy.mode == ProviderProxyMode::Inherit
-                && form.field == 6
-                && form_field_count(form) == 9
+                && form.field == 9
+                && form_field_count(form) == 12
     ));
     state.reduce(key(KeyCode::Left));
     assert!(matches!(
         &state.input,
         InputMode::Form(form)
             if form.network_proxy.mode == ProviderProxyMode::Manual
-                && form.field == 6
-                && form_field_count(form) == 14
-                && form_proxy_protocol_field(form) == Some(7)
-                && form_proxy_password_field(form) == Some(11)
+                && form.field == 9
+                && form_field_count(form) == 17
+                && form_proxy_protocol_field(form) == Some(10)
+                && form_proxy_password_field(form) == Some(14)
     ));
     state.reduce(key(KeyCode::Right));
     assert!(matches!(
@@ -1155,7 +1467,7 @@ fn proxy_settings_edits_address_and_port_while_enabled() {
 #[test]
 fn client_configuration_imports_the_corresponding_current_provider() {
     for client in ClientKind::ALL {
-        let import_index = 2;
+        let import_index = if client == ClientKind::Codex { 4 } else { 2 };
         let mut state = State {
             input: InputMode::Settings(SettingsScreen {
                 selected: match client {
@@ -1350,6 +1662,9 @@ fn add_form_defaults_empty_name_to_base_url_host() {
         claude_model_mapping: None,
         scope: hsin_core::ProviderScope::Primary,
         codex_image: hsin_core::CodexImageConfig::default(),
+        codex_tuning: CodexTuningSettings::default(),
+        context_max: String::new(),
+        context_compact: String::new(),
         network_proxy: hsin_core::ProviderProxyConfig::default(),
         proxy_port: hsin_core::ManualProxyConfig::default().port.to_string(),
         proxy_password: Zeroizing::new(String::new()),
@@ -1399,8 +1714,9 @@ fn codex_form_uses_choice_fields_for_remote_compaction_and_image_generation() {
     assert!(rendered.contains("‹ disabled ›"));
     assert!(!rendered.contains("‹ enabled ›"));
 
-    state.reduce(key(KeyCode::Down));
-    state.reduce(key(KeyCode::Down));
+    for _ in 0..5 {
+        state.reduce(key(KeyCode::Down));
+    }
     state.reduce(key(KeyCode::Char(' ')));
     let rendered = render(&mut state, 100, 32);
     assert!(rendered.contains("Configure image generation"));
@@ -1588,7 +1904,7 @@ fn short_terminal_scrolls_the_form_to_the_selected_field() {
             .any(|cell| cell.symbol() == "v" && cell.fg == WHITE)
     );
 
-    for _ in 0..4 {
+    for _ in 0..6 {
         state.reduce(key(KeyCode::Down));
     }
     terminal
@@ -1606,7 +1922,7 @@ fn short_terminal_scrolls_the_form_to_the_selected_field() {
             .any(|cell| cell.symbol() == "v" && cell.fg == WHITE)
     );
 
-    for _ in 0..4 {
+    for _ in 0..5 {
         state.reduce(key(KeyCode::Down));
     }
     terminal
@@ -1826,7 +2142,7 @@ fn localized_form_has_input_background_and_context_help() {
     };
     state.reduce(key(KeyCode::Char('a')));
     let locale = I18n::new(Some("zh-CN"));
-    let mut terminal = Terminal::new(TestBackend::new(100, 32)).expect("test terminal");
+    let mut terminal = Terminal::new(TestBackend::new(100, 48)).expect("test terminal");
     terminal
         .draw(|frame| draw(frame, &mut state, &locale))
         .expect("draw form");
@@ -1913,7 +2229,7 @@ fn form_renders_fields_in_requested_order() {
     };
     state.reduce(key(KeyCode::Char('a')));
     let locale = I18n::new(Some("en-US"));
-    let mut terminal = Terminal::new(TestBackend::new(80, 32)).expect("test terminal");
+    let mut terminal = Terminal::new(TestBackend::new(80, 48)).expect("test terminal");
     terminal
         .draw(|frame| draw(frame, &mut state, &locale))
         .expect("draw form");
@@ -1930,12 +2246,78 @@ fn form_renders_fields_in_requested_order() {
         "Name",
         "Config name",
         "Remote compaction",
+        "Context override",
+        "Reasoning effort",
         "Configure image generation",
         "Description",
         "Auth",
     ]
     .map(|label| rendered.find(label).expect("field label must render"));
     assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(!rendered.contains("Maximum context"));
+    assert!(rendered.contains("‹ disabled ›"));
+    assert!(rendered.contains("‹ Do not modify ›"));
+
+    for _ in 0..5 {
+        state.reduce(key(KeyCode::Down));
+    }
+    state.reduce(key(KeyCode::Right));
+    terminal
+        .draw(|frame| draw(frame, &mut state, &locale))
+        .expect("draw expanded provider form");
+    let enabled_context = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>();
+    assert!(enabled_context.contains("‹ enabled ›"));
+    assert!(enabled_context.contains("Maximum context"));
+    assert!(enabled_context.contains("Auto-compaction threshold"));
+    let positions = [
+        "Context override",
+        "Maximum context",
+        "Auto-compaction threshold",
+        "Reasoning effort",
+        "Configure image generation",
+    ]
+    .map(|label| {
+        enabled_context
+            .find(label)
+            .expect("expanded field must render")
+    });
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+
+    state.reduce(key(KeyCode::Left));
+    terminal
+        .draw(|frame| draw(frame, &mut state, &locale))
+        .expect("draw collapsed provider form");
+    let disabled_context = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>();
+    assert!(!disabled_context.contains("Maximum context"));
+    assert!(!disabled_context.contains("Auto-compaction threshold"));
+
+    let chinese = I18n::new(Some("zh-CN"));
+    let mut chinese_terminal = Terminal::new(TestBackend::new(80, 48)).expect("test terminal");
+    chinese_terminal
+        .draw(|frame| draw(frame, &mut state, &chinese))
+        .expect("draw localized provider form");
+    let localized = chinese_terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>();
+    let localized = localized.replace(' ', "");
+    assert!(localized.contains("‹已关闭›"));
+    assert!(localized.contains("‹不修改›"));
 }
 
 #[test]
@@ -2117,6 +2499,7 @@ fn header_respects_client_visibility_and_order() {
         client_settings: ClientSettings {
             order: vec![ClientKind::Claude, ClientKind::Codex],
             visible: vec![ClientKind::Claude, ClientKind::Codex],
+            ..ClientSettings::default()
         },
         loading: false,
         ..State::default()
@@ -2827,6 +3210,9 @@ fn claude_form(mapping: Option<ClaudeModelMapping>) -> ProviderForm {
         claude_model_mapping: mapping,
         scope: hsin_core::ProviderScope::Primary,
         codex_image: hsin_core::CodexImageConfig::default(),
+        codex_tuning: CodexTuningSettings::default(),
+        context_max: String::new(),
+        context_compact: String::new(),
         network_proxy: hsin_core::ProviderProxyConfig::default(),
         proxy_port: hsin_core::ManualProxyConfig::default().port.to_string(),
         proxy_password: Zeroizing::new(String::new()),
@@ -2881,6 +3267,19 @@ fn a_claude_form_opens_the_mapping_dialog_instead_of_saving_immediately() {
     let mut state = mapping_state(None);
     assert!(matches!(state.input, InputMode::ModelMapping(_)));
     assert!(state.take_effect().is_none());
+}
+
+#[test]
+fn opus_quick_fill_defaults_to_claude_opus_5_5() {
+    let mut state = mapping_state(None);
+    state.reduce(key(KeyCode::Char(' ')));
+    focus_tier(&mut state, 1);
+    state.reduce(key(KeyCode::Right));
+
+    let InputMode::ModelMapping(mapping) = &state.input else {
+        panic!("expected the mapping dialog");
+    };
+    assert_eq!(mapping.rows[1].model, "claude-opus-5-5");
 }
 
 #[test]
