@@ -4070,6 +4070,9 @@ fn usage_report() -> UsageStatsReport {
                 }
             })
             .collect(),
+        hourly_tokens: (0..24)
+            .map(|hour| if hour == 14 { 250 } else { 0 })
+            .collect(),
         quota: vec![hsin_core::UsageQuotaEstimate {
             plan_key: "1a2b3c4d|openai|pro".into(),
             account: Some("1a2b3c4d".into()),
@@ -4160,6 +4163,7 @@ fn stats_render_wide_and_compact_without_losing_token_details() {
                 all_time: true,
                 day: None,
                 quota_filter: state::QuotaFilter::Recent,
+                day_detail: None,
             }),
             ..State::default()
         };
@@ -4556,4 +4560,57 @@ fn old_plans_hide_by_default_and_the_plan_filter_brings_them_back() {
     let rendered = render(&mut state, 120, 60);
     assert!(rendered.contains("Plan quota · prolite"));
     assert!(!rendered.contains("Plan quota · pro ·"));
+}
+
+#[test]
+fn clicking_a_heatmap_day_opens_its_details_and_can_filter_to_it() {
+    let mut state = stats_state();
+    render(&mut state, 120, 44);
+    let today = chrono::Local::now().date_naive();
+    let cell = hit_area(&state, |hit| *hit == super::mouse::Hit::HeatDay(today));
+    state.reduce(click_at(cell));
+    let Some(Effect::QueryUsageDay(query)) = state.take_effect() else {
+        panic!("clicking a day asks for that day");
+    };
+    assert_eq!((query.to - query.from + 3_600) / 86_400, 1);
+    assert!(stats_screen(&state).day_detail.is_some());
+    assert!(render(&mut state, 120, 44).contains("Loading"));
+
+    let mut report = usage_report();
+    report.query = query;
+    state.reduce(Action::DayUsageLoaded(report));
+    let rendered = render(&mut state, 120, 44);
+    assert!(rendered.contains(&format!("{} usage", today.format("%Y-%m-%d"))));
+    assert!(rendered.contains("By hour"));
+    assert!(rendered.contains("Peak hour 14:00"));
+    assert!(rendered.contains("By model"));
+    assert!(rendered.contains("gpt-5  250 · ≈$0.250"));
+    assert!(rendered.contains("show only this day"));
+
+    // A click beside the popup does not reach the heatmap underneath.
+    state.reduce(click_at(cell));
+    assert!(state.take_effect().is_none());
+
+    state.reduce(key(KeyCode::Enter));
+    let Some(Effect::QueryUsage(query)) = state.take_effect() else {
+        panic!("enter narrows the screen to the day");
+    };
+    assert_eq!((query.to - query.from + 3_600) / 86_400, 1);
+    let screen = stats_screen(&state);
+    assert!(screen.day_detail.is_none());
+    assert!(!screen.all_time);
+    assert_eq!(screen.from, today.format("%Y-%m-%d").to_string());
+
+    let cell = {
+        render(&mut state, 120, 44);
+        hit_area(&state, |hit| *hit == super::mouse::Hit::HeatDay(today))
+    };
+    state.reduce(click_at(cell));
+    state.take_effect();
+    state.reduce(key(KeyCode::Esc));
+    assert!(stats_screen(&state).day_detail.is_none());
+    assert!(
+        matches!(state.input, InputMode::Stats(_)),
+        "esc closes only the popup"
+    );
 }

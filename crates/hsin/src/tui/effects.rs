@@ -53,6 +53,7 @@ pub(super) enum Effect {
         password: SecretInput,
     },
     QueryUsage(UsageStatsQuery),
+    QueryUsageDay(UsageStatsQuery),
     LoadPrices,
     SetPrice(ModelPriceInput),
     RemovePrice(String),
@@ -60,6 +61,7 @@ pub(super) enum Effect {
     RefreshPrices,
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn worker(
     client: DaemonClient,
     mut effects: mpsc::Receiver<Effect>,
@@ -108,6 +110,17 @@ pub(super) async fn worker(
                     }
                     Action::PricesLoaded(prices)
                 }
+                Err(error) => Action::Failed(error_notice(&error)),
+            };
+            let _ = actions.send(action).await;
+            continue;
+        }
+        if let Effect::QueryUsageDay(query) = effect {
+            let action = match client
+                .call::<_, UsageStatsReport>(hsin_ipc::method::STATS_QUERY, &query)
+                .await
+            {
+                Ok(report) => Action::DayUsageLoaded(report),
                 Err(error) => Action::Failed(error_notice(&error)),
             };
             let _ = actions.send(action).await;
@@ -317,7 +330,9 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
             unreachable!("mapping model discovery is handled by the worker")
         }
         Effect::CopyProvider(_) => unreachable!("provider copying is handled by the worker"),
-        Effect::QueryUsage(_) => unreachable!("usage queries are handled by the worker"),
+        Effect::QueryUsage(_) | Effect::QueryUsageDay(_) => {
+            unreachable!("usage queries are handled by the worker")
+        }
         Effect::LoadPrices
         | Effect::SetPrice(_)
         | Effect::RemovePrice(_)

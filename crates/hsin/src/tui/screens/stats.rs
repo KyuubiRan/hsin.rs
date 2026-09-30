@@ -18,8 +18,8 @@ use crate::{
 use super::super::{
     mouse::{ENTER, Hit, HitMap, plain},
     state::{
-        QuotaFilter, STATS_RANGE_CHIPS, STATS_TIME_CUSTOM, StatsFilter, StatsPage, StatsScreen,
-        current_time_preset, quota_plans, visible_quota,
+        DayDetail, QuotaFilter, STATS_RANGE_CHIPS, STATS_TIME_CUSTOM, StatsFilter, StatsPage,
+        StatsScreen, current_time_preset, quota_plans, visible_quota,
     },
     theme::{INPUT_BG, MUTED, RED, WHITE},
     widgets::{centered_fixed, display_width, draw_input_field},
@@ -142,6 +142,161 @@ pub(super) fn draw_stats(
         hits.barrier(area);
         draw_filter(frame, area, screen, filter, i18n, hits);
     }
+    if let Some(detail) = &screen.day_detail {
+        hits.barrier(area);
+        draw_day_popup(frame, area, detail, i18n);
+    }
+}
+
+/// One day's usage: totals, when in the day it happened, and which models and providers it went
+/// to.
+#[allow(clippy::too_many_lines)]
+fn draw_day_popup(frame: &mut Frame<'_>, area: Rect, detail: &DayDetail, i18n: &I18n) {
+    let popup = centered_fixed(area, 76, 24);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(
+            i18n.text("stats_day_title")
+                .replace("{date}", &detail.date.format("%Y-%m-%d").to_string()),
+        )
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(RED))
+        .style(Style::default().bg(INPUT_BG));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let Some(report) = &detail.report else {
+        frame.render_widget(
+            Paragraph::new(i18n.text("loading")).style(Style::default().fg(MUTED)),
+            inner,
+        );
+        return;
+    };
+    let tokens = &report.summary;
+    if tokens.request_count == 0 && tokens.total_tokens() == 0 {
+        frame.render_widget(
+            Paragraph::new(i18n.text("stats_no_usage")).style(Style::default().fg(MUTED)),
+            inner,
+        );
+        return;
+    }
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Min(2),
+        ])
+        .split(inner);
+    let bold = Style::default().fg(WHITE).add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(MUTED);
+    let mut headline = vec![
+        Span::styled(
+            format!(
+                "{} {}",
+                compact(tokens.total_tokens()),
+                i18n.text("stats_tokens")
+            ),
+            bold,
+        ),
+        Span::styled(
+            format!(
+                "  ·  {} {}  ·  {} {:.1}%",
+                tokens.request_count,
+                i18n.text("stats_requests_unit"),
+                i18n.text("stats_hit_rate"),
+                tokens.cache_hit_rate() * 100.0
+            ),
+            Style::default().fg(WHITE),
+        ),
+    ];
+    if !report.cost.is_empty() {
+        headline.push(Span::styled(
+            format!("  ·  ≈{}", format_cost(&report.cost)),
+            Style::default().fg(RED).add_modifier(Modifier::BOLD),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(headline),
+            Line::from(Span::styled(
+                format!(
+                    "{} {}  ·  {} {}  ·  {} {}  ·  {} {}",
+                    i18n.text("stats_input"),
+                    compact(tokens.input_tokens),
+                    i18n.text("stats_cache_write"),
+                    compact(tokens.cache_write_tokens),
+                    i18n.text("stats_hit"),
+                    compact(tokens.cache_read_tokens),
+                    i18n.text("stats_output"),
+                    compact(tokens.output_tokens)
+                ),
+                muted,
+            )),
+        ])
+        .wrap(Wrap { trim: true }),
+        rows[0],
+    );
+    let peak = report
+        .hourly_tokens
+        .iter()
+        .enumerate()
+        .max_by_key(|(hour, tokens)| (**tokens, std::cmp::Reverse(*hour)))
+        .filter(|(_, tokens)| **tokens > 0)
+        .map(|(hour, _)| format!("  ·  {} {hour:02}:00", i18n.text("stats_peak_hour")))
+        .unwrap_or_default();
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(i18n.text("stats_by_hour"), bold),
+            Span::styled(format!("  00 → 23{peak}"), muted),
+        ])),
+        rows[1],
+    );
+    let width = usize::from(rows[2].width);
+    // Each hour gets an equal share of the width, so the bars line up with the clock.
+    let per_hour = (width / 24).max(1);
+    let bars = report
+        .hourly_tokens
+        .iter()
+        .flat_map(|tokens| std::iter::repeat_n(*tokens, per_hour))
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Sparkline::default()
+            .data(&bars)
+            .style(Style::default().fg(RED)),
+        rows[2],
+    );
+    let mut lines = vec![Line::from(Span::styled(i18n.text("stats_by_model"), bold))];
+    let cost = |costs: &[hsin_core::UsageCost]| {
+        if costs.is_empty() {
+            String::new()
+        } else {
+            format!(" · ≈{}", format_cost(costs))
+        }
+    };
+    lines.extend(report.models.iter().take(5).map(|model| {
+        Line::from(format!(
+            "  {}  {}{}",
+            model.model,
+            compact(model.tokens.total_tokens()),
+            cost(&model.cost)
+        ))
+    }));
+    lines.push(Line::from(Span::styled(
+        i18n.text("stats_by_provider"),
+        bold,
+    )));
+    lines.extend(report.providers.iter().take(3).map(|provider| {
+        Line::from(format!(
+            "  {}{}  {}{}",
+            if provider.inferred { "~" } else { "" },
+            provider.provider_name,
+            compact(provider.tokens.total_tokens()),
+            cost(&provider.cost)
+        ))
+    }));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), rows[4]);
 }
 
 /// The page tabs; returns the width they take.

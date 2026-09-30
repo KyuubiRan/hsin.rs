@@ -394,7 +394,7 @@
   "stats_weekdays": "一,,三,,五,,",
   "stats_tokens": "Token",
   "stats_requests_unit": "次请求",
-  "stats_day_hint": "悬停或点击某一天查看当天用量",
+  "stats_day_hint": "悬停预览某一天，点击查看当天详情",
   "stats_favorite_model": "最常用模型",
   "stats_active_days": "活跃天数",
   "stats_most_active_day": "最活跃的一天",
@@ -464,5 +464,10 @@
   "stats_quota_recent": "近 30 天活跃",
   "stats_quota_all": "全部套餐",
   "stats_quota_hidden": "已隐藏 {count} 个超过 30 天未使用的套餐窗口 · 按 q 查看",
-  "cli.stats.arg.all_plans": "同时列出超过 30 天未使用的套餐额度"
+  "cli.stats.arg.all_plans": "同时列出超过 30 天未使用的套餐额度",
+  "stats_day_title": " {date} 当天使用情况 ",
+  "stats_by_hour": "按小时",
+  "stats_by_model": "按模型",
+  "stats_by_provider": "按 Provider",
+  "stats_day_detail_help": "enter 只看这一天 · esc 关闭"
 }

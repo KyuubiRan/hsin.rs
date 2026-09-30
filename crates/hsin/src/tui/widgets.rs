@@ -174,7 +174,9 @@ fn footer_help(state: &State, i18n: &I18n) -> String {
             } => i18n.text("pricing_editor_help"),
             SettingsPage::Pricing { .. } => i18n.text("pricing_help"),
         },
-        InputMode::Stats(screen) => i18n.text(if screen.filter.is_some() {
+        InputMode::Stats(screen) => i18n.text(if screen.day_detail.is_some() {
+            "stats_day_detail_help"
+        } else if screen.filter.is_some() {
             "stats_filter_help"
         } else {
             "stats_help"

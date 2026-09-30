@@ -1265,6 +1265,7 @@ impl UsageCollector {
             unpriced_tokens,
             overview,
             calendar,
+            hourly_tokens: hours.to_vec(),
             quota: self.quota_estimates(query_client, &price_rules, unix_time())?,
         })
     }

@@ -50,6 +50,8 @@ pub(super) enum Action {
     MappingModelDiscoveryFailed(String),
     ProviderCopied(ProviderClipboard),
     UsageLoaded(UsageStatsReport),
+    /// The report for the day the heatmap popup shows.
+    DayUsageLoaded(UsageStatsReport),
     PricesLoaded(ModelPriceList),
     /// Drives the timers the UI owns; today only the delete confirmation, which lapses on its own.
     Tick,
@@ -167,6 +169,13 @@ pub(super) struct StatsScreen {
     /// The heatmap day under the pointer or last clicked.
     pub(super) day: Option<NaiveDate>,
     pub(super) quota_filter: QuotaFilter,
+    /// The heatmap day whose details are open, with its report once it arrives.
+    pub(super) day_detail: Option<Box<DayDetail>>,
+}
+
+pub(super) struct DayDetail {
+    pub(super) date: NaiveDate,
+    pub(super) report: Option<UsageStatsReport>,
 }
 
 /// The ranges in the time popup, in order: today, 7, 30 and 90 days, all time, then custom.
@@ -856,6 +865,17 @@ impl State {
                 self.loading = false;
             }
             Action::PricesLoaded(prices) => self.apply_prices(prices),
+            Action::DayUsageLoaded(report) => {
+                if let InputMode::Stats(StatsScreen {
+                    day_detail: Some(detail),
+                    ..
+                }) = &mut self.input
+                    && stats_query_day(&report.query) == Some(detail.date)
+                {
+                    detail.report = Some(report);
+                }
+                self.loading = false;
+            }
             Action::Key(key) => return self.reduce_key(key),
         }
         Transition::Continue
@@ -975,9 +995,7 @@ impl State {
                     Hit::Barrier => Transition::Continue,
                     Hit::Key(key) => self.reduce_key(key),
                     Hit::HeatDay(date) => {
-                        if let InputMode::Stats(screen) = &mut self.input {
-                            screen.day = Some(date);
-                        }
+                        self.open_day_detail(date);
                         Transition::Continue
                     }
                     Hit::StatsRange(preset) => {
@@ -2604,6 +2622,26 @@ impl State {
             unreachable!("stats reducer requires stats mode");
         };
         let mut keep = true;
+        if let Some(detail) = &screen.day_detail {
+            match key.code {
+                KeyCode::Esc => screen.day_detail = None,
+                // Narrow the whole screen to the day on show.
+                KeyCode::Enter => {
+                    let day = detail.date.format("%Y-%m-%d").to_string();
+                    screen.from.clone_from(&day);
+                    screen.to = day;
+                    screen.all_time = false;
+                    screen.day_detail = None;
+                    self.queue_without_mode_change(Effect::QueryUsage(stats_query(
+                        self.client,
+                        &screen,
+                    )));
+                }
+                _ => {}
+            }
+            self.input = InputMode::Stats(screen);
+            return Transition::Continue;
+        }
         if let Some(filter) = &mut screen.filter {
             match filter {
                 StatsFilter::Time {
@@ -2870,6 +2908,32 @@ impl State {
             *list = Some(prices);
         }
         self.loading = false;
+    }
+
+    /// Opens the details of one heatmap day and asks for that day's report, keeping the screen's
+    /// provider and model filters.
+    fn open_day_detail(&mut self, date: NaiveDate) {
+        let InputMode::Stats(screen) = &mut self.input else {
+            return;
+        };
+        if screen.filter.is_some() {
+            return;
+        }
+        screen.day = Some(date);
+        screen.day_detail = Some(Box::new(DayDetail { date, report: None }));
+        let day = date.format("%Y-%m-%d").to_string();
+        let query = stats_query(
+            self.client,
+            &StatsScreen {
+                from: day.clone(),
+                to: day,
+                all_time: false,
+                provider_id: screen.provider_id.clone(),
+                model: screen.model.clone(),
+                ..default_stats_screen()
+            },
+        );
+        self.queue_without_mode_change(Effect::QueryUsageDay(query));
     }
 
     /// Switches the stats screen to a preset range and asks for it.
@@ -3805,6 +3869,7 @@ fn default_stats_screen() -> StatsScreen {
         all_time: true,
         day: None,
         quota_filter: QuotaFilter::Recent,
+        day_detail: None,
     }
 }
 
@@ -3853,6 +3918,12 @@ pub(super) fn current_time_preset(screen: &StatsScreen) -> usize {
             .unwrap_or(STATS_TIME_CUSTOM),
         _ => STATS_TIME_CUSTOM,
     }
+}
+
+/// The local day a one-day query covers.
+fn stats_query_day(query: &UsageStatsQuery) -> Option<NaiveDate> {
+    chrono::DateTime::from_timestamp(query.from, 0)
+        .map(|value| value.with_timezone(&Local).date_naive())
 }
 
 fn stats_query(client: ClientKind, screen: &StatsScreen) -> UsageStatsQuery {

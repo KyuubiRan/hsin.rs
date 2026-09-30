@@ -1620,6 +1620,9 @@ pub struct UsageStatsReport {
     /// The last [`USAGE_CALENDAR_DAYS`] days ending today, whatever the range.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub calendar: Vec<UsageCalendarDay>,
+    /// Tokens by local hour of day, `0..24`, over the queried range.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hourly_tokens: Vec<u64>,
     /// Subscription quota windows the client reports, newest reading first. Independent of the
     /// query's range and filters.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
