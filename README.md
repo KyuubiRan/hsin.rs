@@ -126,7 +126,7 @@ select text in terminals that support it. Every action is also scriptable:
 ```bash
 hsin status                                   # daemon, proxy and client state
 hsin stats codex                              # last 30 days of Codex token usage
-hsin stats codex --all                        # everything recorded, with a forecast
+hsin stats codex --all                        # everything recorded, with plan quotas
 hsin stats claude --from 2026-09-01 --to 2026-09-14
 hsin stats codex --provider <id> --model gpt-5 --json
 hsin pricing list                             # price rules used for cost estimates
@@ -192,9 +192,9 @@ Codex and Claude Code session-log entries, so official-login and direct-mode
 requests are included too. Collection begins after the upgraded daemon first
 starts: old sessions are not backfilled. Request detail is kept for 90 days and
 hourly totals indefinitely, so the overview opens on all time: an activity
-heatmap of the last year (hover or click a day), streaks, the favorite model,
-the peak hour, an estimated cost per currency, and a forecast for the month end
-and the next 30 days. Press `d` to cycle all time, 7 and 30 days, or `t` for
+heatmap of the last year (hover a day to preview it, click it for that day's
+details), streaks, the favorite model, the peak hour, and an estimated cost per
+currency. Press `d` to cycle all time, 7 and 30 days, or `t` for
 other ranges. Provider attribution from local session logs is inferred from
 Hsin's route history and is marked with `~`.
 

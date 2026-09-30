@@ -12,10 +12,10 @@ use chrono::{DateTime, Datelike, Local, NaiveDate, Timelike, Utc};
 use hsin_core::{
     ClientKind, ConnectionMode, ModelPrice, USAGE_CALENDAR_DAYS, USAGE_MODEL_SERIES_DAYS,
     UsageAttribution, UsageAttributionCounts, UsageCalendarDay, UsageCost, UsageDailyBucket,
-    UsageDataSource, UsageFilterOptions, UsageForecast, UsageModelBreakdown, UsageOverview,
-    UsageProjection, UsageProviderBreakdown, UsageProviderOption, UsageQuotaCapacity,
-    UsageQuotaCycle, UsageQuotaEstimate, UsageStatsQuery, UsageStatsReport, UsageSyncResult,
-    UsageTokenSummary, add_usage_cost, best_model_price,
+    UsageDataSource, UsageFilterOptions, UsageModelBreakdown, UsageOverview, UsageProjection,
+    UsageProviderBreakdown, UsageProviderOption, UsageQuotaCapacity, UsageQuotaCycle,
+    UsageQuotaEstimate, UsageStatsQuery, UsageStatsReport, UsageSyncResult, UsageTokenSummary,
+    add_usage_cost, best_model_price,
 };
 use parking_lot::Mutex;
 use rusqlite::{OptionalExtension, params};
@@ -49,10 +49,6 @@ const QUOTA_CYCLE_TOLERANCE_SECONDS: i64 = 600;
 const UNKNOWN_MODEL: &str = "unknown";
 /// The longest daily series a query returns, so no range can outgrow an IPC frame.
 const MAX_QUERY_DAYS: i64 = 3660;
-/// Complete days a forecast looks back over.
-const FORECAST_BASIS_DAYS: i64 = 28;
-/// Fewer complete days than this and there is no forecast: the average would be noise.
-const FORECAST_MIN_DAYS: usize = 3;
 const MAX_SESSION_LINE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PROXY_OBSERVATION_BYTES: usize = 1024 * 1024;
 const RETENTION_DAYS: i64 = 90;
@@ -1240,11 +1236,6 @@ impl UsageCollector {
             today,
             favorite_model,
         );
-        let forecast = forecast(
-            today,
-            local_naive_date(collected_since).unwrap_or(today),
-            &calendar_days,
-        );
 
         let total_tokens = summary.total_tokens();
         let hit_tokens = summary.cache_read_tokens;
@@ -1274,7 +1265,6 @@ impl UsageCollector {
             unpriced_tokens,
             overview,
             calendar,
-            forecast,
             quota: self.quota_estimates(query_client, &price_rules, unix_time())?,
         })
     }
@@ -2275,112 +2265,6 @@ fn overview(
     }
 }
 
-/// Projects daily usage forward from the last [`FORECAST_BASIS_DAYS`] complete days, blending
-/// the overall daily mean half and half with the mean of the same weekday, so a weekday-heavy
-/// habit shows up in the projection without one odd day dominating it.
-#[allow(clippy::cast_precision_loss)]
-fn forecast(
-    today: NaiveDate,
-    collected_since: NaiveDate,
-    days: &BTreeMap<NaiveDate, (UsageTokenSummary, Vec<UsageCost>)>,
-) -> Option<UsageForecast> {
-    let yesterday = today.pred_opt()?;
-    let basis_start = (today - chrono::Duration::days(FORECAST_BASIS_DAYS)).max(collected_since);
-    let basis = date_range(basis_start, yesterday);
-    if basis.len() < FORECAST_MIN_DAYS {
-        return None;
-    }
-    let tokens_on = |date: &NaiveDate| {
-        days.get(date)
-            .map_or(0, |(tokens, _)| tokens.total_tokens())
-    };
-    let mut basis_tokens = 0_u64;
-    let mut basis_cost = Vec::new();
-    let mut weekday_totals = [(0_u64, 0_u32); 7];
-    for date in &basis {
-        let tokens = tokens_on(date);
-        basis_tokens += tokens;
-        let weekday = &mut weekday_totals[date.weekday().num_days_from_monday() as usize];
-        weekday.0 += tokens;
-        weekday.1 += 1;
-        if let Some((_, cost)) = days.get(date) {
-            for entry in cost {
-                add_usage_cost(&mut basis_cost, &entry.currency, entry.amount);
-            }
-        }
-    }
-    let mean = basis_tokens as f64 / basis.len() as f64;
-    let expected = |date: NaiveDate| {
-        let (total, count) = weekday_totals[date.weekday().num_days_from_monday() as usize];
-        let weekday_mean = if count == 0 {
-            mean
-        } else {
-            total as f64 / f64::from(count)
-        };
-        0.5 * mean + 0.5 * weekday_mean
-    };
-    let price_tokens = |tokens: f64| -> Vec<UsageCost> {
-        if basis_tokens == 0 {
-            return Vec::new();
-        }
-        basis_cost
-            .iter()
-            .map(|cost| UsageCost {
-                currency: cost.currency.clone(),
-                amount: cost.amount / basis_tokens as f64 * tokens,
-            })
-            .collect()
-    };
-
-    let month_start = today.with_day(1)?;
-    let mut month_to_date = UsageProjection::default();
-    for date in date_range(month_start, today) {
-        if let Some((tokens, cost)) = days.get(&date) {
-            month_to_date.tokens += tokens.total_tokens();
-            for entry in cost {
-                add_usage_cost(&mut month_to_date.cost, &entry.currency, entry.amount);
-            }
-        }
-    }
-    let today_actual = tokens_on(&today) as f64;
-    let month_end_date = (if today.month() == 12 {
-        NaiveDate::from_ymd_opt(today.year() + 1, 1, 1)
-    } else {
-        NaiveDate::from_ymd_opt(today.year(), today.month() + 1, 1)
-    })?
-    .pred_opt()?;
-    let tomorrow = today.succ_opt()?;
-    let remaining_month = (expected(today) - today_actual).max(0.0)
-        + date_range(tomorrow, month_end_date)
-            .into_iter()
-            .map(expected)
-            .sum::<f64>();
-    let mut month_end = UsageProjection {
-        tokens: month_to_date.tokens + token_count(remaining_month),
-        cost: month_to_date.cost.clone(),
-    };
-    for entry in price_tokens(remaining_month) {
-        add_usage_cost(&mut month_end.cost, &entry.currency, entry.amount);
-    }
-    let next_30 = date_range(tomorrow, today + chrono::Duration::days(30))
-        .into_iter()
-        .map(expected)
-        .sum::<f64>();
-    Some(UsageForecast {
-        basis_days: u32::try_from(basis.len()).unwrap_or(u32::MAX),
-        daily_average: UsageProjection {
-            tokens: token_count(mean),
-            cost: price_tokens(mean),
-        },
-        month_to_date,
-        month_end,
-        next_30_days: UsageProjection {
-            tokens: token_count(next_30),
-            cost: price_tokens(next_30),
-        },
-    })
-}
-
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn token_count(value: f64) -> u64 {
     // Projections are non-negative sums of token counts, far inside u64.
@@ -2966,65 +2850,6 @@ mod tests {
         drop(collector);
         drop(db);
         fs::remove_dir_all(root).expect("cleanup");
-    }
-
-    fn day(
-        date: NaiveDate,
-        total: u64,
-        usd: f64,
-    ) -> (NaiveDate, (UsageTokenSummary, Vec<UsageCost>)) {
-        (
-            date,
-            (
-                tokens(total, 0),
-                vec![UsageCost {
-                    currency: "USD".into(),
-                    amount: usd,
-                }],
-            ),
-        )
-    }
-
-    #[test]
-    fn forecast_needs_history_and_weights_weekdays() {
-        // Wednesday 2026-09-16.
-        let today = NaiveDate::from_ymd_opt(2026, 9, 16).unwrap();
-        let short = BTreeMap::from([day(today.pred_opt().unwrap(), 100, 1.0)]);
-        assert!(forecast(today, today - chrono::Duration::days(1), &short).is_none());
-
-        // Four weeks of 100 tokens a day, except 400 on every Monday.
-        let days = (1..=28)
-            .map(|offset| {
-                let date = today - chrono::Duration::days(offset);
-                let total: u32 = if date.weekday() == chrono::Weekday::Mon {
-                    400
-                } else {
-                    100
-                };
-                day(date, u64::from(total), f64::from(total) / 100.0)
-            })
-            .collect::<BTreeMap<_, _>>();
-        let forecast = forecast(today, today - chrono::Duration::days(365), &days).unwrap();
-        assert_eq!(forecast.basis_days, 28);
-        // (24 * 100 + 4 * 400) / 28.
-        let mean = 4_000.0 / 28.0;
-        assert_eq!(forecast.daily_average.tokens, token_count(mean));
-        assert!((forecast.daily_average.cost[0].amount - mean / 100.0).abs() < 1e-9);
-        // September 1-15 are in the basis; today has no usage yet.
-        let mtd = days
-            .iter()
-            .filter(|(date, _)| date.month() == 9)
-            .map(|(_, (tokens, _))| tokens.total_tokens())
-            .sum::<u64>();
-        assert_eq!(forecast.month_to_date.tokens, mtd);
-        // Sept 16-30 spans two Mondays (21, 28) that are weighted up.
-        let monday = 0.5 * mean + 0.5 * 400.0;
-        let other = 0.5 * mean + 0.5 * 100.0;
-        assert_eq!(
-            forecast.month_end.tokens,
-            mtd + token_count(2.0 * monday + 13.0 * other)
-        );
-        assert!(forecast.next_30_days.tokens > forecast.month_end.tokens - mtd);
     }
 
     #[test]

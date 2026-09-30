@@ -238,7 +238,7 @@ fn print_quota(quota: &hsin_core::UsageQuotaEstimate) {
     );
 }
 
-/// The overview, forecast and per-provider and per-model totals of a stats report.
+/// The overview, plan quotas and per-provider and per-model totals of a stats report.
 fn print_highlights(report: &UsageStatsReport, all_plans: bool) {
     let overview = &report.overview;
     println!(
@@ -272,27 +272,6 @@ fn print_highlights(report: &UsageStatsReport, all_plans: bool) {
             "
 {hidden} plan quota window(s) idle for over 30 days hidden; use --all-plans"
         );
-    }
-    match &report.forecast {
-        Some(forecast) => {
-            let projection = |projection: &hsin_core::UsageProjection| {
-                if projection.cost.is_empty() {
-                    format!("{} tokens", projection.tokens)
-                } else {
-                    format!(
-                        "{} tokens · {}",
-                        projection.tokens,
-                        format_cost(&projection.cost)
-                    )
-                }
-            };
-            println!("\nForecast (from {} days):", forecast.basis_days);
-            println!("  Month to date: {}", projection(&forecast.month_to_date));
-            println!("  Month end: {}", projection(&forecast.month_end));
-            println!("  Next 30 days: {}", projection(&forecast.next_30_days));
-            println!("  Daily average: {}", projection(&forecast.daily_average));
-        }
-        None => println!("\nForecast: not enough history yet"),
     }
     let cost = |costs: &[hsin_core::UsageCost]| {
         if costs.is_empty() {

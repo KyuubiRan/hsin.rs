@@ -4070,25 +4070,6 @@ fn usage_report() -> UsageStatsReport {
                 }
             })
             .collect(),
-        forecast: Some(hsin_core::UsageForecast {
-            basis_days: 28,
-            daily_average: hsin_core::UsageProjection {
-                tokens: 250,
-                cost: vec![usd(0.25)],
-            },
-            month_to_date: hsin_core::UsageProjection {
-                tokens: 250,
-                cost: vec![usd(0.25)],
-            },
-            month_end: hsin_core::UsageProjection {
-                tokens: 4_000,
-                cost: vec![usd(4.0)],
-            },
-            next_30_days: hsin_core::UsageProjection {
-                tokens: 7_500,
-                cost: vec![usd(7.5)],
-            },
-        }),
         quota: vec![hsin_core::UsageQuotaEstimate {
             plan_key: "1a2b3c4d|openai|pro".into(),
             account: Some("1a2b3c4d".into()),
@@ -4255,14 +4236,11 @@ fn heatmap_days_and_range_chips_respond_to_the_mouse() {
     let rendered = render(&mut state, 120, 44);
     assert!(rendered.contains(&today.format("%Y-%m-%d").to_string()));
     assert!(rendered.contains("250 tokens"));
-    assert!(rendered.contains("Forecast"));
-    assert!(rendered.contains("Month end"));
     assert!(rendered.contains("Plan quota · pro · openai"));
     assert!(rendered.contains("0→4%  ≈80.0m · ≈$50.00"));
     assert!(rendered.contains("≈2.0b · ≈$1250"));
     assert!(rendered.contains("(1.6b–2.6b)"));
     assert!(rendered.contains("Per month"));
-    assert!(rendered.contains("$4.00"));
 
     let week = hit_area(&state, |hit| *hit == super::mouse::Hit::StatsRange(1));
     state.reduce(click_at(week));

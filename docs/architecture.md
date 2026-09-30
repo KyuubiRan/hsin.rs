@@ -48,10 +48,7 @@ same transaction. Before a sync finishes or a query runs, those days are rebuilt
 into `usage_hourly` (per day, hour, Provider revision, and model). Rollups
 outlive the raw events, so reports read only from them: an all-time query
 (`from` = 0) starts at the first recorded day, and a report also carries a
-371-day activity calendar, streaks, the peak hour, and a forecast. The forecast
-averages the last 28 complete days, blending the overall daily mean half and
-half with the same-weekday mean, and projects the month end and the next 30
-days; it follows the Provider and model filters but not the queried range.
+371-day activity calendar, streaks, and the peak hour.
 
 Codex `token_count` records also carry the plan's quota windows (`used_percent`,
 window length, reset time, plan type). Each is stored in `usage_quota_readings`

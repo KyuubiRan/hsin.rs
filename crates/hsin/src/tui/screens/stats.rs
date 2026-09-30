@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{Datelike, Duration, Local, NaiveDate};
-use hsin_core::{UsageCalendarDay, UsageProjection, UsageQuotaEstimate, UsageStatsReport};
+use hsin_core::{UsageCalendarDay, UsageQuotaEstimate, UsageStatsReport};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -568,8 +568,6 @@ fn draw_summary(
             Style::default().fg(MUTED),
         )));
     }
-    lines.push(Line::from(""));
-    lines.extend(forecast_lines(report, i18n));
     let mut details = vec![
         Line::from(""),
         Line::from(format!(
@@ -787,67 +785,6 @@ fn quota_window_label(minutes: u32, i18n: &I18n) -> String {
     } else {
         format!("{minutes} min")
     }
-}
-
-fn forecast_lines(report: &UsageStatsReport, i18n: &I18n) -> Vec<Line<'static>> {
-    let Some(forecast) = &report.forecast else {
-        return vec![Line::from(Span::styled(
-            i18n.text("stats_forecast_unavailable").to_owned(),
-            Style::default().fg(MUTED),
-        ))];
-    };
-    let projection = |projection: &UsageProjection| {
-        if projection.cost.is_empty() {
-            compact(projection.tokens)
-        } else {
-            format!(
-                "{} · ≈{}",
-                compact(projection.tokens),
-                format_cost(&projection.cost)
-            )
-        }
-    };
-    let label =
-        |key: &str| Span::styled(format!("{}  ", i18n.text(key)), Style::default().fg(MUTED));
-    let value = |text: String| {
-        Span::styled(
-            text,
-            Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
-        )
-    };
-    vec![
-        Line::from(vec![
-            Span::styled(
-                i18n.text("stats_forecast").to_owned(),
-                Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(
-                    "  {}",
-                    i18n.text("stats_forecast_basis")
-                        .replace("{days}", &forecast.basis_days.to_string())
-                ),
-                Style::default().fg(MUTED),
-            ),
-        ]),
-        Line::from(vec![
-            label("stats_month_to_date"),
-            value(projection(&forecast.month_to_date)),
-            Span::styled("  →  ", Style::default().fg(MUTED)),
-            label("stats_month_end"),
-            Span::styled(
-                projection(&forecast.month_end),
-                Style::default().fg(RED).add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            label("stats_next_30_days"),
-            value(projection(&forecast.next_30_days)),
-            Span::raw("   "),
-            label("stats_daily_average"),
-            value(projection(&forecast.daily_average)),
-        ]),
-    ]
 }
 
 fn draw_models(

@@ -1573,18 +1573,6 @@ pub struct UsageQuotaEstimate {
     pub cycles: Vec<UsageQuotaCycle>,
 }
 
-/// A projection from recent daily usage. It follows the query's provider and model filters but
-/// always looks forward from today, whatever range the query covers.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct UsageForecast {
-    /// Complete days the projection is based on.
-    pub basis_days: u32,
-    pub daily_average: UsageProjection,
-    pub month_to_date: UsageProjection,
-    pub month_end: UsageProjection,
-    pub next_30_days: UsageProjection,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageAttributionCounts {
     pub exact: u64,
@@ -1632,8 +1620,6 @@ pub struct UsageStatsReport {
     /// The last [`USAGE_CALENDAR_DAYS`] days ending today, whatever the range.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub calendar: Vec<UsageCalendarDay>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub forecast: Option<UsageForecast>,
     /// Subscription quota windows the client reports, newest reading first. Independent of the
     /// query's range and filters.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
