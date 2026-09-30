@@ -532,9 +532,15 @@ fn draw_summary(
             Style::default().fg(MUTED),
         )));
     }
-    for estimate in report.quota.iter().take(2) {
+    // An account label only helps once there is more than one account to tell apart.
+    let accounts = report
+        .quota
+        .iter()
+        .filter_map(|estimate| estimate.account.as_deref())
+        .collect::<std::collections::BTreeSet<_>>();
+    for estimate in &report.quota {
         lines.push(Line::from(""));
-        lines.extend(quota_lines(estimate, i18n));
+        lines.extend(quota_lines(estimate, accounts.len() > 1, i18n));
     }
     lines.push(Line::from(""));
     lines.extend(forecast_lines(report, i18n));
@@ -629,7 +635,12 @@ fn metric(label: &str, value: u64) -> Span<'static> {
 }
 
 /// A subscription window and the allowance back-calculated for it.
-fn quota_lines(estimate: &UsageQuotaEstimate, i18n: &I18n) -> Vec<Line<'static>> {
+#[allow(clippy::too_many_lines)]
+fn quota_lines(
+    estimate: &UsageQuotaEstimate,
+    show_account: bool,
+    i18n: &I18n,
+) -> Vec<Line<'static>> {
     let muted = Style::default().fg(MUTED);
     let bold = Style::default().fg(WHITE).add_modifier(Modifier::BOLD);
     let window = quota_window_label(estimate.window_minutes, i18n);
@@ -644,13 +655,26 @@ fn quota_lines(estimate: &UsageQuotaEstimate, i18n: &I18n) -> Vec<Line<'static>>
     if let Some(plan) = &estimate.plan_type {
         header.push(Span::styled(format!(" · {plan}"), bold));
     }
+    if let Some(source) = &estimate.source {
+        header.push(Span::styled(format!(" · {source}"), muted));
+    }
+    if show_account && let Some(account) = &estimate.account {
+        header.push(Span::styled(
+            format!(" · {} {account}", i18n.text("stats_quota_account")),
+            muted,
+        ));
+    }
     header.push(Span::styled(
-        format!(
-            "  {window} · {:.0}% {} · {} {resets}",
-            estimate.used_percent,
-            i18n.text("stats_quota_used"),
-            i18n.text("stats_quota_resets"),
-        ),
+        if estimate.current {
+            format!(
+                "  {window} · {:.0}% {} · {} {resets}",
+                estimate.used_percent,
+                i18n.text("stats_quota_used"),
+                i18n.text("stats_quota_resets"),
+            )
+        } else {
+            format!("  {window} · {}", i18n.text("stats_quota_past"))
+        },
         muted,
     ));
     let mut lines = vec![Line::from(header)];
@@ -693,6 +717,31 @@ fn quota_lines(estimate: &UsageQuotaEstimate, i18n: &I18n) -> Vec<Line<'static>>
                 Style::default().fg(RED).add_modifier(Modifier::BOLD),
             ),
         ]));
+    }
+    let shown = if estimate.current { 4 } else { 2 };
+    for cycle in estimate.cycles.iter().take(shown) {
+        let time = |at: i64| {
+            chrono::DateTime::from_timestamp(at, 0).map_or_else(String::new, |value| {
+                value
+                    .with_timezone(&Local)
+                    .format("%m-%d %H:%M")
+                    .to_string()
+            })
+        };
+        let cost = if cycle.cost.is_empty() {
+            String::new()
+        } else {
+            format!(" · ≈{}", format_cost(&cycle.cost))
+        };
+        let text = format!(
+            "  {} → {}  {:.0}→{:.0}%  ≈{}{cost}",
+            time(cycle.first_at),
+            time(cycle.last_at),
+            cycle.from_percent,
+            cycle.to_percent,
+            compact(cycle.tokens)
+        );
+        lines.push(Line::from(Span::styled(text, muted)));
     }
     lines.push(Line::from(Span::styled(
         i18n.text("stats_quota_note")

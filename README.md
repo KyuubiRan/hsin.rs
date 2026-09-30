@@ -203,7 +203,10 @@ way quota calculators do: Codex logs its quota meter with every request, so the
 tokens spent while the meter moved, scaled to 100%, give the weekly allowance in
 tokens and in API list-price dollars, with the range the whole-percent meter
 leaves open, the remainder of the current window, and the equivalent per
-calendar month. It is an estimate; OpenAI does not publish token limits.
+calendar month. Each account, session provider, plan and window is estimated
+separately, with its recent cycles listed, so switching between a relay and your
+own plan, or between plans, never mixes their allowances. It is an estimate;
+OpenAI does not publish token limits.
 
 Costs use built-in list prices, the public LiteLLM price list when you fetch it
 (`u` on Settings → Model pricing, or `hsin pricing refresh`), and your own

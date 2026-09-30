@@ -1515,9 +1515,35 @@ pub struct UsageQuotaCapacity {
     pub cost: Vec<UsageCost>,
 }
 
-/// One quota window of a subscription plan, as the client last reported it.
+/// One reset cycle of a quota window and what it contributed to the estimate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageQuotaCycle {
+    pub resets_at: i64,
+    /// First and last reading seen in the cycle.
+    pub first_at: i64,
+    pub last_at: i64,
+    pub from_percent: f64,
+    pub to_percent: f64,
+    /// Usage between the first reading and the last rise of the meter.
+    pub tokens: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cost: Vec<UsageCost>,
+}
+
+/// One quota window of one subscription, as the client last reported it. Each account, source
+/// provider and plan gets its own estimate: their allowances differ even when they share a client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageQuotaEstimate {
+    /// A short hash of the account the readings came from, when the client names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// The provider the client's session used, such as `openai`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Whether this window appears in the client's newest readings; an older one belongs to a
+    /// plan or account no longer in use.
+    #[serde(default)]
+    pub current: bool,
     pub limit_id: String,
     /// `primary` or `secondary`, as the client labels its windows.
     pub window: String,
@@ -1538,6 +1564,9 @@ pub struct UsageQuotaEstimate {
     /// The allowance over a calendar month, for windows of a day or longer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monthly: Option<UsageProjection>,
+    /// Recent cycles, newest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cycles: Vec<UsageQuotaCycle>,
 }
 
 /// A projection from recent daily usage. It follows the query's provider and model filters but

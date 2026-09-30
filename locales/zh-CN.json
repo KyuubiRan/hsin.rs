@@ -464,5 +464,7 @@
   "stats_quota_remaining": "剩余",
   "stats_quota_monthly": "每月",
   "stats_quota_pending": "额度计量还没变化满 1%，继续使用后即可估算总额度。",
-  "stats_quota_note": "根据最近 {cycles} 个周期共 {percent}% 的额度变化，按 API 标价反推；官方未公布套餐的 Token 上限。"
+  "stats_quota_note": "根据最近 {cycles} 个周期共 {percent}% 的额度变化，按 API 标价反推；官方未公布套餐的 Token 上限。",
+  "stats_quota_past": "已不再使用",
+  "stats_quota_account": "账号"
 }

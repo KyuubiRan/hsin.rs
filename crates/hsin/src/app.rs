@@ -167,11 +167,17 @@ fn print_quota(quota: &hsin_core::UsageQuotaEstimate) {
                 .to_string()
         });
     println!(
-        "\nPlan quota ({}, {} {} min window): {:.0}% used, resets {resets}",
+        "\nPlan quota ({}, source {}, account {}, {} {} min window){}",
         quota.plan_type.as_deref().unwrap_or("unknown plan"),
+        quota.source.as_deref().unwrap_or("unknown"),
+        quota.account.as_deref().unwrap_or("unknown"),
         quota.window,
         quota.window_minutes,
-        quota.used_percent
+        if quota.current {
+            format!(": {:.0}% used, resets {resets}", quota.used_percent)
+        } else {
+            " (no longer reported)".to_owned()
+        }
     );
     let Some(capacity) = &quota.capacity else {
         println!("  Allowance: not enough meter movement yet");
@@ -205,6 +211,25 @@ fn print_quota(quota: &hsin_core::UsageQuotaEstimate) {
             "  Per month: ~{} tokens{}",
             monthly.tokens,
             cost(&monthly.cost)
+        );
+    }
+    for cycle in &quota.cycles {
+        let time = |at: i64| {
+            chrono::DateTime::from_timestamp(at, 0).map_or_else(String::new, |value| {
+                value
+                    .with_timezone(&Local)
+                    .format("%m-%d %H:%M")
+                    .to_string()
+            })
+        };
+        println!(
+            "  Cycle {} → {}: {:.0}% → {:.0}%, {} tokens{}",
+            time(cycle.first_at),
+            time(cycle.last_at),
+            cycle.from_percent,
+            cycle.to_percent,
+            cycle.tokens,
+            cost(&cycle.cost)
         );
     }
     println!(

@@ -464,5 +464,7 @@
   "stats_quota_remaining": "Remaining",
   "stats_quota_monthly": "Per month",
   "stats_quota_pending": "The meter has not moved a full point yet; keep using the plan to estimate its allowance.",
-  "stats_quota_note": "Back-calculated from {percent}% of meter movement over {cycles} cycle(s) at API list prices; the plan's token limit is not published."
+  "stats_quota_note": "Back-calculated from {percent}% of meter movement over {cycles} cycle(s) at API list prices; the plan's token limit is not published.",
+  "stats_quota_past": "no longer reported",
+  "stats_quota_account": "account"
 }

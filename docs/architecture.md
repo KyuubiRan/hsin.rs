@@ -60,8 +60,11 @@ time form one cycle; concurrent sessions interleave slightly stale percentages,
 so a cycle's movement is the rise of its running peak over its first reading,
 and only usage up to the last rise counts. A window's allowance is
 Σ tokens × 100 / Σ movement over the recent cycles, and each cycle adds one
-point of uncertainty to the reported range. Only windows present in the newest
-readings are reported. Session cursors keep the Codex parser state (current
+point of uncertainty to the reported range. Readings also record the session's
+provider (`session_meta.model_provider`) and a hash of its account, and each
+account, provider, plan and window is estimated on its own: a user can move
+between plans and accounts, and relay sessions carry no quota readings at all.
+Windows missing from the newest readings are reported as no longer in use. Session cursors keep the Codex parser state (current
 model and cumulative counters) so a sync that resumes mid-file still knows the
 model; a one-time background pass relabels events an earlier version filed
 under `unknown`.

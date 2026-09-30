@@ -4090,6 +4090,9 @@ fn usage_report() -> UsageStatsReport {
             },
         }),
         quota: vec![hsin_core::UsageQuotaEstimate {
+            account: Some("1a2b3c4d".into()),
+            source: Some("openai".into()),
+            current: true,
             limit_id: "codex".into(),
             window: "primary".into(),
             window_minutes: 10_080,
@@ -4113,6 +4116,15 @@ fn usage_report() -> UsageStatsReport {
                 tokens: 8_571_428_571,
                 cost: vec![usd(5_357.0)],
             }),
+            cycles: vec![hsin_core::UsageQuotaCycle {
+                resets_at: 1_791_335_429,
+                first_at: 1_790_730_000,
+                last_at: 1_791_300_000,
+                from_percent: 0.0,
+                to_percent: 4.0,
+                tokens: 80_000_000,
+                cost: vec![usd(50.0)],
+            }],
         }],
     }
 }
@@ -4243,7 +4255,8 @@ fn heatmap_days_and_range_chips_respond_to_the_mouse() {
     assert!(rendered.contains("250 tokens"));
     assert!(rendered.contains("Forecast"));
     assert!(rendered.contains("Month end"));
-    assert!(rendered.contains("Plan quota · pro"));
+    assert!(rendered.contains("Plan quota · pro · openai"));
+    assert!(rendered.contains("0→4%  ≈80.0m · ≈$50.00"));
     assert!(rendered.contains("≈2.0b · ≈$1250"));
     assert!(rendered.contains("(1.6b–2.6b)"));
     assert!(rendered.contains("Per month"));

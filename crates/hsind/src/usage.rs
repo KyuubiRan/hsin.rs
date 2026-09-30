@@ -14,8 +14,8 @@ use hsin_core::{
     UsageAttribution, UsageAttributionCounts, UsageCalendarDay, UsageCost, UsageDailyBucket,
     UsageDataSource, UsageFilterOptions, UsageForecast, UsageModelBreakdown, UsageOverview,
     UsageProjection, UsageProviderBreakdown, UsageProviderOption, UsageQuotaCapacity,
-    UsageQuotaEstimate, UsageStatsQuery, UsageStatsReport, UsageSyncResult, UsageTokenSummary,
-    add_usage_cost, best_model_price,
+    UsageQuotaCycle, UsageQuotaEstimate, UsageStatsQuery, UsageStatsReport, UsageSyncResult,
+    UsageTokenSummary, add_usage_cost, best_model_price,
 };
 use parking_lot::Mutex;
 use rusqlite::{OptionalExtension, params};
@@ -32,7 +32,10 @@ const LAST_CLEANUP_AT_KEY: &str = "usage_last_cleanup_at";
 const ROLLUP_VERSION_KEY: &str = "usage_rollup_version";
 const ROLLUP_VERSION: &str = "1";
 const CODEX_REPAIR_KEY: &str = "usage_codex_repair_version";
-const CODEX_REPAIR_VERSION: &str = "1";
+/// Version 2 also fills in the account and session provider of stored quota readings.
+const CODEX_REPAIR_VERSION: &str = "2";
+/// Cycles listed per quota window.
+const QUOTA_CYCLES_SHOWN: usize = 6;
 /// How far back quota readings are kept and repaired: a few weekly cycles.
 const QUOTA_HISTORY_DAYS: i64 = 35;
 /// Readings whose reset times differ by more than this belong to different cycles.
@@ -79,6 +82,12 @@ struct Cursor {
 struct CodexState {
     model: String,
     cumulative: Option<UsageTokenSummary>,
+    /// The session's provider, from `session_meta`: `openai` for a `ChatGPT` login.
+    #[serde(default)]
+    source: String,
+    /// A hash of the session's account, never the account ID itself.
+    #[serde(default)]
+    account: String,
 }
 
 impl Default for CodexState {
@@ -86,6 +95,8 @@ impl Default for CodexState {
         Self {
             model: UNKNOWN_MODEL.into(),
             cumulative: None,
+            source: String::new(),
+            account: String::new(),
         }
     }
 }
@@ -109,6 +120,8 @@ struct QuotaReading {
 
 #[derive(Debug, Clone)]
 struct QuotaRow {
+    account: String,
+    source: String,
     window: String,
     limit_id: String,
     window_minutes: i64,
@@ -132,6 +145,8 @@ struct StoredEvent {
 }
 
 type UsageRoute = (Option<String>, String, u64, ConnectionMode);
+/// Account, session provider, plan, limit, window name and length.
+type QuotaGroupKey = (String, String, String, String, String, i64);
 
 /// One stored hour of rolled-up usage for one provider revision and model.
 #[derive(Debug, Clone)]
@@ -438,7 +453,7 @@ impl UsageCollector {
                         &value,
                         &quota_reading_key(&hash, line_start),
                         parsed.as_ref(),
-                        &codex.model,
+                        &codex,
                         quota_horizon,
                     )?;
                     parsed
@@ -496,7 +511,7 @@ impl UsageCollector {
         value: &Value,
         key: &str,
         event: Option<&UsageEvent>,
-        model: &str,
+        state: &CodexState,
         horizon: i64,
     ) -> Result<()> {
         let Some(observed_at) = timestamp(value) else {
@@ -510,12 +525,12 @@ impl UsageCollector {
         let connection = self.db.connection.lock();
         for reading in readings {
             connection.execute(
-                "INSERT OR IGNORE INTO usage_quota_readings(reading_key,quota_window,client,observed_at,limit_id,window_minutes,resets_at,used_percent,plan_type,model,input_tokens,cache_write_tokens,cache_read_tokens,output_tokens) VALUES(?1,?2,'codex',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                "INSERT INTO usage_quota_readings(reading_key,quota_window,client,observed_at,limit_id,window_minutes,resets_at,used_percent,plan_type,model,input_tokens,cache_write_tokens,cache_read_tokens,output_tokens,account,session_provider) VALUES(?1,?2,'codex',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15) ON CONFLICT(reading_key,quota_window) DO UPDATE SET model=excluded.model,account=excluded.account,session_provider=excluded.session_provider",
                 params![
                     key, reading.window, observed_at, reading.limit_id, reading.window_minutes,
-                    reading.resets_at, reading.used_percent, reading.plan_type, model,
+                    reading.resets_at, reading.used_percent, reading.plan_type, state.model,
                     tokens.input_tokens, tokens.cache_write_tokens, tokens.cache_read_tokens,
-                    tokens.output_tokens,
+                    tokens.output_tokens, state.account, state.source,
                 ],
             )?;
         }
@@ -574,7 +589,7 @@ impl UsageCollector {
                 &value,
                 &quota_reading_key(&hash, line_start),
                 event.as_ref(),
-                &state.model,
+                &state,
                 horizon,
             )?;
             if let Some(event) = event
@@ -642,12 +657,14 @@ impl UsageCollector {
         let rows = {
             let connection = self.db.connection.lock();
             let mut statement = connection.prepare(
-                "SELECT quota_window,limit_id,window_minutes,resets_at,used_percent,plan_type,model,observed_at,input_tokens,cache_write_tokens,cache_read_tokens,output_tokens FROM usage_quota_readings WHERE client=?1 AND observed_at>=?2 ORDER BY observed_at,rowid",
+                "SELECT quota_window,limit_id,window_minutes,resets_at,used_percent,plan_type,model,observed_at,input_tokens,cache_write_tokens,cache_read_tokens,output_tokens,account,session_provider FROM usage_quota_readings WHERE client=?1 AND observed_at>=?2 ORDER BY observed_at,rowid",
             )?;
             let rows = statement.query_map(
                 params![client.to_string(), now - QUOTA_HISTORY_DAYS * 86_400],
                 |row| {
                     Ok(QuotaRow {
+                        account: row.get(12)?,
+                        source: row.get(13)?,
                         window: row.get(0)?,
                         limit_id: row.get(1)?,
                         window_minutes: row.get(2)?,
@@ -669,15 +686,22 @@ impl UsageCollector {
             )?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        let mut groups = BTreeMap::<(String, String, i64), Vec<QuotaRow>>::new();
+        // Different accounts, session providers and plans have different allowances, and a user
+        // can move between them, so each gets its own series of readings.
+        let mut groups = BTreeMap::<QuotaGroupKey, Vec<QuotaRow>>::new();
         for row in rows {
             groups
-                .entry((row.limit_id.clone(), row.window.clone(), row.window_minutes))
+                .entry((
+                    row.account.clone(),
+                    row.source.clone(),
+                    row.plan_type.clone().unwrap_or_default(),
+                    row.limit_id.clone(),
+                    row.window.clone(),
+                    row.window_minutes,
+                ))
                 .or_default()
                 .push(row);
         }
-        // Only the windows the client reports now: a plan change leaves windows behind that no
-        // longer apply.
         let newest = groups
             .values()
             .filter_map(|rows| rows.last().map(|row| row.observed_at))
@@ -686,13 +710,23 @@ impl UsageCollector {
         let today = Local::now().date_naive();
         let mut estimates = groups
             .values()
-            .filter(|rows| {
-                rows.last()
-                    .is_some_and(|row| row.observed_at >= newest - 3_600)
+            .filter_map(|rows| {
+                let mut estimate = estimate_quota(rows, prices, now, today)?;
+                // What the client reports now; older windows belong to a plan or account that is
+                // no longer in use, and their remaining share means nothing.
+                estimate.current = estimate.observed_at >= newest - 3_600;
+                if !estimate.current {
+                    estimate.remaining = None;
+                }
+                Some(estimate)
             })
-            .filter_map(|rows| estimate_quota(rows, prices, now, today))
             .collect::<Vec<_>>();
-        estimates.sort_by_key(|estimate| std::cmp::Reverse(estimate.observed_at));
+        estimates.sort_by_key(|estimate| {
+            (
+                std::cmp::Reverse(estimate.current),
+                std::cmp::Reverse(estimate.observed_at),
+            )
+        });
         Ok(estimates)
     }
 
@@ -1429,9 +1463,25 @@ fn parse_claude_session(value: &Value) -> Option<UsageEvent> {
 }
 
 fn parse_codex_session(value: &Value, state: &mut CodexState) -> Option<UsageEvent> {
+    if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+        if let Some(source) = value
+            .pointer("/payload/model_provider")
+            .and_then(Value::as_str)
+        {
+            source.clone_into(&mut state.source);
+        }
+        state.account = value
+            .pointer("/payload/creator_account_id")
+            .and_then(Value::as_str)
+            .filter(|account| !account.is_empty())
+            .map(|account| digest(&format!("codex-account:{account}"))[..8].to_owned())
+            .unwrap_or_default();
+        return None;
+    }
     let CodexState {
         model: current_model,
         cumulative,
+        ..
     } = state;
     if value.get("type").and_then(Value::as_str) == Some("turn_context")
         && let Some(model) = value.pointer("/payload/model").and_then(Value::as_str)
@@ -1544,7 +1594,7 @@ fn codex_line(bytes: &[u8]) -> Option<Value> {
         return None;
     }
     let relevant = |needle: &[u8]| bytes.windows(needle.len()).any(|window| window == needle);
-    if !relevant(b"turn_context") && !relevant(b"token_count") {
+    if !relevant(b"turn_context") && !relevant(b"token_count") && !relevant(b"session_meta") {
         return None;
     }
     serde_json::from_slice(bytes).ok()
@@ -1614,6 +1664,7 @@ fn estimate_quota(
     let mut movement = 0.0_f64;
     let mut used_cycles = 0_u32;
     let mut current_peak = latest.used_percent;
+    let mut listed = Vec::new();
     for cycle in &cycles {
         // Movement is the rise of the running peak over the first reading. Usage only counts up
         // to the last rise: what follows it has not moved the meter yet.
@@ -1641,6 +1692,17 @@ fn estimate_quota(
         if (cycle[0].resets_at - latest.resets_at).abs() <= QUOTA_CYCLE_TOLERANCE_SECONDS {
             current_peak = peak;
         }
+        listed.push(UsageQuotaCycle {
+            resets_at: cycle[0].resets_at,
+            first_at: cycle[0].observed_at,
+            last_at: cycle
+                .last()
+                .map_or(cycle[0].observed_at, |row| row.observed_at),
+            from_percent: first,
+            to_percent: peak,
+            tokens: settled.0,
+            cost: settled.1.clone(),
+        });
         let moved = peak - first;
         if moved < 1.0 {
             continue;
@@ -1695,7 +1757,12 @@ fn estimate_quota(
             let minutes = f64::from(days_in_month(today)) * 24.0 * 60.0;
             portion(capacity, minutes / latest.window_minutes as f64)
         });
+    listed.sort_by_key(|cycle| std::cmp::Reverse(cycle.first_at));
+    listed.truncate(QUOTA_CYCLES_SHOWN);
     Some(UsageQuotaEstimate {
+        account: (!latest.account.is_empty()).then(|| latest.account.clone()),
+        source: (!latest.source.is_empty()).then(|| latest.source.clone()),
+        current: true,
         limit_id: latest.limit_id.clone(),
         window: latest.window.clone(),
         window_minutes: u32::try_from(latest.window_minutes).unwrap_or(u32::MAX),
@@ -1708,6 +1775,7 @@ fn estimate_quota(
         capacity,
         remaining,
         monthly,
+        cycles: listed,
     })
 }
 
@@ -2906,6 +2974,8 @@ mod tests {
     #[test]
     fn a_meter_that_barely_moved_gives_no_estimate() {
         let row = |used_percent: f64, input: u64| QuotaRow {
+            account: String::new(),
+            source: "openai".into(),
             window: "primary".into(),
             limit_id: "codex".into(),
             window_minutes: 300,
@@ -2943,6 +3013,8 @@ mod tests {
     #[test]
     fn stale_readings_from_concurrent_sessions_are_not_resets() {
         let row = |used_percent: f64, input: u64| QuotaRow {
+            account: String::new(),
+            source: "openai".into(),
             window: "primary".into(),
             limit_id: "codex".into(),
             window_minutes: 10_080,
@@ -2972,5 +3044,99 @@ mod tests {
         assert!((estimate.basis_percent - 2.0).abs() < f64::EPSILON);
         assert!((estimate.used_percent - 6.0).abs() < f64::EPSILON);
         assert_eq!(estimate.capacity.unwrap().tokens, 15_000);
+    }
+
+    #[test]
+    fn plans_accounts_and_providers_are_estimated_apart() {
+        let (root, db, collector) = test_collector();
+        collector.initialize().expect("initialize");
+        let now = unix_time();
+        let at = |seconds_ago: i64| {
+            DateTime::<Utc>::from_timestamp(now - seconds_ago, 0)
+                .unwrap()
+                .to_rfc3339()
+        };
+        let meta = |provider: &str| {
+            serde_json::json!({"type":"session_meta","timestamp":at(9_000),"payload":{"model_provider":provider,"creator_account_id":"account-1"}})
+                .to_string()
+        };
+        let usage = |seconds_ago: i64, input: u64, limits: Option<(&str, f64, i64)>| {
+            let mut payload = serde_json::json!({
+                "type": "token_count",
+                "info": {"last_token_usage": {"input_tokens": input, "output_tokens": 0}}
+            });
+            if let Some((plan, used_percent, resets_at)) = limits {
+                payload["rate_limits"] = serde_json::json!({
+                    "limit_id": "codex",
+                    "plan_type": plan,
+                    "primary": {"used_percent": used_percent, "window_minutes": 10080, "resets_at": resets_at}
+                });
+            }
+            serde_json::json!({"type":"event_msg","timestamp":at(seconds_ago),"payload":payload})
+                .to_string()
+        };
+        let write = |name: &str, lines: Vec<String>| {
+            fs::write(
+                root.join("codex/sessions").join(name),
+                lines
+                    .into_iter()
+                    .map(|line| line + "\n")
+                    .collect::<String>(),
+            )
+            .expect("log");
+        };
+        let lite = now + 86_400;
+        let pro = now + 6 * 86_400;
+        write(
+            "lite.jsonl",
+            vec![
+                meta("openai"),
+                codex_turn("gpt-6.1-sol"),
+                usage(7_300, 100_000, Some(("prolite", 10.0, lite))),
+                usage(7_250, 100_000, Some(("prolite", 11.0, lite))),
+                usage(7_200, 100_000, Some(("prolite", 12.0, lite))),
+            ],
+        );
+        write(
+            "pro.jsonl",
+            vec![
+                meta("openai"),
+                codex_turn("gpt-6.1-sol"),
+                usage(20, 1_000_000, Some(("pro", 1.0, pro))),
+                usage(10, 1_000_000, Some(("pro", 2.0, pro))),
+            ],
+        );
+        // A relay session at the same time reports no quota and must not dilute either plan.
+        write(
+            "relay.jsonl",
+            vec![
+                meta("hsin"),
+                codex_turn("gpt-6.1-sol"),
+                usage(15, 5_000_000, None),
+            ],
+        );
+        collector.sync().expect("sync");
+        let quota = collector
+            .query(all_time(ClientKind::Codex))
+            .expect("query")
+            .quota;
+        assert_eq!(quota.len(), 2, "{quota:?}");
+        let (current, past) = (&quota[0], &quota[1]);
+        assert_eq!(current.plan_type.as_deref(), Some("pro"));
+        assert!(current.current);
+        assert_eq!(current.source.as_deref(), Some("openai"));
+        assert_eq!(current.account.as_ref().map(String::len), Some(8));
+        assert_eq!(current.capacity.as_ref().unwrap().tokens, 100_000_000);
+        assert!(current.remaining.is_some());
+        assert_eq!(past.plan_type.as_deref(), Some("prolite"));
+        assert!(!past.current);
+        assert!(past.remaining.is_none());
+        assert_eq!(past.capacity.as_ref().unwrap().tokens, 10_000_000);
+        assert_eq!(past.cycles.len(), 1);
+        assert_eq!(past.cycles[0].tokens, 200_000);
+        assert!((past.cycles[0].to_percent - 12.0).abs() < f64::EPSILON);
+        drop(collector);
+        drop(db);
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }
