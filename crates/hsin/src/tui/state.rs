@@ -167,6 +167,9 @@ pub(super) struct StatsScreen {
     pub(super) model: Option<String>,
     pub(super) filter: Option<StatsFilter>,
     pub(super) scroll: u16,
+    pub(super) scroll_max: u16,
+    /// Whether the last frame displayed a bar/line chart that `v` can switch.
+    pub(super) chart_visible: bool,
     /// Covers everything recorded; `from` and `to` only matter for a custom range.
     pub(super) all_time: bool,
     /// The heatmap day under the pointer or last clicked.
@@ -2634,6 +2637,12 @@ impl State {
         if let Some(detail) = &screen.day_detail {
             match key.code {
                 KeyCode::Esc => screen.day_detail = None,
+                KeyCode::Char('v') if screen.chart_visible => {
+                    self.stats_chart_style = self.stats_chart_style.toggled();
+                    self.queue_without_mode_change(Effect::SetStatsChartStyle(
+                        self.stats_chart_style,
+                    ));
+                }
                 // Narrow the whole screen to the day on show.
                 KeyCode::Enter => {
                     let day = detail.date.format("%Y-%m-%d").to_string();
@@ -2785,8 +2794,14 @@ impl State {
         } else {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('s') => keep = false,
-                KeyCode::Char('1') => screen.page = StatsPage::Overview,
-                KeyCode::Char('2') => screen.page = StatsPage::Models,
+                KeyCode::Char('1' | '2') => {
+                    screen.page = if key.code == KeyCode::Char('1') {
+                        StatsPage::Overview
+                    } else {
+                        StatsPage::Models
+                    };
+                    screen.scroll = 0;
+                }
                 KeyCode::Char('t') => {
                     screen.filter = Some(StatsFilter::Time {
                         selected: current_time_preset(&screen),
@@ -2842,8 +2857,8 @@ impl State {
                         .unwrap_or(0);
                     screen.filter = Some(StatsFilter::Model { selected });
                 }
-                // Switch chart style at once and save it, so the next visit opens the same way.
-                KeyCode::Char('v') => {
+                // Only switch the style when the bar/line charts are on screen.
+                KeyCode::Char('v') if screen.page == StatsPage::Models && screen.chart_visible => {
                     self.stats_chart_style = self.stats_chart_style.toggled();
                     self.queue_without_mode_change(Effect::SetStatsChartStyle(
                         self.stats_chart_style,
@@ -2866,7 +2881,7 @@ impl State {
                     stats_query(self.client, &screen),
                 )),
                 KeyCode::Down | KeyCode::Char('k') => {
-                    screen.scroll = screen.scroll.saturating_add(1);
+                    screen.scroll = screen.scroll.saturating_add(1).min(screen.scroll_max);
                 }
                 KeyCode::Up | KeyCode::Char('i') => {
                     screen.scroll = screen.scroll.saturating_sub(1);
@@ -3882,6 +3897,8 @@ fn default_stats_screen() -> StatsScreen {
         model: None,
         filter: None,
         scroll: 0,
+        scroll_max: 0,
+        chart_visible: false,
         all_time: true,
         day: None,
         quota_filter: QuotaFilter::Recent,

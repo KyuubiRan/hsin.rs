@@ -4,10 +4,11 @@ use chrono::{Datelike, Duration, Local, NaiveDate};
 use hsin_core::{StatsChartStyle, UsageCalendarDay, UsageQuotaEstimate, UsageStatsReport};
 use ratatui::{
     Frame,
+    buffer::Buffer,
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap},
 };
 
 use crate::{
@@ -37,6 +38,53 @@ const HEAT: [Color; 5] = [
 const HEAT_LABEL_WIDTH: u16 = 4;
 const HEATMAP_HEIGHT: u16 = 9;
 const MAX_WEEKS: u16 = 53;
+const MODEL_CHART_HEIGHT: u16 = 9;
+
+/// Renders the whole content before copying the visible rows into the terminal. Charts retain
+/// their size in short terminals, and text, pointer coordinates and hit regions scroll together.
+struct StatsViewport {
+    buffer: Buffer,
+    area: Rect,
+    scroll: u16,
+}
+
+impl StatsViewport {
+    fn new(area: Rect, height: u16, scroll: &mut u16, scroll_max: &mut u16) -> Self {
+        *scroll_max = height.saturating_sub(area.height);
+        *scroll = (*scroll).min(*scroll_max);
+        Self {
+            buffer: Buffer::empty(Rect::new(0, 0, area.width, height)),
+            area,
+            scroll: *scroll,
+        }
+    }
+
+    fn pointer(&self, pointer: Option<Position>) -> Option<Position> {
+        pointer
+            .filter(|pointer| self.area.contains(*pointer))
+            .map(|pointer| {
+                Position::new(
+                    pointer.x - self.area.x,
+                    pointer.y - self.area.y + self.scroll,
+                )
+            })
+    }
+
+    fn draw(self, frame: &mut Frame<'_>, hits: &mut HitMap, content_hits: HitMap) {
+        let visible = self
+            .area
+            .height
+            .min(self.buffer.area.height.saturating_sub(self.scroll));
+        let target = frame.buffer_mut();
+        for row in 0..visible {
+            for column in 0..self.area.width {
+                target[(self.area.x + column, self.area.y + row)] =
+                    self.buffer[(column, self.scroll + row)].clone();
+            }
+        }
+        hits.extend_scrolled(content_hits, self.area, self.scroll);
+    }
+}
 
 /// Labels of the time popup, in the order of its presets.
 const TIME_LABELS: [&str; 6] = [
@@ -48,15 +96,17 @@ const TIME_LABELS: [&str; 6] = [
     "stats_custom",
 ];
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn draw_stats(
     frame: &mut Frame<'_>,
     area: Rect,
-    screen: &StatsScreen,
+    screen: &mut StatsScreen,
     loading: bool,
     style: StatsChartStyle,
     i18n: &I18n,
     hits: &mut HitMap,
 ) {
+    screen.chart_visible = false;
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -129,17 +179,15 @@ pub(super) fn draw_stats(
         rows[1],
     );
     match (&screen.report, screen.page) {
-        (Some(report), StatsPage::Overview) => {
-            draw_overview(frame, rows[2], screen, report, i18n, hits);
+        (Some(_), StatsPage::Overview) => {
+            draw_overview(frame, rows[2], screen, i18n, hits);
         }
-        (Some(report), StatsPage::Models) => {
+        (Some(_), StatsPage::Models) => {
             // The day popup covers the charts, so the pointer is over it rather than them.
             let pointer = screen
                 .pointer
                 .filter(|_| screen.day_detail.is_none() && screen.filter.is_none());
-            if let Some(tooltip) =
-                draw_models(frame, rows[2], report, screen.scroll, style, pointer, i18n)
-            {
+            if let Some(tooltip) = draw_models(frame, rows[2], screen, style, pointer, i18n, hits) {
                 draw_tooltip(frame, &tooltip, i18n);
             }
         }
@@ -154,7 +202,10 @@ pub(super) fn draw_stats(
     }
     if let Some(detail) = &screen.day_detail {
         hits.barrier(area);
-        if let Some(tooltip) = draw_day_popup(frame, area, detail, style, screen.pointer, i18n) {
+        let (tooltip, chart_visible) =
+            draw_day_popup(frame, area, detail, style, screen.pointer, i18n);
+        screen.chart_visible = chart_visible;
+        if let Some(tooltip) = tooltip {
             draw_tooltip(frame, &tooltip, i18n);
         }
     }
@@ -170,7 +221,7 @@ fn draw_day_popup(
     style: StatsChartStyle,
     pointer: Option<Position>,
     i18n: &I18n,
-) -> Option<Tooltip> {
+) -> (Option<Tooltip>, bool) {
     let popup = centered_fixed(area, 76, 28);
     frame.render_widget(Clear, popup);
     let block = Block::default()
@@ -188,7 +239,7 @@ fn draw_day_popup(
             Paragraph::new(i18n.text("loading")).style(Style::default().fg(MUTED)),
             inner,
         );
-        return None;
+        return (None, false);
     };
     let tokens = &report.summary;
     if tokens.request_count == 0 && tokens.total_tokens() == 0 {
@@ -196,7 +247,7 @@ fn draw_day_popup(
             Paragraph::new(i18n.text("stats_no_usage")).style(Style::default().fg(MUTED)),
             inner,
         );
-        return None;
+        return (None, false);
     }
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -279,7 +330,14 @@ fn draw_day_popup(
     let hour_labels = (0..hours.len())
         .map(|hour| format!("{hour:02}:00"))
         .collect::<Vec<_>>();
-    let tooltip = draw_series(frame, rows[3], &hours, &hour_labels, style, pointer);
+    let tooltip = draw_series(
+        frame.buffer_mut(),
+        rows[3],
+        &hours,
+        &hour_labels,
+        style,
+        pointer,
+    );
     let mut lines = vec![Line::from(Span::styled(i18n.text("stats_by_model"), bold))];
     let cost = |costs: &[hsin_core::UsageCost]| {
         if costs.is_empty() {
@@ -310,7 +368,7 @@ fn draw_day_popup(
         ))
     }));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), rows[5]);
-    tooltip
+    (tooltip, rows[3].width > 0 && rows[3].height > 0)
 }
 
 /// The page tabs; returns the width they take.
@@ -412,33 +470,50 @@ fn draw_range_chips(
 fn draw_overview(
     frame: &mut Frame<'_>,
     area: Rect,
-    screen: &StatsScreen,
-    report: &UsageStatsReport,
+    screen: &mut StatsScreen,
     i18n: &I18n,
     hits: &mut HitMap,
 ) {
-    if area.height < 16 || area.width < 56 {
-        draw_summary(frame, area, screen, report, i18n);
-        return;
+    let report = screen.report.as_ref().expect("loaded overview");
+    let summary = summary_paragraph(area.width, screen, report, i18n);
+    let summary_height = u16::try_from(summary.line_count(area.width)).unwrap_or(u16::MAX);
+    let heatmap_height = if area.width >= 56 {
+        HEATMAP_HEIGHT + 2
+    } else {
+        0
+    };
+    let height = heatmap_height.saturating_add(summary_height);
+    let mut viewport = StatsViewport::new(area, height, &mut screen.scroll, &mut screen.scroll_max);
+    let mut content_hits = HitMap::default();
+    if heatmap_height > 0 {
+        draw_heatmap(
+            &mut viewport.buffer,
+            Rect::new(0, 0, area.width, HEATMAP_HEIGHT),
+            report,
+            screen.day,
+            i18n,
+            &mut content_hits,
+        );
+        draw_day_detail(
+            &mut viewport.buffer,
+            Rect::new(0, HEATMAP_HEIGHT, area.width, 1),
+            report,
+            screen.day,
+            i18n,
+        );
     }
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(HEATMAP_HEIGHT),
-            Constraint::Length(2),
-            Constraint::Min(4),
-        ])
-        .split(area);
-    draw_heatmap(frame, rows[0], report, screen.day, i18n, hits);
-    draw_day_detail(frame, rows[1], report, screen.day, i18n);
-    draw_summary(frame, rows[2], screen, report, i18n);
+    summary.render(
+        Rect::new(0, heatmap_height, area.width, summary_height),
+        &mut viewport.buffer,
+    );
+    viewport.draw(frame, hits, content_hits);
 }
 
 /// A contribution-style calendar: one column per week ending with the current one, one row per
 /// weekday, as many weeks as fit up to a year.
 #[allow(clippy::too_many_lines)]
 fn draw_heatmap(
-    frame: &mut Frame<'_>,
+    buffer: &mut Buffer,
     area: Rect,
     report: &UsageStatsReport,
     selected: Option<NaiveDate>,
@@ -464,13 +539,11 @@ fn draw_heatmap(
     );
 
     let title = i18n.text("stats_activity");
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            title,
-            Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
-        ))),
-        Rect { height: 1, ..area },
-    );
+    Paragraph::new(Line::from(Span::styled(
+        title,
+        Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+    )))
+    .render(Rect { height: 1, ..area }, buffer);
     let mut legend = vec![Span::styled(
         format!("{} ", i18n.text("stats_less")),
         Style::default().fg(MUTED),
@@ -486,14 +559,14 @@ fn draw_heatmap(
     let legend = Line::from(legend);
     let legend_width = u16::try_from(legend.width()).unwrap_or(u16::MAX);
     if legend_width.saturating_add(display_width_u16(title) + 2) <= area.width {
-        frame.render_widget(
-            Paragraph::new(legend),
+        Paragraph::new(legend).render(
             Rect {
                 x: area.right().saturating_sub(legend_width),
                 y: area.y,
                 width: legend_width,
                 height: 1,
             },
+            buffer,
         );
     }
 
@@ -515,15 +588,17 @@ fn draw_heatmap(
             month_line.push_str(label);
         }
     }
-    frame.render_widget(
-        Paragraph::new(month_line).style(Style::default().fg(MUTED)),
-        Rect {
-            x: grid_x,
-            y: area.y + 1,
-            width: area.width.saturating_sub(HEAT_LABEL_WIDTH),
-            height: 1,
-        },
-    );
+    Paragraph::new(month_line)
+        .style(Style::default().fg(MUTED))
+        .render(
+            Rect {
+                x: grid_x,
+                y: area.y + 1,
+                width: area.width.saturating_sub(HEAT_LABEL_WIDTH),
+                height: 1,
+            },
+            buffer,
+        );
 
     let weekdays = i18n.text("stats_weekdays").split(',').collect::<Vec<_>>();
     for weekday in 0..7_u16 {
@@ -562,20 +637,20 @@ fn draw_heatmap(
                 Hit::HeatDay(date),
             );
         }
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)),
+        Paragraph::new(Line::from(spans)).render(
             Rect {
                 x: area.x,
                 y,
                 width: area.width,
                 height: 1,
             },
+            buffer,
         );
     }
 }
 
 fn draw_day_detail(
-    frame: &mut Frame<'_>,
+    buffer: &mut Buffer,
     area: Rect,
     report: &UsageStatsReport,
     selected: Option<NaiveDate>,
@@ -617,18 +692,16 @@ fn draw_day_detail(
             Style::default().fg(MUTED),
         )),
     };
-    frame.render_widget(Paragraph::new(line), Rect { height: 1, ..area });
+    Paragraph::new(line).render(Rect { height: 1, ..area }, buffer);
 }
 
 #[allow(clippy::too_many_lines)]
-fn draw_summary(
-    frame: &mut Frame<'_>,
-    area: Rect,
+fn summary_paragraph(
+    width: u16,
     screen: &StatsScreen,
     report: &UsageStatsReport,
     i18n: &I18n,
-) {
-    let scroll = screen.scroll;
+) -> Paragraph<'static> {
     let tokens = &report.summary;
     let overview = &report.overview;
     let none = || "—".to_owned();
@@ -690,8 +763,8 @@ fn draw_summary(
         ]
     };
     let mut lines = Vec::new();
-    if area.width >= 60 {
-        let column = usize::from(area.width / 2);
+    if width >= 60 {
+        let column = usize::from(width / 2);
         for pair in cells.chunks(2) {
             let mut spans = cell(pair[0].0, &pair[0].1);
             let used = display_width(pair[0].0) + 2 + display_width(&pair[0].1);
@@ -772,7 +845,7 @@ fn draw_summary(
             Style::default().fg(MUTED),
         )),
         Line::from(Span::styled(
-            i18n.text("stats_source_note"),
+            i18n.text("stats_source_note").to_owned(),
             Style::default().fg(MUTED),
         )),
     ];
@@ -790,7 +863,7 @@ fn draw_summary(
         ))
     }));
     // A narrow terminal leads with the token breakdown, which the grid only summarizes.
-    if area.width < 60 {
+    if width < 60 {
         details.remove(0);
         details.insert(
             0,
@@ -812,12 +885,7 @@ fn draw_summary(
     } else {
         lines.append(&mut details);
     }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .scroll((scroll, 0)),
-        area,
-    );
+    Paragraph::new(lines).wrap(Wrap { trim: true })
 }
 
 fn metric(label: &str, value: u64) -> Span<'static> {
@@ -960,81 +1028,112 @@ fn quota_window_label(minutes: u32, i18n: &I18n) -> String {
 fn draw_models(
     frame: &mut Frame<'_>,
     area: Rect,
-    report: &UsageStatsReport,
-    scroll: u16,
+    screen: &mut StatsScreen,
     style: StatsChartStyle,
     pointer: Option<Position>,
     i18n: &I18n,
+    hits: &mut HitMap,
 ) -> Option<Tooltip> {
+    let report = screen.report.as_ref().expect("loaded models");
     if report.models.is_empty() {
+        screen.scroll = 0;
+        screen.scroll_max = 0;
         frame.render_widget(
             Paragraph::new(i18n.text("stats_no_usage")).style(Style::default().fg(MUTED)),
             area,
         );
         return None;
     }
-    if area.width < 60 || area.height < 14 {
-        let lines = report
-            .models
+    let chart_count = if area.width >= 60 {
+        report.models.len().min(4)
+    } else {
+        0
+    };
+    let mut lines = report
+        .models
+        .iter()
+        .take(if chart_count == 0 {
+            report.models.len()
+        } else {
+            chart_count
+        })
+        .map(|model| model_line(model, i18n))
+        .collect::<Vec<_>>();
+    if chart_count > 0 && report.models.len() > chart_count {
+        let other = report.models[chart_count..]
             .iter()
-            .map(|model| model_line(model, i18n))
-            .collect::<Vec<_>>();
-        frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: true })
-                .scroll((scroll, 0)),
-            area,
-        );
-        return None;
+            .map(|model| model.tokens.total_tokens())
+            .sum::<u64>();
+        lines.push(Line::from(format!(
+            "{}  {}",
+            i18n.text("stats_other"),
+            compact(other)
+        )));
     }
-    let chart_count = report.models.len().min(4);
-    // The charts take what the model list below them leaves: a line per charted model, one for
-    // the rest, and a blank line.
-    let list_rows = u16::try_from(chart_count).unwrap_or(4) + u16::from(report.models.len() > 4);
-    let chart_height = area.height.saturating_sub(list_rows + 1).max(6);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(chart_height), Constraint::Min(4)])
-        .split(area);
-    frame.render_widget(
-        Paragraph::new(legend(i18n)),
-        Rect {
-            height: 1,
-            ..rows[0]
-        },
-    );
+    let list = Paragraph::new(lines).wrap(Wrap { trim: true });
+    let list_height = u16::try_from(list.line_count(area.width)).unwrap_or(u16::MAX);
+    let plots_height = if chart_count > 0 {
+        area.height
+            .saturating_sub(list_height.saturating_add(2))
+            .max(u16::try_from(chart_count).unwrap_or(4) * MODEL_CHART_HEIGHT)
+    } else {
+        0
+    };
+    let list_start = plots_height + if chart_count > 0 { 2 } else { 0 };
     let charts = Layout::default()
         .direction(Direction::Vertical)
         .constraints(
             (0..chart_count).map(|_| Constraint::Ratio(1, u32::try_from(chart_count).unwrap_or(1))),
         )
-        .split(Rect {
-            y: rows[0].y + 1,
-            height: rows[0].height.saturating_sub(1),
-            ..rows[0]
+        .split(Rect::new(0, 1, area.width, plots_height));
+    let mut viewport = StatsViewport::new(
+        area,
+        list_start.saturating_add(list_height),
+        &mut screen.scroll,
+        &mut screen.scroll_max,
+    );
+    screen.chart_visible = report
+        .models
+        .iter()
+        .take(chart_count)
+        .zip(charts.iter())
+        .any(|(model, chart)| {
+            let chart = Rect::new(
+                chart.x,
+                chart.y + 1,
+                chart.width,
+                chart.height.saturating_sub(1),
+            );
+            let visible = chart.intersection(Rect::new(0, screen.scroll, area.width, area.height));
+            !model.daily.is_empty() && visible.width > 0 && visible.height > 0
         });
+    let pointer = viewport.pointer(pointer);
+    if chart_count > 0 {
+        Paragraph::new(legend(i18n)).render(Rect::new(0, 0, area.width, 1), &mut viewport.buffer);
+    }
     let mut tooltip = None;
-    for (model, chart_area) in report.models.iter().take(4).zip(charts.iter()) {
+    for (model, chart_area) in report.models.iter().take(chart_count).zip(charts.iter()) {
         let cost = if model.cost.is_empty() {
             String::new()
         } else {
             format!(" · ≈{}", format_cost(&model.cost))
         };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    model.model.clone(),
-                    Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(" · {}{cost}", compact(model.tokens.total_tokens())),
-                    Style::default().fg(MUTED),
-                ),
-            ])),
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                model.model.clone(),
+                Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" · {}{cost}", compact(model.tokens.total_tokens())),
+                Style::default().fg(MUTED),
+            ),
+        ]))
+        .render(
             Rect {
                 height: 1,
                 ..*chart_area
             },
+            &mut viewport.buffer,
         );
         let points = model
             .daily
@@ -1047,7 +1146,7 @@ fn draw_models(
             .map(|bucket| bucket.date.get(5..).unwrap_or(&bucket.date).to_owned())
             .collect::<Vec<_>>();
         tooltip = draw_series(
-            frame,
+            &mut viewport.buffer,
             Rect {
                 y: chart_area.y + 1,
                 height: chart_area.height.saturating_sub(1),
@@ -1060,29 +1159,12 @@ fn draw_models(
         )
         .or(tooltip);
     }
-    let mut lines = report
-        .models
-        .iter()
-        .take(4)
-        .map(|model| model_line(model, i18n))
-        .collect::<Vec<_>>();
-    if report.models.len() > 4 {
-        let other = report.models[4..]
-            .iter()
-            .map(|model| model.tokens.total_tokens())
-            .sum::<u64>();
-        lines.push(Line::from(format!(
-            "{}  {}",
-            i18n.text("stats_other"),
-            compact(other)
-        )));
-    }
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .scroll((scroll, 0)),
-        rows[1],
+    list.render(
+        Rect::new(0, list_start, area.width, list_height),
+        &mut viewport.buffer,
     );
+    let tooltip = tooltip.map(|tooltip| tooltip.in_viewport(area, viewport.scroll));
+    viewport.draw(frame, hits, HitMap::default());
     tooltip
 }
 

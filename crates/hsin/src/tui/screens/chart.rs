@@ -11,7 +11,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     symbols::Marker,
     text::{Line, Span},
-    widgets::{Axis, Block, Borders, Chart, Clear, Dataset, GraphType, Padding, Paragraph},
+    widgets::{Axis, Block, Borders, Chart, Clear, Dataset, GraphType, Padding, Paragraph, Widget},
 };
 
 use crate::{i18n::I18n, usage_format::compact_tokens};
@@ -69,10 +69,18 @@ pub(super) struct Tooltip {
     values: [u64; 3],
 }
 
+impl Tooltip {
+    pub(super) fn in_viewport(mut self, viewport: Rect, scroll: u16) -> Self {
+        self.anchor.x += viewport.x;
+        self.anchor.y = viewport.y + self.anchor.y.saturating_sub(scroll);
+        self
+    }
+}
+
 /// Draws `points`, named one to one by `labels`, and returns the tooltip for the point under
 /// `pointer`, if any.
 pub(super) fn draw_series(
-    frame: &mut Frame<'_>,
+    buffer: &mut Buffer,
     area: Rect,
     points: &[[u64; 3]],
     labels: &[String],
@@ -84,8 +92,8 @@ pub(super) fn draw_series(
     }
     let pointer = pointer.filter(|pointer| area.contains(*pointer));
     let hovered = match style {
-        StatsChartStyle::Bar => draw_bars(frame, area, points, labels, pointer),
-        StatsChartStyle::Line => draw_lines(frame, area, points, labels, pointer),
+        StatsChartStyle::Bar => draw_bars(buffer, area, points, labels, pointer),
+        StatsChartStyle::Line => draw_lines(buffer, area, points, labels, pointer),
     }?;
     let values = points[hovered.clone()]
         .iter()
@@ -197,7 +205,7 @@ pub(super) fn draw_tooltip(frame: &mut Frame<'_>, tooltip: &Tooltip, i18n: &I18n
 /// of the topmost one. The y axis runs linearly from zero to a round value at or above the
 /// tallest bar. Returns the points behind the bar under the pointer.
 fn draw_bars(
-    frame: &mut Frame<'_>,
+    buffer: &mut Buffer,
     area: Rect,
     points: &[[u64; 3]],
     labels: &[String],
@@ -245,7 +253,7 @@ fn draw_bars(
             .iter()
             .map(|(value, label)| (bar_row(*value, *top, plot.height), label.clone()))
             .collect::<Vec<_>>();
-        axes.draw(frame.buffer_mut(), &y_ticks, &x_ticks, None);
+        axes.draw(buffer, &y_ticks, &x_ticks, None);
     }
     let hovered = pointer
         .filter(|pointer| plot.contains(*pointer))
@@ -254,7 +262,6 @@ fn draw_bars(
             (0..count).find(|column| start(column + 1) > x)
         });
     let units = u64::from(plot.height) * 8;
-    let buffer = frame.buffer_mut();
     for (index, column) in columns.iter().enumerate() {
         let bounds = stack(*column, *top, units);
         let top = bounds[2];
@@ -428,7 +435,7 @@ fn add(sum: [u64; 3], point: [u64; 3]) -> [u64; 3] {
     clippy::cast_sign_loss
 )]
 fn draw_lines(
-    frame: &mut Frame<'_>,
+    buffer: &mut Buffer,
     area: Rect,
     points: &[[u64; 3]],
     labels: &[String],
@@ -488,7 +495,7 @@ fn draw_lines(
                 .collect(),
             plot.width,
         );
-        axes.draw(frame.buffer_mut(), &y_ticks, &x_ticks, Some(LOG));
+        axes.draw(buffer, &y_ticks, &x_ticks, Some(LOG));
     }
     let hovered = pointer
         .filter(|pointer| plot.contains(*pointer))
@@ -507,18 +514,15 @@ fn draw_lines(
                 .data(data)
         })
         .collect::<Vec<_>>();
-    frame.render_widget(
-        Chart::new(datasets)
-            .x_axis(Axis::default().bounds([0.0, last.max(1) as f64]))
-            .y_axis(Axis::default().bounds([0.0, f64::from(decades)]))
-            .legend_position(None)
-            .style(Style::default().fg(RED)),
-        plot,
-    );
+    Chart::new(datasets)
+        .x_axis(Axis::default().bounds([0.0, last.max(1) as f64]))
+        .y_axis(Axis::default().bounds([0.0, f64::from(decades)]))
+        .legend_position(None)
+        .style(Style::default().fg(RED))
+        .render(plot, buffer);
     // A guide through the hovered point, behind the lines: only blank cells take it.
     if let Some(index) = hovered {
         let x = plot.x + column_of(index);
-        let buffer = frame.buffer_mut();
         for y in plot.top()..plot.bottom() {
             let cell = &mut buffer[(x, y)];
             if cell.symbol() == " " {
@@ -697,7 +701,8 @@ mod tests {
         let mut tooltip = None;
         terminal
             .draw(|frame| {
-                tooltip = draw_series(frame, frame.area(), points, &labels, style, pointer);
+                let area = frame.area();
+                tooltip = draw_series(frame.buffer_mut(), area, points, &labels, style, pointer);
             })
             .unwrap();
         (terminal.backend().buffer().clone(), tooltip)

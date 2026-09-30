@@ -65,7 +65,7 @@ fn draw_frame(frame: &mut Frame<'_>, state: &mut State, i18n: &I18n, hits: &mut 
         draw_footer(frame, rows[3], state, i18n, hits);
         return;
     }
-    if let InputMode::Stats(screen) = &state.input {
+    if let InputMode::Stats(screen) = &mut state.input {
         draw_stats(
             frame,
             rows[2],

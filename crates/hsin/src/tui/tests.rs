@@ -4166,6 +4166,8 @@ fn stats_render_wide_and_compact_without_losing_token_details() {
                 model: None,
                 filter: None,
                 scroll: 0,
+                scroll_max: 0,
+                chart_visible: false,
                 all_time: true,
                 day: None,
                 quota_filter: state::QuotaFilter::Recent,
@@ -4715,4 +4717,165 @@ fn chart_style_toggles_saves_and_follows_the_daemon() {
         },
     });
     assert_eq!(state.stats_chart_style, hsin_core::StatsChartStyle::Bar);
+}
+
+#[test]
+fn stats_scroll_the_heatmap_and_stop_at_the_last_content_row() {
+    let mut state = stats_state();
+    let first = render(&mut state, 120, 26);
+    assert!(first.contains("Activity"), "{first}");
+    state.reduce(key(KeyCode::Down));
+    let scrolled = render(&mut state, 120, 26);
+    assert!(!scrolled.contains("Activity"), "the heatmap scrolls too");
+    for _ in 0..100 {
+        state.reduce(key(KeyCode::Down));
+        render(&mut state, 120, 26);
+    }
+    let last = render(&mut state, 120, 26);
+    assert!(last.contains("~Example"), "{last}");
+    state.reduce(key(KeyCode::Down));
+    assert_eq!(render(&mut state, 120, 26), last);
+}
+
+#[test]
+fn v_is_only_advertised_and_active_when_model_charts_are_visible() {
+    let mut state = stats_state();
+    let overview = render(&mut state, 120, 26);
+    assert!(!overview.contains("v chart"));
+    state.reduce(key(KeyCode::Char('v')));
+    assert_eq!(stats_screen(&state).page, state::StatsPage::Overview);
+    assert_eq!(state.stats_chart_style, hsin_core::StatsChartStyle::Bar);
+    assert!(state.take_effect().is_none());
+    state.reduce(key(KeyCode::Char('2')));
+    assert_eq!(stats_screen(&state).page, state::StatsPage::Models);
+    let charts = render(&mut state, 120, 26);
+    assert!(charts.contains("Input (cache hit)"), "{charts}");
+    assert!(charts.contains("09-14"), "{charts}");
+    assert!(charts.contains("v chart style"));
+}
+
+#[test]
+fn v_switches_the_chart_in_a_day_popup() {
+    let mut state = stats_state();
+    render(&mut state, 120, 44);
+    let today = chrono::Local::now().date_naive();
+    let cell = hit_area(&state, |hit| *hit == super::mouse::Hit::HeatDay(today));
+    state.reduce(click_at(cell));
+    let Some(Effect::QueryUsageDay(query)) = state.take_effect() else {
+        panic!("day query");
+    };
+    let mut report = usage_report();
+    report.query = query;
+    state.reduce(Action::DayUsageLoaded(report));
+    assert!(render(&mut state, 120, 44).contains("v chart style"));
+    state.reduce(key(KeyCode::Char('v')));
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::SetStatsChartStyle(hsin_core::StatsChartStyle::Line))
+    ));
+    assert!(render(&mut state, 120, 44).contains("log"));
+}
+
+#[test]
+fn scrolled_heatmap_clicks_keep_their_date_and_resize_clamps_the_offset() {
+    let mut state = stats_state();
+    render(&mut state, 120, 26);
+    let today = chrono::Local::now().date_naive();
+    let original = hit_area(&state, |hit| *hit == super::mouse::Hit::HeatDay(today));
+    state.reduce(key(KeyCode::Down));
+    render(&mut state, 120, 26);
+    let scrolled = hit_area(&state, |hit| *hit == super::mouse::Hit::HeatDay(today));
+    assert_eq!(scrolled.y, original.y - 1);
+    state.reduce(click_at(scrolled));
+    assert_eq!(
+        stats_screen(&state).day_detail.as_ref().unwrap().date,
+        today
+    );
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::QueryUsageDay(_))
+    ));
+    state.reduce(key(KeyCode::Esc));
+    for _ in 0..100 {
+        state.reduce(key(KeyCode::Down));
+    }
+    render(&mut state, 120, 26);
+    assert!(stats_screen(&state).scroll > 0);
+    let enlarged = render(&mut state, 120, 60);
+    assert_eq!(stats_screen(&state).scroll, 0);
+    assert!(enlarged.contains("Activity"));
+    assert!(enlarged.contains("~Example"));
+}
+
+#[test]
+fn short_model_view_scrolls_all_charts_and_rejects_v_without_visible_charts() {
+    let mut state = stats_state();
+    let mut report = usage_report();
+    report.models = (0..4)
+        .map(|index| {
+            let mut model = report.models[0].clone();
+            model.model = format!("chart-model-{index}");
+            model
+        })
+        .collect();
+    state.reduce(Action::UsageLoaded(report));
+    state.reduce(key(KeyCode::Char('2')));
+    for model in 0..4 {
+        let mut visible = false;
+        for _ in 0..50 {
+            let rendered = render(&mut state, 120, 26);
+            if rendered.contains(&format!("chart-model-{model} ·")) {
+                visible = true;
+                break;
+            }
+            state.reduce(key(KeyCode::Down));
+        }
+        assert!(visible, "chart {model} is reachable by scrolling");
+    }
+    let last = render(&mut state, 120, 26);
+    for _ in 0..100 {
+        state.reduce(key(KeyCode::Down));
+    }
+    let bottom = render(&mut state, 120, 26);
+    assert!(bottom.contains("chart-model-3"));
+    assert_ne!(bottom, last);
+    let narrow = render(&mut state, 48, 16);
+    assert!(!narrow.contains("v chart"));
+    let style = state.stats_chart_style;
+    state.reduce(key(KeyCode::Char('v')));
+    assert_eq!(state.stats_chart_style, style);
+    assert!(state.take_effect().is_none());
+}
+
+#[test]
+fn hovering_a_scrolled_chart_uses_the_visible_point() {
+    let mut state = stats_state();
+    let mut report = usage_report();
+    report.models = vec![report.models[0].clone(); 4];
+    state.reduce(Action::UsageLoaded(report));
+    state.reduce(key(KeyCode::Char('2')));
+    render(&mut state, 120, 26);
+    for _ in 0..20 {
+        state.reduce(key(KeyCode::Down));
+    }
+    let locale = I18n::new(Some(LANGUAGE_EN_US));
+    let mut terminal = Terminal::new(TestBackend::new(120, 26)).expect("terminal");
+    terminal
+        .draw(|frame| draw(frame, &mut state, &locale))
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    let (column, row) = (11..23)
+        .flat_map(|row| (0..120).map(move |column| (column, row)))
+        .find(|&(column, row)| buffer[(column, row)].symbol() == "█")
+        .expect("a visible bar after scrolling");
+    state.reduce(Action::Mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }));
+    let tooltip = render(&mut state, 120, 26);
+    assert!(tooltip.contains("Input (cache hit)"), "{tooltip}");
+    assert!(tooltip.contains("09-14"), "{tooltip}");
+    assert!(tooltip.contains("250"), "{tooltip}");
 }

@@ -47,6 +47,23 @@ impl HitMap {
         self.push(area, Hit::Barrier);
     }
 
+    /// Maps content coordinates into a scrolled viewport and clips partially visible regions.
+    pub(super) fn extend_scrolled(&mut self, content: Self, viewport: Rect, scroll: u16) {
+        let visible = Rect::new(0, scroll, viewport.width, viewport.height);
+        for (area, hit) in content.regions {
+            let clipped = area.intersection(visible);
+            self.push(
+                Rect::new(
+                    viewport.x + clipped.x,
+                    viewport.y + clipped.y.saturating_sub(scroll),
+                    clipped.width,
+                    clipped.height,
+                ),
+                hit,
+            );
+        }
+    }
+
     /// Registers the rows a `List` actually drew, reading the scroll offset ratatui settled on.
     pub(super) fn list(
         &mut self,
