@@ -262,8 +262,13 @@ impl UsageCollector {
             }
         }
         self.cleanup_if_due(now, true)?;
-        self.backfill_rollups(now)?;
-        self.repair_codex_sessions(now)
+        self.backfill_rollups(now)
+    }
+
+    /// Runs the one-time Codex repair; the daemon calls it in the background after startup, since
+    /// rereading weeks of sessions must not hold up IPC.
+    pub(crate) fn repair_legacy_codex_usage(&self) -> Result<()> {
+        self.repair_codex_sessions(unix_time())
     }
 
     pub(crate) fn record_current_route(&self, client: ClientKind) -> Result<()> {
@@ -530,7 +535,9 @@ impl UsageCollector {
             let recent =
                 fs::metadata(&path).is_ok_and(|metadata| modified_seconds(&metadata) >= horizon);
             if client == ClientKind::Codex && recent {
-                // One unreadable file must not keep the others unrepaired.
+                // Per file, so a sync waits for one file at most and never races this pass on the
+                // same cursor. One unreadable file must not keep the others unrepaired.
+                let _guard = self.sync_lock.lock();
                 let _ = self.repair_codex_file(&path, horizon, now);
             }
         }
@@ -669,9 +676,20 @@ impl UsageCollector {
                 .or_default()
                 .push(row);
         }
+        // Only the windows the client reports now: a plan change leaves windows behind that no
+        // longer apply.
+        let newest = groups
+            .values()
+            .filter_map(|rows| rows.last().map(|row| row.observed_at))
+            .max()
+            .unwrap_or(0);
         let today = Local::now().date_naive();
         let mut estimates = groups
             .values()
+            .filter(|rows| {
+                rows.last()
+                    .is_some_and(|row| row.observed_at >= newest - 3_600)
+            })
             .filter_map(|rows| estimate_quota(rows, prices, now, today))
             .collect::<Vec<_>>();
         estimates.sort_by_key(|estimate| std::cmp::Reverse(estimate.observed_at));
@@ -1569,7 +1587,7 @@ fn quota_reading_key(hash: &str, line_start: u64) -> String {
 /// Tokens and cost spent while the meter moved, per cycle, pooled over the recent cycles:
 /// allowance ≈ Σ tokens × 100 / Σ meter movement. Meter readings are whole percents, so each
 /// cycle's movement is uncertain by one point either way, which the range reports.
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
 fn estimate_quota(
     rows: &[QuotaRow],
     prices: &[ModelPrice],
@@ -1577,49 +1595,67 @@ fn estimate_quota(
     today: NaiveDate,
 ) -> Option<UsageQuotaEstimate> {
     let latest = rows.last()?;
-    let mut cycles: Vec<&[QuotaRow]> = Vec::new();
-    let mut start = 0;
-    for index in 1..rows.len() {
-        let previous = &rows[index - 1];
-        let row = &rows[index];
-        if (row.resets_at - previous.resets_at).abs() > QUOTA_CYCLE_TOLERANCE_SECONDS
-            || row.used_percent + 0.5 < previous.used_percent
-        {
-            cycles.push(&rows[start..index]);
-            start = index;
+    // A cycle is every reading that names the same reset time. Concurrent sessions interleave
+    // their readings, and one that started earlier can report a slightly older percentage, so a
+    // dip inside a cycle is noise rather than a reset: a real reset names a new reset time.
+    let mut cycles: Vec<Vec<&QuotaRow>> = Vec::new();
+    for row in rows {
+        match cycles.iter_mut().find(|cycle| {
+            (cycle[0].resets_at - row.resets_at).abs() <= QUOTA_CYCLE_TOLERANCE_SECONDS
+        }) {
+            Some(cycle) => cycle.push(row),
+            None => cycles.push(vec![row]),
         }
     }
-    cycles.push(&rows[start..]);
 
     let mut resolved = HashMap::<&str, Option<&ModelPrice>>::new();
     let mut tokens = 0_u64;
     let mut cost = Vec::new();
     let mut movement = 0.0_f64;
     let mut used_cycles = 0_u32;
-    for cycle in cycles {
-        let (Some(first), Some(last)) = (cycle.first(), cycle.last()) else {
-            continue;
-        };
-        let moved = last.used_percent - first.used_percent;
+    let mut current_peak = latest.used_percent;
+    for cycle in &cycles {
+        // Movement is the rise of the running peak over the first reading. Usage only counts up
+        // to the last rise: what follows it has not moved the meter yet.
+        let first = cycle[0].used_percent;
+        let mut peak = first;
+        let mut settled = (0_u64, Vec::new());
+        let mut pending = (0_u64, Vec::new());
+        for row in &cycle[1..] {
+            pending.0 += row.tokens.total_tokens();
+            let price = *resolved
+                .entry(row.model.as_str())
+                .or_insert_with(|| best_model_price(prices, None, &row.model));
+            if let Some(price) = price {
+                add_usage_cost(&mut pending.1, &price.currency, price.cost(&row.tokens));
+            }
+            if row.used_percent > peak {
+                peak = row.used_percent;
+                settled.0 += pending.0;
+                for entry in std::mem::take(&mut pending.1) {
+                    add_usage_cost(&mut settled.1, &entry.currency, entry.amount);
+                }
+                pending.0 = 0;
+            }
+        }
+        if (cycle[0].resets_at - latest.resets_at).abs() <= QUOTA_CYCLE_TOLERANCE_SECONDS {
+            current_peak = peak;
+        }
+        let moved = peak - first;
         if moved < 1.0 {
             continue;
         }
         movement += moved;
         used_cycles += 1;
-        for row in &cycle[1..] {
-            tokens += row.tokens.total_tokens();
-            let price = *resolved
-                .entry(row.model.as_str())
-                .or_insert_with(|| best_model_price(prices, None, &row.model));
-            if let Some(price) = price {
-                add_usage_cost(&mut cost, &price.currency, price.cost(&row.tokens));
-            }
+        tokens += settled.0;
+        for entry in settled.1 {
+            add_usage_cost(&mut cost, &entry.currency, entry.amount);
         }
     }
     let used_percent = if now >= latest.resets_at {
         0.0
     } else {
-        latest.used_percent
+        current_peak
     };
     let scale = |value: f64, percent: f64| value * 100.0 / percent;
     let capacity = (movement >= 1.0).then(|| {
@@ -2883,9 +2919,13 @@ mod tests {
         let today = Local::now().date_naive();
         let flat = estimate_quota(&[row(3.0, 0), row(3.0, 500)], &[], 0, today).unwrap();
         assert!(flat.capacity.is_none());
-        // A reset starts a new cycle instead of reading as negative movement.
+        // A reset names a new reset time and starts a new cycle.
+        let next = |used_percent: f64, input: u64| QuotaRow {
+            resets_at: 30_000,
+            ..row(used_percent, input)
+        };
         let reset = estimate_quota(
-            &[row(90.0, 0), row(92.0, 100), row(1.0, 0), row(3.0, 100)],
+            &[row(90.0, 0), row(92.0, 100), next(1.0, 0), next(3.0, 100)],
             &[],
             0,
             today,
@@ -2898,5 +2938,39 @@ mod tests {
             "a five-hour window has no monthly figure"
         );
         assert_eq!(reset.capacity.unwrap().tokens, 5_000);
+    }
+
+    #[test]
+    fn stale_readings_from_concurrent_sessions_are_not_resets() {
+        let row = |used_percent: f64, input: u64| QuotaRow {
+            window: "primary".into(),
+            limit_id: "codex".into(),
+            window_minutes: 10_080,
+            resets_at: 10_000,
+            used_percent,
+            plan_type: Some("pro".into()),
+            model: "gpt-6.1-sol".into(),
+            observed_at: 0,
+            tokens: tokens(input, 0),
+        };
+        // A session still reporting 4% interleaves with one at 5%; the trailing 900 tokens have
+        // not moved the meter yet and stay out.
+        let estimate = estimate_quota(
+            &[
+                row(4.0, 0),
+                row(5.0, 100),
+                row(4.0, 100),
+                row(6.0, 100),
+                row(6.0, 900),
+            ],
+            &[],
+            0,
+            Local::now().date_naive(),
+        )
+        .unwrap();
+        assert_eq!(estimate.basis_cycles, 1);
+        assert!((estimate.basis_percent - 2.0).abs() < f64::EPSILON);
+        assert!((estimate.used_percent - 6.0).abs() < f64::EPSILON);
+        assert_eq!(estimate.capacity.unwrap().tokens, 15_000);
     }
 }

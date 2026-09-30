@@ -55,12 +55,16 @@ days; it follows the Provider and model filters but not the queried range.
 
 Codex `token_count` records also carry the plan's quota windows (`used_percent`,
 window length, reset time, plan type). Each is stored in `usage_quota_readings`
-with the tokens of the same record, for 35 days. A window's allowance is
-Σ tokens × 100 / Σ meter movement over its recent reset cycles, excluding each
-cycle's first reading; each cycle adds one point of uncertainty to the reported
-range. Session cursors keep the Codex parser state (current model and
-cumulative counters) so a sync that resumes mid-file still knows the model; a
-one-time pass relabels events an earlier version filed under `unknown`.
+with the tokens of the same record, for 35 days. Readings naming the same reset
+time form one cycle; concurrent sessions interleave slightly stale percentages,
+so a cycle's movement is the rise of its running peak over its first reading,
+and only usage up to the last rise counts. A window's allowance is
+Σ tokens × 100 / Σ movement over the recent cycles, and each cycle adds one
+point of uncertainty to the reported range. Only windows present in the newest
+readings are reported. Session cursors keep the Codex parser state (current
+model and cumulative counters) so a sync that resumes mid-file still knows the
+model; a one-time background pass relabels events an earlier version filed
+under `unknown`.
 
 Costs are estimates from `model_prices` plus a built-in table: a
 Provider-scoped rule beats a general one, a user rule beats a fetched one which

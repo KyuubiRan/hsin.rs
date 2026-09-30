@@ -198,6 +198,12 @@ async fn run(
     app.initialize_usage()?;
     let usage_app = app.clone();
     let usage_task = tokio::spawn(async move {
+        let collector = usage_app.usage_collector();
+        match tokio::task::spawn_blocking(move || collector.repair_legacy_codex_usage()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(code = error.code(), "Codex usage repair failed"),
+            Err(error) => tracing::warn!(%error, "Codex usage repair task failed"),
+        }
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         interval.tick().await;
         loop {
