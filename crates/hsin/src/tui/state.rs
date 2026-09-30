@@ -17,6 +17,7 @@ use hsin_core::{
     UsageStatsReport, convert_provider_base_url, normalize_generated_provider_name,
     provider_name_from_url,
 };
+use ratatui::layout::Position;
 use zeroize::Zeroizing;
 
 use crate::rpc::StatusSnapshot;
@@ -173,6 +174,8 @@ pub(super) struct StatsScreen {
     pub(super) quota_filter: QuotaFilter,
     /// The heatmap day whose details are open, with its report once it arrives.
     pub(super) day_detail: Option<Box<DayDetail>>,
+    /// Where the mouse pointer last moved, for the chart tooltip.
+    pub(super) pointer: Option<Position>,
 }
 
 pub(super) struct DayDetail {
@@ -981,12 +984,15 @@ impl State {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.reduce_key(plain(KeyCode::Up)),
             MouseEventKind::ScrollDown => self.reduce_key(plain(KeyCode::Down)),
-            // Motion only matters over the heatmap, where it previews a day.
+            // Motion only matters on the stats screen: over the heatmap it previews a day, and over
+            // a chart it shows the values under the pointer.
             MouseEventKind::Moved => {
-                if let Some(Hit::HeatDay(date)) = self.hits.at(mouse.column, mouse.row).cloned()
-                    && let InputMode::Stats(screen) = &mut self.input
-                {
-                    screen.day = Some(date);
+                let hit = self.hits.at(mouse.column, mouse.row).cloned();
+                if let InputMode::Stats(screen) = &mut self.input {
+                    screen.pointer = Some(Position::new(mouse.column, mouse.row));
+                    if let Some(Hit::HeatDay(date)) = hit {
+                        screen.day = Some(date);
+                    }
                 }
                 Transition::Continue
             }
@@ -3880,6 +3886,7 @@ fn default_stats_screen() -> StatsScreen {
         day: None,
         quota_filter: QuotaFilter::Recent,
         day_detail: None,
+        pointer: None,
     }
 }
 

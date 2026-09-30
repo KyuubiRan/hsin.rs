@@ -4170,6 +4170,7 @@ fn stats_render_wide_and_compact_without_losing_token_details() {
                 day: None,
                 quota_filter: state::QuotaFilter::Recent,
                 day_detail: None,
+                pointer: None,
             }),
             ..State::default()
         };
@@ -4188,6 +4189,70 @@ fn stats_render_wide_and_compact_without_losing_token_details() {
             assert!(rendered.contains("Favorite model"));
             assert!(rendered.contains("All time"));
         }
+    }
+}
+
+#[test]
+fn hovering_a_model_chart_shows_the_three_token_kinds() {
+    let mut state = stats_state();
+    state.reduce(key(KeyCode::Char('2')));
+    let tooltip_rows = |rendered: &str| rendered.matches("Input (cache miss)").count();
+    for style in [
+        hsin_core::StatsChartStyle::Bar,
+        hsin_core::StatsChartStyle::Line,
+    ] {
+        state.stats_chart_style = style;
+        let locale = I18n::new(Some(LANGUAGE_EN_US));
+        let mut terminal = Terminal::new(TestBackend::new(120, 44)).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut state, &locale))
+            .expect("draw");
+        // The legend names each kind once.
+        assert_eq!(tooltip_rows(&terminal.backend().to_string()), 1);
+        // Any cell the series painted below the legend lies inside the chart.
+        let buffer = terminal.backend().buffer().clone();
+        let legend = (0..44)
+            .find(|&row| {
+                (0..120)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+                    .starts_with("■ Input (cache hit)")
+            })
+            .expect("legend row");
+        let (column, row) = (legend + 1..44)
+            .flat_map(|row| (0..120).map(move |column| (column, row)))
+            .find(|&(column, row)| {
+                let cell = &buffer[(column, row)];
+                cell.symbol() == "█"
+                    || (style == hsin_core::StatsChartStyle::Line
+                        && cell
+                            .symbol()
+                            .chars()
+                            .all(|c| ('\u{2801}'..='\u{28ff}').contains(&c)))
+            })
+            .expect("a painted chart cell");
+        state.reduce(Action::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }));
+        terminal
+            .draw(|frame| draw(frame, &mut state, &locale))
+            .expect("draw");
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("09-14"), "{style:?}: {rendered}");
+        assert_eq!(tooltip_rows(&rendered), 2, "{style:?}: {rendered}");
+        state.reduce(Action::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }));
+        terminal
+            .draw(|frame| draw(frame, &mut state, &locale))
+            .expect("draw");
+        assert_eq!(tooltip_rows(&terminal.backend().to_string()), 1);
     }
 }
 

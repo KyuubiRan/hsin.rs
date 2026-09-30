@@ -4,7 +4,7 @@ use chrono::{Datelike, Duration, Local, NaiveDate};
 use hsin_core::{StatsChartStyle, UsageCalendarDay, UsageQuotaEstimate, UsageStatsReport};
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
@@ -24,7 +24,7 @@ use super::super::{
     theme::{INPUT_BG, MUTED, RED, WHITE},
     widgets::{centered_fixed, display_width, draw_input_field},
 };
-use super::chart::{draw_series, legend, split};
+use super::chart::{Tooltip, draw_series, draw_tooltip, legend, split};
 
 /// Heatmap intensities from idle to busiest.
 const HEAT: [Color; 5] = [
@@ -133,7 +133,15 @@ pub(super) fn draw_stats(
             draw_overview(frame, rows[2], screen, report, i18n, hits);
         }
         (Some(report), StatsPage::Models) => {
-            draw_models(frame, rows[2], report, screen.scroll, style, i18n);
+            // The day popup covers the charts, so the pointer is over it rather than them.
+            let pointer = screen
+                .pointer
+                .filter(|_| screen.day_detail.is_none() && screen.filter.is_none());
+            if let Some(tooltip) =
+                draw_models(frame, rows[2], report, screen.scroll, style, pointer, i18n)
+            {
+                draw_tooltip(frame, &tooltip, i18n);
+            }
         }
         (None, _) => frame.render_widget(
             Paragraph::new(i18n.text("loading")).style(Style::default().fg(MUTED)),
@@ -146,7 +154,9 @@ pub(super) fn draw_stats(
     }
     if let Some(detail) = &screen.day_detail {
         hits.barrier(area);
-        draw_day_popup(frame, area, detail, style, i18n);
+        if let Some(tooltip) = draw_day_popup(frame, area, detail, style, screen.pointer, i18n) {
+            draw_tooltip(frame, &tooltip, i18n);
+        }
     }
 }
 
@@ -158,8 +168,9 @@ fn draw_day_popup(
     area: Rect,
     detail: &DayDetail,
     style: StatsChartStyle,
+    pointer: Option<Position>,
     i18n: &I18n,
-) {
+) -> Option<Tooltip> {
     let popup = centered_fixed(area, 76, 28);
     frame.render_widget(Clear, popup);
     let block = Block::default()
@@ -177,7 +188,7 @@ fn draw_day_popup(
             Paragraph::new(i18n.text("loading")).style(Style::default().fg(MUTED)),
             inner,
         );
-        return;
+        return None;
     };
     let tokens = &report.summary;
     if tokens.request_count == 0 && tokens.total_tokens() == 0 {
@@ -185,7 +196,7 @@ fn draw_day_popup(
             Paragraph::new(i18n.text("stats_no_usage")).style(Style::default().fg(MUTED)),
             inner,
         );
-        return;
+        return None;
     }
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -265,13 +276,10 @@ fn draw_day_popup(
     );
     frame.render_widget(Paragraph::new(legend(i18n)), rows[2]);
     let hours = report.hourly.iter().map(split).collect::<Vec<_>>();
-    draw_series(
-        frame,
-        rows[3],
-        &hours,
-        style,
-        Some(("00".to_owned(), "23".to_owned())),
-    );
+    let hour_labels = (0..hours.len())
+        .map(|hour| format!("{hour:02}:00"))
+        .collect::<Vec<_>>();
+    let tooltip = draw_series(frame, rows[3], &hours, &hour_labels, style, pointer);
     let mut lines = vec![Line::from(Span::styled(i18n.text("stats_by_model"), bold))];
     let cost = |costs: &[hsin_core::UsageCost]| {
         if costs.is_empty() {
@@ -302,6 +310,7 @@ fn draw_day_popup(
         ))
     }));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), rows[5]);
+    tooltip
 }
 
 /// The page tabs; returns the width they take.
@@ -954,14 +963,15 @@ fn draw_models(
     report: &UsageStatsReport,
     scroll: u16,
     style: StatsChartStyle,
+    pointer: Option<Position>,
     i18n: &I18n,
-) {
+) -> Option<Tooltip> {
     if report.models.is_empty() {
         frame.render_widget(
             Paragraph::new(i18n.text("stats_no_usage")).style(Style::default().fg(MUTED)),
             area,
         );
-        return;
+        return None;
     }
     if area.width < 60 || area.height < 14 {
         let lines = report
@@ -975,7 +985,7 @@ fn draw_models(
                 .scroll((scroll, 0)),
             area,
         );
-        return;
+        return None;
     }
     let chart_count = report.models.len().min(4);
     let chart_height = (area.height / 2).max(6);
@@ -1000,6 +1010,7 @@ fn draw_models(
             height: rows[0].height.saturating_sub(1),
             ..rows[0]
         });
+    let mut tooltip = None;
     for (model, chart_area) in report.models.iter().take(4).zip(charts.iter()) {
         let cost = if model.cost.is_empty() {
             String::new()
@@ -1029,10 +1040,10 @@ fn draw_models(
             .collect::<Vec<_>>();
         let dates = model
             .daily
-            .first()
-            .zip(model.daily.last())
-            .map(|(first, last)| (first.date[5..].to_owned(), last.date[5..].to_owned()));
-        draw_series(
+            .iter()
+            .map(|bucket| bucket.date.get(5..).unwrap_or(&bucket.date).to_owned())
+            .collect::<Vec<_>>();
+        tooltip = draw_series(
             frame,
             Rect {
                 y: chart_area.y + 1,
@@ -1040,9 +1051,11 @@ fn draw_models(
                 ..*chart_area
             },
             &points,
+            &dates,
             style,
-            dates,
-        );
+            pointer,
+        )
+        .or(tooltip);
     }
     let mut lines = report
         .models
@@ -1067,6 +1080,7 @@ fn draw_models(
             .scroll((scroll, 0)),
         rows[1],
     );
+    tooltip
 }
 
 #[allow(clippy::too_many_lines)]
