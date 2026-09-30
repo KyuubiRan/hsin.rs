@@ -12,9 +12,10 @@ use ratatui::{
 use crate::i18n::I18n;
 
 use super::super::{
+    mouse::{ENTER, Hit, HitMap, plain},
     state::{StatsFilter, StatsPage, StatsScreen},
     theme::{INPUT_BG, MUTED, RED, WHITE},
-    widgets::{centered_fixed, draw_input_field},
+    widgets::{centered_fixed, display_width, draw_input_field},
 };
 
 pub(super) fn draw_stats(
@@ -23,6 +24,7 @@ pub(super) fn draw_stats(
     screen: &StatsScreen,
     loading: bool,
     i18n: &I18n,
+    hits: &mut HitMap,
 ) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -32,18 +34,32 @@ pub(super) fn draw_stats(
             Constraint::Min(5),
         ])
         .split(area);
-    let tabs = Line::from(vec![
-        tab(
-            &format!("1 {}", i18n.text("stats_overview")),
-            screen.page == StatsPage::Overview,
-        ),
-        Span::raw("  "),
-        tab(
-            &format!("2 {}", i18n.text("stats_models")),
-            screen.page == StatsPage::Models,
-        ),
-    ]);
-    frame.render_widget(Paragraph::new(tabs), rows[0]);
+    let pages = [
+        ('1', i18n.text("stats_overview"), StatsPage::Overview),
+        ('2', i18n.text("stats_models"), StatsPage::Models),
+    ];
+    let mut spans = Vec::new();
+    let mut x = rows[0].x;
+    for (key, label, page) in pages {
+        if !spans.is_empty() {
+            spans.push(Span::raw("  "));
+            x = x.saturating_add(2);
+        }
+        let span = tab(&format!("{key} {label}"), screen.page == page);
+        let width = u16::try_from(span.width()).unwrap_or(u16::MAX);
+        hits.key(
+            Rect {
+                x,
+                y: rows[0].y,
+                width: width.min(rows[0].right().saturating_sub(x)),
+                height: 1,
+            },
+            plain(crossterm::event::KeyCode::Char(key)),
+        );
+        x = x.saturating_add(width);
+        spans.push(span);
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
     let provider_label = screen.provider_id.as_ref().map_or_else(
         || i18n.text("stats_all").to_owned(),
         |id| {
@@ -99,7 +115,8 @@ pub(super) fn draw_stats(
         ),
     }
     if let Some(filter) = &screen.filter {
-        draw_filter(frame, area, screen, filter, i18n);
+        hits.barrier(area);
+        draw_filter(frame, area, screen, filter, i18n, hits);
     }
 }
 
@@ -336,6 +353,7 @@ fn draw_filter(
     screen: &StatsScreen,
     filter: &StatsFilter,
     i18n: &I18n,
+    hits: &mut HitMap,
 ) {
     let popup = centered_fixed(
         area,
@@ -378,6 +396,24 @@ fn draw_filter(
                 i18n.text("stats_last_90"),
                 i18n.text("stats_custom"),
             ];
+            let mut x = inner.x;
+            for (index, label) in labels.iter().enumerate() {
+                let width = u16::try_from(display_width(label) + 2).unwrap_or(u16::MAX);
+                hits.push(
+                    Rect {
+                        x,
+                        y: inner.y,
+                        width: width.min(inner.right().saturating_sub(x)),
+                        height: 1,
+                    },
+                    Hit::Row {
+                        index,
+                        selected: *selected,
+                        activate: ENTER,
+                    },
+                );
+                x = x.saturating_add(width + 1);
+            }
             let line = Line::from(
                 labels
                     .iter()
@@ -441,24 +477,28 @@ fn draw_filter(
                     ))
                 }));
             }
+            let item_count = items.len();
             let mut state = ListState::default().with_selected(Some(*selected));
             frame.render_stateful_widget(
                 List::new(items).highlight_style(Style::default().fg(WHITE).bg(RED)),
                 inner,
                 &mut state,
             );
+            hits.list(inner, &state, (0..item_count).map(|_| 1), ENTER);
         }
         StatsFilter::Model { selected } => {
             let mut items = vec![ListItem::new(i18n.text("stats_all"))];
             if let Some(report) = &screen.report {
                 items.extend(report.filters.models.iter().cloned().map(ListItem::new));
             }
+            let item_count = items.len();
             let mut state = ListState::default().with_selected(Some(*selected));
             frame.render_stateful_widget(
                 List::new(items).highlight_style(Style::default().fg(WHITE).bg(RED)),
                 inner,
                 &mut state,
             );
+            hits.list(inner, &state, (0..item_count).map(|_| 1), ENTER);
         }
     }
 }

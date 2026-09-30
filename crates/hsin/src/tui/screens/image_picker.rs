@@ -9,6 +9,7 @@ use ratatui::{
 use crate::i18n::I18n;
 
 use super::super::{
+    mouse::{ENTER, HitMap, plain},
     state::{ImageModelPicker, ModelPickerMode, State, visible_image_models},
     theme::RED,
     widgets::{
@@ -21,6 +22,7 @@ pub(super) fn draw_image_models(
     area: Rect,
     picker: &ImageModelPicker,
     i18n: &I18n,
+    hits: &mut HitMap,
 ) {
     let models = visible_image_models(picker);
     let longest = models
@@ -112,9 +114,24 @@ pub(super) fn draw_image_models(
         &mut state,
     );
     draw_list_scroll_indicators(frame, popup, rows[1], &state, (0..item_count).map(|_| 1));
+    // A second click on a model ticks it, the gesture space makes on the keyboard.
+    if matches!(picker.mode, ModelPickerMode::Browse) {
+        hits.list(
+            rows[1],
+            &state,
+            (0..item_count).map(|_| 1),
+            Some(plain(crossterm::event::KeyCode::Char(' '))),
+        );
+    }
 }
 
-pub(super) fn draw_image_source(frame: &mut Frame<'_>, area: Rect, selected: usize, i18n: &I18n) {
+pub(super) fn draw_image_source(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    selected: usize,
+    i18n: &I18n,
+    hits: &mut HitMap,
+) {
     draw_choice_list(
         frame,
         area,
@@ -124,6 +141,7 @@ pub(super) fn draw_image_source(frame: &mut Frame<'_>, area: Rect, selected: usi
             i18n.text("image_source_manual").to_owned(),
         ],
         selected,
+        hits,
     );
 }
 
@@ -133,6 +151,7 @@ pub(super) fn draw_image_import(
     state: &State,
     selected: usize,
     i18n: &I18n,
+    hits: &mut HitMap,
 ) {
     let items = state
         .providers
@@ -157,6 +176,7 @@ pub(super) fn draw_image_import(
         i18n.text("image_source_import"),
         items,
         selected,
+        hits,
     );
 }
 
@@ -166,6 +186,7 @@ fn draw_choice_list(
     title: &str,
     items: Vec<String>,
     selected: usize,
+    hits: &mut HitMap,
 ) {
     let longest = items
         .iter()
@@ -204,5 +225,12 @@ fn draw_choice_list(
         popup,
         &mut state,
     );
-    draw_list_scroll_indicators(frame, popup, list_area, &state, item_heights);
+    draw_list_scroll_indicators(
+        frame,
+        popup,
+        list_area,
+        &state,
+        item_heights.iter().copied(),
+    );
+    hits.list(list_area, &state, item_heights, ENTER);
 }

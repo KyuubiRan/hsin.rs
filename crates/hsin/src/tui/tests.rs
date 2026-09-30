@@ -65,13 +65,13 @@ fn a_held_key_keeps_deleting_instead_of_stalling_after_one_character() {
         kind: crossterm::event::KeyEventKind::Repeat,
         ..KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
     });
-    assert!(super::key_action(&repeat).is_some());
+    assert!(super::event_action(&repeat).is_some());
 
     let release = Event::Key(KeyEvent {
         kind: crossterm::event::KeyEventKind::Release,
         ..KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
     });
-    assert!(super::key_action(&release).is_none());
+    assert!(super::event_action(&release).is_none());
 }
 
 #[test]
@@ -88,13 +88,13 @@ fn shifted_text_reaches_the_form_on_press_and_repeat_but_not_release() {
                     modifiers,
                     kind,
                 ));
-                state.reduce(super::key_action(&event).expect("text input"));
+                state.reduce(super::event_action(&event).expect("text input"));
                 let release = Event::Key(KeyEvent::new_with_kind(
                     KeyCode::Char(character),
                     modifiers,
                     KeyEventKind::Release,
                 ));
-                assert!(super::key_action(&release).is_none());
+                assert!(super::event_action(&release).is_none());
             }
             assert!(matches!(
                 &state.input,
@@ -4104,5 +4104,161 @@ fn image_stats_are_rejected_with_a_localized_notice() {
     state.reduce(key(KeyCode::Char('s')));
     assert!(matches!(state.input, InputMode::Normal));
     assert_eq!(state.notice.as_deref(), Some("@stats_image_unsupported"));
+    assert!(state.take_effect().is_none());
+}
+
+fn click_at(area: Rect) -> Action {
+    Action::Mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: area.x,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
+fn mouse(kind: crossterm::event::MouseEventKind) -> crossterm::event::MouseEvent {
+    crossterm::event::MouseEvent {
+        kind,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn two_provider_state() -> State {
+    let mut state = State {
+        loading: false,
+        ..State::default()
+    };
+    state.providers.push(example_provider());
+    state.providers.push(Provider {
+        id: "provider-2".into(),
+        name: "Second".into(),
+        ..example_provider()
+    });
+    state
+}
+
+fn hit_area(state: &State, predicate: impl Fn(&super::mouse::Hit) -> bool) -> Rect {
+    state.hits.find(predicate).expect("clickable region")
+}
+
+#[test]
+fn mouse_events_reach_the_reducer_only_for_clicks_and_the_wheel() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::ScrollUp,
+        MouseEventKind::ScrollDown,
+    ] {
+        assert!(super::event_action(&Event::Mouse(mouse(kind))).is_some());
+    }
+    for kind in [
+        MouseEventKind::Up(MouseButton::Left),
+        MouseEventKind::Down(MouseButton::Right),
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Moved,
+    ] {
+        assert!(super::event_action(&Event::Mouse(mouse(kind))).is_none());
+    }
+}
+
+#[test]
+fn footer_hints_name_the_keys_they_press() {
+    use super::mouse::{hint_key, plain};
+
+    assert_eq!(hint_key("enter"), Some(plain(KeyCode::Enter)));
+    assert_eq!(hint_key("esc"), Some(plain(KeyCode::Esc)));
+    assert_eq!(hint_key("s/esc"), Some(plain(KeyCode::Char('s'))));
+    assert_eq!(hint_key("/"), Some(plain(KeyCode::Char('/'))));
+    assert_eq!(hint_key("→"), Some(plain(KeyCode::Right)));
+    assert_eq!(
+        hint_key("ctrl+u"),
+        Some(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+    );
+    assert_eq!(hint_key("↑/↓"), None);
+    assert_eq!(hint_key("type"), None);
+}
+
+#[test]
+fn clicking_a_provider_selects_it_and_a_second_click_switches() {
+    let mut state = two_provider_state();
+    render(&mut state, 100, 30);
+    let second = hit_area(&state, |hit| {
+        matches!(hit, super::mouse::Hit::Row { index: 1, .. })
+    });
+    state.reduce(click_at(second));
+    assert_eq!(state.selected, 1);
+    assert!(state.take_effect().is_none());
+
+    render(&mut state, 100, 30);
+    state.reduce(click_at(second));
+    assert!(state.take_effect().is_some(), "second click activates");
+}
+
+#[test]
+fn wheel_moves_the_selection() {
+    let mut state = two_provider_state();
+    state.reduce(Action::Mouse(mouse(
+        crossterm::event::MouseEventKind::ScrollDown,
+    )));
+    assert_eq!(state.selected, 1);
+    state.reduce(Action::Mouse(mouse(
+        crossterm::event::MouseEventKind::ScrollUp,
+    )));
+    assert_eq!(state.selected, 0);
+}
+
+#[test]
+fn clicking_a_client_tab_switches_to_it() {
+    let mut state = two_provider_state();
+    render(&mut state, 100, 30);
+    let claude = hit_area(&state, |hit| {
+        *hit == super::mouse::Hit::Section(HomeSection::Client(ClientKind::Claude))
+    });
+    state.reduce(click_at(claude));
+    assert_eq!(state.client, ClientKind::Claude);
+    assert!(!state.image_section);
+}
+
+#[test]
+fn footer_hint_click_presses_its_key() {
+    let mut state = two_provider_state();
+    render(&mut state, 100, 30);
+    let settings = hit_area(&state, |hit| {
+        *hit == super::mouse::Hit::Key(super::mouse::plain(KeyCode::Char('o')))
+    });
+    state.reduce(click_at(settings));
+    assert!(matches!(state.input, InputMode::Settings(_)));
+}
+
+#[test]
+fn clicks_beside_an_open_dialog_do_not_reach_the_screen_underneath() {
+    let mut state = two_provider_state();
+    state.reduce(key(KeyCode::Char('a')));
+    render(&mut state, 100, 30);
+    state.reduce(click_at(Rect::new(0, 0, 1, 1)));
+    let row = Rect::new(2, 12, 1, 1);
+    state.reduce(click_at(row));
+    assert!(matches!(state.input, InputMode::Form(_)));
+    assert_eq!(state.selected, 0);
+}
+
+#[test]
+fn clicking_a_form_field_focuses_it_without_submitting() {
+    let mut state = two_provider_state();
+    state.reduce(key(KeyCode::Char('a')));
+    render(&mut state, 100, 40);
+    let field = hit_area(&state, |hit| {
+        matches!(hit, super::mouse::Hit::Row { index: 2, .. })
+    });
+    state.reduce(click_at(field));
+    render(&mut state, 100, 40);
+    state.reduce(click_at(field));
+    let InputMode::Form(form) = &state.input else {
+        panic!("form stays open");
+    };
+    assert_eq!(form.field, 2);
     assert!(state.take_effect().is_none());
 }

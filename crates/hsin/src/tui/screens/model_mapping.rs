@@ -8,6 +8,7 @@ use ratatui::{
 use crate::i18n::I18n;
 
 use super::super::{
+    mouse::{HitMap, plain},
     state::{MAPPING_TIERS, ModelMappingForm},
     theme::{INPUT_BG, MUTED, RED, WHITE},
     widgets::{
@@ -25,6 +26,7 @@ pub(super) fn draw_model_mapping(
     area: Rect,
     mapping: &ModelMappingForm,
     i18n: &I18n,
+    hits: &mut HitMap,
 ) {
     let proportional_width = area.width.saturating_mul(4) / 5;
     let width = content_width(area, 64, 64, 100)
@@ -102,6 +104,12 @@ pub(super) fn draw_model_mapping(
         }
     }
     draw_row_scroll_indicators(frame, popup, &rows, FIELD_COUNT);
+    // A second click flips the focused row's switch or 1M box, as space does.
+    hits.rows(
+        &rows,
+        mapping.field,
+        Some(plain(crossterm::event::KeyCode::Char(' '))),
+    );
 }
 
 fn model_row_areas(area: Rect) -> (Rect, Rect) {

@@ -12,6 +12,7 @@ use ratatui::{
 use crate::i18n::I18n;
 
 use super::super::{
+    mouse::HitMap,
     state::{
         ProviderForm, form_auth_field, form_context_compact_field, form_context_max_field,
         form_description_field, form_field_count, form_image_field, form_network_proxy_field,
@@ -40,7 +41,13 @@ struct FormValues<'a> {
     proxy_password_placeholder: &'a str,
 }
 
-pub(super) fn draw_form(frame: &mut Frame<'_>, area: Rect, form: &ProviderForm, i18n: &I18n) {
+pub(super) fn draw_form(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    form: &ProviderForm,
+    i18n: &I18n,
+    hits: &mut HitMap,
+) {
     let hidden = "•".repeat(form.secret.chars().count());
     let secret = if form.secret_visible {
         form.secret.as_str()
@@ -116,6 +123,7 @@ pub(super) fn draw_form(frame: &mut Frame<'_>, area: Rect, form: &ProviderForm, 
         draw_form_field(frame, field, index, form, i18n, &values);
     }
     draw_row_scroll_indicators(frame, popup, &fields, field_count);
+    hits.rows(&fields, form.field, None);
 }
 
 fn form_popup(

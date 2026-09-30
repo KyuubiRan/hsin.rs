@@ -12,6 +12,7 @@ use ratatui::{
 use crate::i18n::I18n;
 
 use super::super::{
+    mouse::{ENTER, HitMap},
     state::{SettingsPage, SettingsScreen, State},
     theme::{MUTED, RED, WHITE},
     widgets::{centered_fixed, display_width, draw_input_field},
@@ -24,6 +25,7 @@ pub(super) fn draw_settings_screen(
     state: &State,
     screen: &SettingsScreen,
     i18n: &I18n,
+    hits: &mut HitMap,
 ) {
     let proxy = if state.proxy_enabled {
         i18n.text("enabled")
@@ -475,6 +477,7 @@ pub(super) fn draw_settings_screen(
             None,
         ),
     };
+    let item_count = items.len();
     let mut list_state = ListState::default().with_selected(Some(selected));
     let list = List::new(items)
         .highlight_symbol("› ")
@@ -492,6 +495,12 @@ pub(super) fn draw_settings_screen(
                 .border_style(Style::default().fg(MUTED)),
         );
     frame.render_stateful_widget(list, columns[0], &mut list_state);
+    hits.list(
+        columns[0].inner(ratatui::layout::Margin::new(1, 1)),
+        &list_state,
+        (0..item_count).map(|_| 1),
+        ENTER,
+    );
 
     frame.render_widget(
         Paragraph::new(
@@ -538,6 +547,7 @@ pub(super) fn draw_settings_screen(
     } = &screen.page
     {
         let popup = centered_fixed(area, 48, 5);
+        hits.barrier(area);
         frame.render_widget(Clear, popup);
         let block = Block::default()
             .title(i18n.text(if editor.original.is_some() {

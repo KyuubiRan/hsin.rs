@@ -5,7 +5,7 @@ use std::{
 };
 
 use chrono::{Local, NaiveDate, TimeZone};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use hsin_core::{
     AuthScheme, ClaudeModelMapping, ClaudeModelMappingUpdate, ClientAuthSettings, ClientKind,
     ClientSettings, CodexConfigNameUpdate, CodexImageConfig, CodexReasoningEffort,
@@ -20,10 +20,14 @@ use zeroize::Zeroizing;
 
 use crate::rpc::StatusSnapshot;
 
-use super::effects::Effect;
+use super::{
+    effects::Effect,
+    mouse::{Hit, HitMap, plain},
+};
 
 pub(super) enum Action {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Loaded {
         providers: Vec<Provider>,
         status: StatusSnapshot,
@@ -85,6 +89,8 @@ pub(super) struct State {
     /// Where the cursor sat in each client left behind, so returning to one resumes there instead
     /// of dropping back onto the official provider at the top.
     pub(super) parked: HashMap<ClientKind, usize>,
+    /// Clickable regions of the last drawn frame.
+    pub(super) hits: HitMap,
 }
 
 impl Default for State {
@@ -111,6 +117,7 @@ impl Default for State {
             pending_effect: None,
             search: String::new(),
             parked: HashMap::new(),
+            hits: HitMap::default(),
         }
     }
 }
@@ -584,6 +591,7 @@ impl State {
                 self.notice = Some(format!("@{key}"));
                 self.loading = false;
             }
+            Action::Mouse(mouse) => return self.reduce_mouse(mouse),
             Action::Tick => {
                 if let InputMode::DeleteConfirm { expires_at, .. } = &self.input
                     && Instant::now() >= *expires_at
@@ -760,6 +768,57 @@ impl State {
         self.clamp_selection();
         if let Some(index) = self.active_index() {
             self.selected = index;
+        }
+    }
+
+    /// Clicks replay the keyboard: they move the same cursors and press the same keys, so every
+    /// rule the keyboard enforces holds for the mouse too.
+    fn reduce_mouse(&mut self, mouse: MouseEvent) -> Transition {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.reduce_key(plain(KeyCode::Up)),
+            MouseEventKind::ScrollDown => self.reduce_key(plain(KeyCode::Down)),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(hit) = self.hits.at(mouse.column, mouse.row).cloned() else {
+                    return Transition::Continue;
+                };
+                match hit {
+                    Hit::Barrier => Transition::Continue,
+                    Hit::Key(key) => self.reduce_key(key),
+                    Hit::Section(section) => {
+                        // Tab walks the same ring the header shows; the bound only guards against a
+                        // section that is no longer reachable.
+                        for _ in 0..self.visible_sections().len() {
+                            if self.section() == section {
+                                break;
+                            }
+                            self.reduce_key(plain(KeyCode::Tab));
+                        }
+                        Transition::Continue
+                    }
+                    Hit::Row {
+                        index,
+                        selected,
+                        activate,
+                    } => {
+                        if index == selected {
+                            return activate
+                                .map_or(Transition::Continue, |key| self.reduce_key(key));
+                        }
+                        let step = plain(if index > selected {
+                            KeyCode::Down
+                        } else {
+                            KeyCode::Up
+                        });
+                        for _ in 0..index.abs_diff(selected) {
+                            if self.reduce_key(step) == Transition::Quit {
+                                return Transition::Quit;
+                            }
+                        }
+                        Transition::Continue
+                    }
+                }
+            }
+            _ => Transition::Continue,
         }
     }
 

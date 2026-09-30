@@ -118,8 +118,10 @@ installed release build.
 
 ## Usage
 
-Run `hsin` with no arguments for the terminal UI. Every action is also
-scriptable:
+Run `hsin` with no arguments for the terminal UI. The mouse works alongside the
+keyboard: click a client tab, a list row or a footer hint, click a selected row
+again to activate it, and scroll with the wheel. Hold Shift while dragging to
+select text in terminals that support it. Every action is also scriptable:
 
 ```bash
 hsin status                                   # daemon, proxy and client state
