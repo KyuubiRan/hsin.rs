@@ -233,7 +233,7 @@
   "language_system": "跟随系统",
   "help": "q 退出 · tab 切换客户端 · ↑/↓ 选择 · enter 切换 · / 搜索 · a 添加 · e 编辑 · d 删除 · c 复制 · v 粘贴 · p 代理 · o 设置 · s 统计 · r 刷新",
   "image_help": "q 退出 · tab 切换客户端 · ↑/↓ 选择 · enter 启用 · / 搜索 · a 添加 · e 编辑 · d 停用/删除 · o 设置 · s 统计 · r 刷新",
-  "stats_help": "1/2 页面 · d 范围 · t 时间 · p Provider · m 模型 · q 套餐 · r 同步 · tab 客户端 · s/esc 返回",
+  "stats_help": "1/2 页面 · d 范围 · t 时间 · p Provider · m 模型 · q 套餐 · v 图表 · r 同步 · tab 客户端 · s/esc 返回",
   "stats_filter_help": "↑/↓ 或 ←/→ 选择 · tab 切换输入 · enter 应用 · esc 取消",
   "stats_image_unsupported": "暂不支持图片 Token 统计。",
   "stats_invalid_date": "请输入有效的 YYYY-MM-DD 日期范围。",
@@ -469,5 +469,8 @@
   "stats_by_hour": "按小时",
   "stats_by_model": "按模型",
   "stats_by_provider": "按 Provider",
-  "stats_day_detail_help": "enter 只看这一天 · esc 关闭"
+  "stats_day_detail_help": "enter 只看这一天 · esc 关闭",
+  "stats_chart_hit": "输入（命中缓存）",
+  "stats_chart_miss": "输入（未命中缓存）",
+  "stats_chart_output": "输出"
 }

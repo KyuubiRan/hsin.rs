@@ -52,6 +52,7 @@ pub(super) enum Effect {
         config: hsin_core::UpstreamProxyConfig,
         password: SecretInput,
     },
+    SetStatsChartStyle(hsin_core::StatsChartStyle),
     QueryUsage(UsageStatsQuery),
     QueryUsageDay(UsageStatsQuery),
     LoadPrices,
@@ -325,6 +326,18 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
         Effect::SetUpstreamProxy { config, password } => {
             update_upstream_proxy(client, config, password).await
         }
+        Effect::SetStatsChartStyle(style) => {
+            let _: Value = client
+                .call(
+                    "settings.set",
+                    &SettingsPatch {
+                        stats_chart_style: Some(style),
+                        ..SettingsPatch::default()
+                    },
+                )
+                .await?;
+            Ok(None)
+        }
         Effect::DiscoverModels(_) => unreachable!("model discovery is handled by the worker"),
         Effect::DiscoverMappingModels(_) => {
             unreachable!("mapping model discovery is handled by the worker")
@@ -486,6 +499,7 @@ async fn update_proxy_enabled(
                 clients: None,
                 client_auth: None,
                 codex_preserve_official_auth: None,
+                stats_chart_style: None,
                 claude_model_names_enabled: None,
                 upstream_proxy: None,
             },
@@ -510,6 +524,7 @@ async fn update_proxy_host(client: &DaemonClient, host: String) -> Result<Option
                 clients: None,
                 client_auth: None,
                 codex_preserve_official_auth: None,
+                stats_chart_style: None,
                 claude_model_names_enabled: None,
                 upstream_proxy: None,
             },
@@ -530,6 +545,7 @@ async fn update_proxy_port(client: &DaemonClient, port: u16) -> Result<Option<&'
                 clients: None,
                 client_auth: None,
                 codex_preserve_official_auth: None,
+                stats_chart_style: None,
                 claude_model_names_enabled: None,
                 upstream_proxy: None,
             },
@@ -550,6 +566,7 @@ async fn update_language(client: &DaemonClient, language: String) -> Result<Opti
                 clients: None,
                 client_auth: None,
                 codex_preserve_official_auth: None,
+                stats_chart_style: None,
                 claude_model_names_enabled: None,
                 upstream_proxy: None,
             },
@@ -590,6 +607,7 @@ async fn update_clients(
                 clients: Some(clients.clone()),
                 client_auth: None,
                 codex_preserve_official_auth: None,
+                stats_chart_style: None,
                 claude_model_names_enabled: None,
                 upstream_proxy: None,
             },
@@ -621,6 +639,7 @@ async fn update_client_auth(
                     disable_custom_auth,
                 }),
                 codex_preserve_official_auth: None,
+                stats_chart_style: None,
                 claude_model_names_enabled: None,
                 upstream_proxy: None,
             },
@@ -644,6 +663,7 @@ async fn update_codex_official_auth_preservation(
                 clients: None,
                 client_auth: None,
                 codex_preserve_official_auth: Some(enabled),
+                stats_chart_style: None,
                 claude_model_names_enabled: None,
                 upstream_proxy: None,
             },
@@ -667,6 +687,7 @@ async fn update_claude_model_names(
                 clients: None,
                 client_auth: None,
                 codex_preserve_official_auth: None,
+                stats_chart_style: None,
                 claude_model_names_enabled: Some(enabled),
                 upstream_proxy: None,
             },

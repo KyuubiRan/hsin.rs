@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 
 use chrono::{Datelike, Duration, Local, NaiveDate};
-use hsin_core::{UsageCalendarDay, UsageQuotaEstimate, UsageStatsReport};
+use hsin_core::{StatsChartStyle, UsageCalendarDay, UsageQuotaEstimate, UsageStatsReport};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Sparkline, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use crate::{
@@ -24,6 +24,7 @@ use super::super::{
     theme::{INPUT_BG, MUTED, RED, WHITE},
     widgets::{centered_fixed, display_width, draw_input_field},
 };
+use super::chart::{draw_series, legend, split};
 
 /// Heatmap intensities from idle to busiest.
 const HEAT: [Color; 5] = [
@@ -52,6 +53,7 @@ pub(super) fn draw_stats(
     area: Rect,
     screen: &StatsScreen,
     loading: bool,
+    style: StatsChartStyle,
     i18n: &I18n,
     hits: &mut HitMap,
 ) {
@@ -131,7 +133,7 @@ pub(super) fn draw_stats(
             draw_overview(frame, rows[2], screen, report, i18n, hits);
         }
         (Some(report), StatsPage::Models) => {
-            draw_models(frame, rows[2], report, screen.scroll, i18n);
+            draw_models(frame, rows[2], report, screen.scroll, style, i18n);
         }
         (None, _) => frame.render_widget(
             Paragraph::new(i18n.text("loading")).style(Style::default().fg(MUTED)),
@@ -144,15 +146,21 @@ pub(super) fn draw_stats(
     }
     if let Some(detail) = &screen.day_detail {
         hits.barrier(area);
-        draw_day_popup(frame, area, detail, i18n);
+        draw_day_popup(frame, area, detail, style, i18n);
     }
 }
 
 /// One day's usage: totals, when in the day it happened, and which models and providers it went
 /// to.
 #[allow(clippy::too_many_lines)]
-fn draw_day_popup(frame: &mut Frame<'_>, area: Rect, detail: &DayDetail, i18n: &I18n) {
-    let popup = centered_fixed(area, 76, 24);
+fn draw_day_popup(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    detail: &DayDetail,
+    style: StatsChartStyle,
+    i18n: &I18n,
+) {
+    let popup = centered_fixed(area, 76, 28);
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .title(
@@ -184,7 +192,8 @@ fn draw_day_popup(frame: &mut Frame<'_>, area: Rect, detail: &DayDetail, i18n: &
         .constraints([
             Constraint::Length(3),
             Constraint::Length(1),
-            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(6),
             Constraint::Length(1),
             Constraint::Min(2),
         ])
@@ -239,11 +248,12 @@ fn draw_day_popup(frame: &mut Frame<'_>, area: Rect, detail: &DayDetail, i18n: &
         rows[0],
     );
     let peak = report
-        .hourly_tokens
+        .hourly
         .iter()
+        .map(hsin_core::UsageTokenSummary::total_tokens)
         .enumerate()
-        .max_by_key(|(hour, tokens)| (**tokens, std::cmp::Reverse(*hour)))
-        .filter(|(_, tokens)| **tokens > 0)
+        .max_by_key(|(hour, tokens)| (*tokens, std::cmp::Reverse(*hour)))
+        .filter(|(_, tokens)| *tokens > 0)
         .map(|(hour, _)| format!("  ·  {} {hour:02}:00", i18n.text("stats_peak_hour")))
         .unwrap_or_default();
     frame.render_widget(
@@ -253,19 +263,14 @@ fn draw_day_popup(frame: &mut Frame<'_>, area: Rect, detail: &DayDetail, i18n: &
         ])),
         rows[1],
     );
-    let width = usize::from(rows[2].width);
-    // Each hour gets an equal share of the width, so the bars line up with the clock.
-    let per_hour = (width / 24).max(1);
-    let bars = report
-        .hourly_tokens
-        .iter()
-        .flat_map(|tokens| std::iter::repeat_n(*tokens, per_hour))
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        Sparkline::default()
-            .data(&bars)
-            .style(Style::default().fg(RED)),
-        rows[2],
+    frame.render_widget(Paragraph::new(legend(i18n)), rows[2]);
+    let hours = report.hourly.iter().map(split).collect::<Vec<_>>();
+    draw_series(
+        frame,
+        rows[3],
+        &hours,
+        style,
+        Some(("00".to_owned(), "23".to_owned())),
     );
     let mut lines = vec![Line::from(Span::styled(i18n.text("stats_by_model"), bold))];
     let cost = |costs: &[hsin_core::UsageCost]| {
@@ -296,7 +301,7 @@ fn draw_day_popup(frame: &mut Frame<'_>, area: Rect, detail: &DayDetail, i18n: &
             cost(&provider.cost)
         ))
     }));
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), rows[4]);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), rows[5]);
 }
 
 /// The page tabs; returns the width they take.
@@ -942,11 +947,13 @@ fn quota_window_label(minutes: u32, i18n: &I18n) -> String {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn draw_models(
     frame: &mut Frame<'_>,
     area: Rect,
     report: &UsageStatsReport,
     scroll: u16,
+    style: StatsChartStyle,
     i18n: &I18n,
 ) {
     if report.models.is_empty() {
@@ -976,28 +983,65 @@ fn draw_models(
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(chart_height), Constraint::Min(4)])
         .split(area);
+    frame.render_widget(
+        Paragraph::new(legend(i18n)),
+        Rect {
+            height: 1,
+            ..rows[0]
+        },
+    );
     let charts = Layout::default()
         .direction(Direction::Vertical)
         .constraints(
             (0..chart_count).map(|_| Constraint::Ratio(1, u32::try_from(chart_count).unwrap_or(1))),
         )
-        .split(rows[0]);
+        .split(Rect {
+            y: rows[0].y + 1,
+            height: rows[0].height.saturating_sub(1),
+            ..rows[0]
+        });
     for (model, chart_area) in report.models.iter().take(4).zip(charts.iter()) {
-        let values = model
+        let cost = if model.cost.is_empty() {
+            String::new()
+        } else {
+            format!(" · ≈{}", format_cost(&model.cost))
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    model.model.clone(),
+                    Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" · {}{cost}", compact(model.tokens.total_tokens())),
+                    Style::default().fg(MUTED),
+                ),
+            ])),
+            Rect {
+                height: 1,
+                ..*chart_area
+            },
+        );
+        let points = model
             .daily
             .iter()
-            .map(|bucket| bucket.tokens.total_tokens())
+            .map(|bucket| split(&bucket.tokens))
             .collect::<Vec<_>>();
-        frame.render_widget(
-            Sparkline::default()
-                .data(&values)
-                .style(Style::default().fg(RED))
-                .block(Block::default().title(format!(
-                    "{} · {}",
-                    model.model,
-                    compact(model.tokens.total_tokens())
-                ))),
-            *chart_area,
+        let dates = model
+            .daily
+            .first()
+            .zip(model.daily.last())
+            .map(|(first, last)| (first.date[5..].to_owned(), last.date[5..].to_owned()));
+        draw_series(
+            frame,
+            Rect {
+                y: chart_area.y + 1,
+                height: chart_area.height.saturating_sub(1),
+                ..*chart_area
+            },
+            &points,
+            style,
+            dates,
         );
     }
     let mut lines = report

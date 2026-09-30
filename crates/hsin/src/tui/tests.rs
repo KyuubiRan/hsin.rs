@@ -4070,8 +4070,14 @@ fn usage_report() -> UsageStatsReport {
                 }
             })
             .collect(),
-        hourly_tokens: (0..24)
-            .map(|hour| if hour == 14 { 250 } else { 0 })
+        hourly: (0..24)
+            .map(|hour| {
+                if hour == 14 {
+                    tokens.clone()
+                } else {
+                    UsageTokenSummary::default()
+                }
+            })
             .collect(),
         quota: vec![hsin_core::UsageQuotaEstimate {
             plan_key: "1a2b3c4d|openai|pro".into(),
@@ -4613,4 +4619,35 @@ fn clicking_a_heatmap_day_opens_its_details_and_can_filter_to_it() {
         matches!(state.input, InputMode::Stats(_)),
         "esc closes only the popup"
     );
+}
+
+#[test]
+fn chart_style_toggles_saves_and_follows_the_daemon() {
+    let mut state = stats_state();
+    state.reduce(key(KeyCode::Char('2')));
+    let bars = render(&mut state, 120, 44);
+    assert!(bars.contains("Input (cache hit)"));
+    assert!(bars.contains("Input (cache miss)"));
+    assert!(!bars.contains("(log)"));
+
+    state.reduce(key(KeyCode::Char('v')));
+    assert_eq!(state.stats_chart_style, hsin_core::StatsChartStyle::Line);
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::SetStatsChartStyle(hsin_core::StatsChartStyle::Line))
+    ));
+    let lines = render(&mut state, 120, 44);
+    assert!(lines.contains("(log)"));
+    assert!(lines.contains("Output"));
+
+    // The saved style comes back with the settings, whatever the screen last showed.
+    state.reduce(Action::Loaded {
+        providers: vec![example_provider()],
+        status: crate::rpc::StatusSnapshot::default(),
+        settings: Settings {
+            stats_chart_style: hsin_core::StatsChartStyle::Bar,
+            ..Settings::default()
+        },
+    });
+    assert_eq!(state.stats_chart_style, hsin_core::StatsChartStyle::Bar);
 }

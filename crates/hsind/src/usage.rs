@@ -1115,6 +1115,7 @@ impl UsageCollector {
         let mut unpriced_tokens = 0_u64;
         let mut daily = BTreeMap::<NaiveDate, UsageTokenSummary>::new();
         let mut hours = [0_u64; 24];
+        let mut hourly = vec![UsageTokenSummary::default(); 24];
         let mut providers = HashMap::<
             (Option<String>, String, u64),
             (bool, UsageTokenSummary, Vec<UsageCost>),
@@ -1132,6 +1133,7 @@ impl UsageCollector {
             add_tokens(&mut summary, &row.tokens);
             add_tokens(daily.entry(row.day).or_default(), &row.tokens);
             hours[usize::from(row.hour.min(23))] += row.tokens.total_tokens();
+            add_tokens(&mut hourly[usize::from(row.hour.min(23))], &row.tokens);
             let priced = costs.cost(row);
             match &priced {
                 Some((currency, amount)) => add_usage_cost(&mut cost, currency, *amount),
@@ -1265,7 +1267,7 @@ impl UsageCollector {
             unpriced_tokens,
             overview,
             calendar,
-            hourly_tokens: hours.to_vec(),
+            hourly,
             quota: self.quota_estimates(query_client, &price_rules, unix_time())?,
         })
     }

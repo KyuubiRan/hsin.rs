@@ -1620,9 +1620,9 @@ pub struct UsageStatsReport {
     /// The last [`USAGE_CALENDAR_DAYS`] days ending today, whatever the range.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub calendar: Vec<UsageCalendarDay>,
-    /// Tokens by local hour of day, `0..24`, over the queried range.
+    /// Usage by local hour of day, `0..24`, over the queried range.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub hourly_tokens: Vec<u64>,
+    pub hourly: Vec<UsageTokenSummary>,
     /// Subscription quota windows the client reports, newest reading first. Independent of the
     /// query's range and filters.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1872,6 +1872,37 @@ pub struct Settings {
     pub claude_model_names_enabled: bool,
     #[serde(default)]
     pub upstream_proxy: UpstreamProxyConfig,
+    #[serde(default)]
+    pub stats_chart_style: StatsChartStyle,
+}
+
+/// How the statistics screens draw token series.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatsChartStyle {
+    /// Bars stacked by kind of token.
+    #[default]
+    Bar,
+    /// One line per kind of token.
+    Line,
+}
+
+impl StatsChartStyle {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bar => "bar",
+            Self::Line => "line",
+        }
+    }
+
+    #[must_use]
+    pub const fn toggled(self) -> Self {
+        match self {
+            Self::Bar => Self::Line,
+            Self::Line => Self::Bar,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1947,6 +1978,7 @@ impl Default for Settings {
             client_auth: ClientAuthSettings::default(),
             claude_model_names_enabled: true,
             upstream_proxy: UpstreamProxyConfig::default(),
+            stats_chart_style: StatsChartStyle::default(),
         }
     }
 }
@@ -1978,6 +2010,8 @@ pub struct SettingsPatch {
     pub claude_model_names_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_proxy: Option<UpstreamProxyUpdate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats_chart_style: Option<StatsChartStyle>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

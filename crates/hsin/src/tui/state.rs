@@ -83,6 +83,7 @@ pub(super) struct State {
     pub(super) client_auth: ClientAuthSettings,
     pub(super) claude_model_names_enabled: bool,
     pub(super) upstream_proxy: UpstreamProxyConfig,
+    pub(super) stats_chart_style: hsin_core::StatsChartStyle,
     pub(super) clipboard: Option<ProviderClipboard>,
     pub(super) loading: bool,
     pub(super) notice: Option<String>,
@@ -114,6 +115,7 @@ impl Default for State {
             client_auth: ClientAuthSettings::default(),
             claude_model_names_enabled: true,
             upstream_proxy: UpstreamProxyConfig::default(),
+            stats_chart_style: hsin_core::StatsChartStyle::default(),
             clipboard: None,
             loading: true,
             notice: None,
@@ -916,6 +918,7 @@ impl State {
         self.client_auth = settings.client_auth;
         self.claude_model_names_enabled = settings.claude_model_names_enabled;
         self.upstream_proxy = settings.upstream_proxy;
+        self.stats_chart_style = settings.stats_chart_style;
         if let InputMode::Settings(screen) = &mut self.input
             && matches!(
                 screen.page,
@@ -2832,6 +2835,13 @@ impl State {
                         })
                         .unwrap_or(0);
                     screen.filter = Some(StatsFilter::Model { selected });
+                }
+                // Switch chart style at once and save it, so the next visit opens the same way.
+                KeyCode::Char('v') => {
+                    self.stats_chart_style = self.stats_chart_style.toggled();
+                    self.queue_without_mode_change(Effect::SetStatsChartStyle(
+                        self.stats_chart_style,
+                    ));
                 }
                 KeyCode::Char('q') if screen.report.is_some() => {
                     let selected = match &screen.quota_filter {

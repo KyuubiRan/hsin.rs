@@ -195,7 +195,9 @@ hourly totals indefinitely, so the overview opens on all time: an activity
 heatmap of the last year (hover a day to preview it, click it for that day's
 details), streaks, the favorite model, the peak hour, and an estimated cost per
 currency. Press `d` to cycle all time, 7 and 30 days, or `t` for
-other ranges. Provider attribution from local session logs is inferred from
+other ranges. The model and daily charts split cache-hit input, other input and
+output by shade, as stacked bars or, after `v`, as lines on a log scale; the
+choice is saved. Provider attribution from local session logs is inferred from
 Hsin's route history and is marked with `~`.
 
 For a Codex or Claude subscription, the overview also estimates the plan's

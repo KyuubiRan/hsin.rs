@@ -11,6 +11,7 @@ use super::{
     widgets::{draw_banner, draw_footer},
 };
 
+mod chart;
 mod header;
 mod home;
 mod image_picker;
@@ -65,7 +66,15 @@ fn draw_frame(frame: &mut Frame<'_>, state: &mut State, i18n: &I18n, hits: &mut 
         return;
     }
     if let InputMode::Stats(screen) = &state.input {
-        draw_stats(frame, rows[2], screen, state.loading, i18n, hits);
+        draw_stats(
+            frame,
+            rows[2],
+            screen,
+            state.loading,
+            state.stats_chart_style,
+            i18n,
+            hits,
+        );
         draw_footer(frame, rows[3], state, i18n, hits);
         return;
     }
