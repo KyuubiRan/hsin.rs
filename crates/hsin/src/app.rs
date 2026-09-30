@@ -154,7 +154,7 @@ async fn run_stats(args: crate::cli::StatsArgs, client: &DaemonClient, json: boo
         "Attribution: exact {} · inferred {} · unattributed {}",
         report.attribution.exact, report.attribution.inferred, report.attribution.unattributed
     );
-    print_highlights(&report);
+    print_highlights(&report, args.all_plans);
     Ok(())
 }
 
@@ -239,7 +239,7 @@ fn print_quota(quota: &hsin_core::UsageQuotaEstimate) {
 }
 
 /// The overview, forecast and per-provider and per-model totals of a stats report.
-fn print_highlights(report: &UsageStatsReport) {
+fn print_highlights(report: &UsageStatsReport, all_plans: bool) {
     let overview = &report.overview;
     println!(
         "\nActive days: {} · current streak {} · longest streak {}",
@@ -258,8 +258,20 @@ fn print_highlights(report: &UsageStatsReport) {
     if let Some(hour) = overview.peak_hour {
         println!("Peak hour: {hour:02}:00");
     }
+    let recent = chrono::Utc::now().timestamp() - 30 * 86_400;
+    let mut hidden = 0;
     for quota in &report.quota {
-        print_quota(quota);
+        if all_plans || quota.observed_at >= recent {
+            print_quota(quota);
+        } else {
+            hidden += 1;
+        }
+    }
+    if hidden > 0 {
+        println!(
+            "
+{hidden} plan quota window(s) idle for over 30 days hidden; use --all-plans"
+        );
     }
     match &report.forecast {
         Some(forecast) => {

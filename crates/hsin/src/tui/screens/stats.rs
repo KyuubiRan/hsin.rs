@@ -18,8 +18,8 @@ use crate::{
 use super::super::{
     mouse::{ENTER, Hit, HitMap, plain},
     state::{
-        STATS_RANGE_CHIPS, STATS_TIME_CUSTOM, StatsFilter, StatsPage, StatsScreen,
-        current_time_preset,
+        QuotaFilter, STATS_RANGE_CHIPS, STATS_TIME_CUSTOM, StatsFilter, StatsPage, StatsScreen,
+        current_time_preset, quota_plans, visible_quota,
     },
     theme::{INPUT_BG, MUTED, RED, WHITE},
     widgets::{centered_fixed, display_width, draw_input_field},
@@ -95,8 +95,23 @@ pub(super) fn draw_stats(
     } else {
         format!("{} — {}", screen.from, screen.to)
     };
+    let plan_label = match &screen.quota_filter {
+        QuotaFilter::Recent => i18n.text("stats_quota_recent").to_owned(),
+        QuotaFilter::All => i18n.text("stats_quota_all").to_owned(),
+        QuotaFilter::Plan(key) => screen
+            .report
+            .as_ref()
+            .map(quota_plans)
+            .and_then(|plans| {
+                plans
+                    .into_iter()
+                    .find(|(plan, _)| plan == key)
+                    .map(|(_, label)| label)
+            })
+            .unwrap_or_else(|| key.clone()),
+    };
     let filters = format!(
-        "{range}  ·  {}: {}  ·  {}: {}{}",
+        "{range}  ·  {}: {}  ·  {}: {}  ·  {}: {plan_label}{}",
         i18n.text("stats_provider"),
         provider_label,
         i18n.text("stats_model"),
@@ -104,6 +119,7 @@ pub(super) fn draw_stats(
             .model
             .as_deref()
             .unwrap_or_else(|| i18n.text("stats_all")),
+        i18n.text("stats_quota_filter"),
         if loading { "  ·  …" } else { "" }
     );
     frame.render_widget(
@@ -233,7 +249,7 @@ fn draw_overview(
     hits: &mut HitMap,
 ) {
     if area.height < 16 || area.width < 56 {
-        draw_summary(frame, area, report, screen.scroll, i18n);
+        draw_summary(frame, area, screen, report, i18n);
         return;
     }
     let rows = Layout::default()
@@ -246,7 +262,7 @@ fn draw_overview(
         .split(area);
     draw_heatmap(frame, rows[0], report, screen.day, i18n, hits);
     draw_day_detail(frame, rows[1], report, screen.day, i18n);
-    draw_summary(frame, rows[2], report, screen.scroll, i18n);
+    draw_summary(frame, rows[2], screen, report, i18n);
 }
 
 /// A contribution-style calendar: one column per week ending with the current one, one row per
@@ -439,10 +455,11 @@ fn draw_day_detail(
 fn draw_summary(
     frame: &mut Frame<'_>,
     area: Rect,
+    screen: &StatsScreen,
     report: &UsageStatsReport,
-    scroll: u16,
     i18n: &I18n,
 ) {
+    let scroll = screen.scroll;
     let tokens = &report.summary;
     let overview = &report.overview;
     let none = || "—".to_owned();
@@ -538,9 +555,18 @@ fn draw_summary(
         .iter()
         .filter_map(|estimate| estimate.account.as_deref())
         .collect::<std::collections::BTreeSet<_>>();
-    for estimate in &report.quota {
+    let (quota, hidden) =
+        visible_quota(report, &screen.quota_filter, chrono::Utc::now().timestamp());
+    for estimate in quota {
         lines.push(Line::from(""));
         lines.extend(quota_lines(estimate, accounts.len() > 1, i18n));
+    }
+    if hidden > 0 {
+        lines.push(Line::from(Span::styled(
+            i18n.text("stats_quota_hidden")
+                .replace("{count}", &hidden.to_string()),
+            Style::default().fg(MUTED),
+        )));
     }
     lines.push(Line::from(""));
     lines.extend(forecast_lines(report, i18n));
@@ -932,6 +958,7 @@ fn draw_filter(
                 StatsFilter::Time { .. } => i18n.text("stats_time_range"),
                 StatsFilter::Provider { .. } => i18n.text("stats_provider"),
                 StatsFilter::Model { .. } => i18n.text("stats_model"),
+                StatsFilter::Quota { .. } => i18n.text("stats_quota_filter"),
             })
             .borders(Borders::ALL)
             .border_style(Style::default().fg(RED))
@@ -967,11 +994,23 @@ fn draw_filter(
                 items.extend(report.filters.models.iter().cloned().map(ListItem::new));
             }
         }
+        StatsFilter::Quota { .. } => {
+            items.push(ListItem::new(i18n.text("stats_quota_recent")));
+            items.push(ListItem::new(i18n.text("stats_quota_all")));
+            if let Some(report) = &screen.report {
+                items.extend(
+                    quota_plans(report)
+                        .into_iter()
+                        .map(|(_, label)| ListItem::new(label)),
+                );
+            }
+        }
     }
     let selected = match filter {
         StatsFilter::Time { selected, .. }
         | StatsFilter::Provider { selected }
-        | StatsFilter::Model { selected } => *selected,
+        | StatsFilter::Model { selected }
+        | StatsFilter::Quota { selected } => *selected,
     };
     let item_count = items.len();
     let list_area = Rect {

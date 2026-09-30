@@ -233,7 +233,7 @@
   "language_system": "Follow system",
   "help": "q quit · tab client · ↑/↓ select · enter switch · / search · a add · e edit · d delete · c copy · v paste · p proxy · o settings · s stats · r refresh",
   "image_help": "q quit · tab client · ↑/↓ select · enter activate · / search · a add · e edit · d disable/delete · o settings · s stats · r refresh",
-  "stats_help": "1/2 page · d range · t time · p Provider · m model · r sync · tab client · s/esc back",
+  "stats_help": "1/2 page · d range · t time · p Provider · m model · q plan · r sync · tab client · s/esc back",
   "stats_filter_help": "↑/↓ or ←/→ select · tab field · enter apply · esc cancel",
   "stats_image_unsupported": "Image token statistics are not supported yet.",
   "stats_invalid_date": "Enter a valid date range in YYYY-MM-DD form.",
@@ -466,5 +466,10 @@
   "stats_quota_pending": "The meter has not moved a full point yet; keep using the plan to estimate its allowance.",
   "stats_quota_note": "Back-calculated from {percent}% of meter movement over {cycles} cycle(s) at API list prices; the plan's token limit is not published.",
   "stats_quota_past": "no longer reported",
-  "stats_quota_account": "account"
+  "stats_quota_account": "account",
+  "stats_quota_filter": "Plan",
+  "stats_quota_recent": "Active in the last 30 days",
+  "stats_quota_all": "All plans",
+  "stats_quota_hidden": "{count} window(s) of plans idle for over 30 days are hidden · press q to show them",
+  "cli.stats.arg.all_plans": "Also list plan quotas idle for more than 30 days"
 }

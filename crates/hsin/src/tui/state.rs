@@ -166,6 +166,7 @@ pub(super) struct StatsScreen {
     pub(super) all_time: bool,
     /// The heatmap day under the pointer or last clicked.
     pub(super) day: Option<NaiveDate>,
+    pub(super) quota_filter: QuotaFilter,
 }
 
 /// The ranges in the time popup, in order: today, 7, 30 and 90 days, all time, then custom.
@@ -193,6 +194,68 @@ pub(super) enum StatsFilter {
     Model {
         selected: usize,
     },
+    Quota {
+        selected: usize,
+    },
+}
+
+/// Which plan quotas the overview shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) enum QuotaFilter {
+    /// Plans with readings in the last [`QUOTA_RECENT_DAYS`] days.
+    #[default]
+    Recent,
+    All,
+    Plan(String),
+}
+
+pub(super) const QUOTA_RECENT_DAYS: i64 = 30;
+
+/// Every plan in the report, as `(plan key, label)`, current plans first.
+pub(super) fn quota_plans(report: &UsageStatsReport) -> Vec<(String, String)> {
+    let mut plans = Vec::<(String, String)>::new();
+    for estimate in &report.quota {
+        if plans.iter().any(|(key, _)| key == &estimate.plan_key) {
+            continue;
+        }
+        let label = [
+            Some(estimate.plan_type.as_deref().unwrap_or("?")),
+            estimate.source.as_deref(),
+            estimate.account.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+        plans.push((estimate.plan_key.clone(), label));
+    }
+    plans
+}
+
+/// The quota windows a filter lets through, and how many recent-only filtering hid.
+pub(super) fn visible_quota<'a>(
+    report: &'a UsageStatsReport,
+    filter: &QuotaFilter,
+    now: i64,
+) -> (Vec<&'a hsin_core::UsageQuotaEstimate>, usize) {
+    let recent = |estimate: &hsin_core::UsageQuotaEstimate| {
+        estimate.observed_at >= now - QUOTA_RECENT_DAYS * 86_400
+    };
+    let shown = report
+        .quota
+        .iter()
+        .filter(|estimate| match filter {
+            QuotaFilter::Recent => recent(estimate),
+            QuotaFilter::All => true,
+            QuotaFilter::Plan(key) => &estimate.plan_key == key,
+        })
+        .collect::<Vec<_>>();
+    let hidden = if *filter == QuotaFilter::Recent {
+        report.quota.len() - shown.len()
+    } else {
+        0
+    };
+    (shown, hidden)
 }
 
 pub(super) struct SettingsScreen {
@@ -2644,6 +2707,33 @@ impl State {
                         _ => {}
                     }
                 }
+                // Filtering plans needs no new query: the report carries every plan.
+                StatsFilter::Quota { selected } => {
+                    let plans = screen.report.as_ref().map(quota_plans).unwrap_or_default();
+                    match key.code {
+                        KeyCode::Esc => screen.filter = None,
+                        KeyCode::Up | KeyCode::Char('i') => {
+                            *selected = selected.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('k') => {
+                            *selected = (*selected + 1).min(plans.len() + 1);
+                        }
+                        KeyCode::Enter => {
+                            screen.quota_filter = match *selected {
+                                0 => QuotaFilter::Recent,
+                                1 => QuotaFilter::All,
+                                index => plans
+                                    .get(index - 2)
+                                    .map_or(QuotaFilter::Recent, |(key, _)| {
+                                        QuotaFilter::Plan(key.clone())
+                                    }),
+                            };
+                            screen.filter = None;
+                            screen.scroll = 0;
+                        }
+                        _ => {}
+                    }
+                }
             }
         } else {
             match key.code {
@@ -2704,6 +2794,19 @@ impl State {
                         })
                         .unwrap_or(0);
                     screen.filter = Some(StatsFilter::Model { selected });
+                }
+                KeyCode::Char('q') if screen.report.is_some() => {
+                    let selected = match &screen.quota_filter {
+                        QuotaFilter::Recent => 0,
+                        QuotaFilter::All => 1,
+                        QuotaFilter::Plan(key) => screen
+                            .report
+                            .as_ref()
+                            .map(quota_plans)
+                            .and_then(|plans| plans.iter().position(|(plan, _)| plan == key))
+                            .map_or(0, |index| index + 2),
+                    };
+                    screen.filter = Some(StatsFilter::Quota { selected });
                 }
                 KeyCode::Char('r') => self.queue_without_mode_change(Effect::QueryUsage(
                     stats_query(self.client, &screen),
@@ -3701,6 +3804,7 @@ fn default_stats_screen() -> StatsScreen {
         scroll: 0,
         all_time: true,
         day: None,
+        quota_filter: QuotaFilter::Recent,
     }
 }
 

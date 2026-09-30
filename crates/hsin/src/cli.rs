@@ -96,6 +96,9 @@ pub struct StatsArgs {
     /// Include everything recorded; overrides --from and --to.
     #[arg(long, conflicts_with_all = ["from", "to"])]
     pub all: bool,
+    /// Also list plan quotas idle for more than 30 days.
+    #[arg(long)]
+    pub all_plans: bool,
 }
 
 #[derive(Debug, Subcommand)]

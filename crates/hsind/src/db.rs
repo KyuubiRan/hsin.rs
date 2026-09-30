@@ -16,7 +16,7 @@ use crate::{
     },
 };
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 const PROVIDER_COLUMNS: &str = "p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,EXISTS(SELECT 1 FROM provider_secrets configured WHERE configured.provider_id=p.id),p.claude_model_mapping,p.codex_config_name,p.scope,p.codex_image_enabled,p.codex_image_models,p.codex_image_preferred_model,p.network_proxy,EXISTS(SELECT 1 FROM protected_values proxy_secret WHERE proxy_secret.key='provider_proxy_password:' || p.id),p.codex_tuning";
 
@@ -678,9 +678,9 @@ fn migrate(connection: &Connection) -> Result<()> {
          INSERT OR IGNORE INTO client_state(client,mode,config_status,updated_at) VALUES('codex','direct','unmanaged',0),('claude','direct','unmanaged',0);
          INSERT OR IGNORE INTO codex_image_state(id,active_provider_id,updated_at) VALUES(1,NULL,0);
          INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES('language','system',0),('proxy_host','127.0.0.1',0),('proxy_port','9999',0),('proxy_enabled','false',0),('upstream_proxy','{"mode":"direct","manual":{"protocol":"http","host":"127.0.0.1","port":7890,"username":"","password_configured":false}}',0);
-         CREATE TABLE IF NOT EXISTS usage_quota_readings(reading_key TEXT NOT NULL,quota_window TEXT NOT NULL CHECK(quota_window IN ('primary','secondary')),client TEXT NOT NULL,observed_at INTEGER NOT NULL,limit_id TEXT NOT NULL,window_minutes INTEGER NOT NULL,resets_at INTEGER NOT NULL,used_percent REAL NOT NULL,plan_type TEXT,model TEXT NOT NULL,input_tokens INTEGER NOT NULL DEFAULT 0,cache_write_tokens INTEGER NOT NULL DEFAULT 0,cache_read_tokens INTEGER NOT NULL DEFAULT 0,output_tokens INTEGER NOT NULL DEFAULT 0,account TEXT NOT NULL DEFAULT '',session_provider TEXT NOT NULL DEFAULT '',PRIMARY KEY(reading_key,quota_window));
+         CREATE TABLE IF NOT EXISTS usage_quota_readings(reading_key TEXT NOT NULL,quota_window TEXT NOT NULL CHECK(quota_window IN ('primary','secondary')),client TEXT NOT NULL,observed_at INTEGER NOT NULL,limit_id TEXT NOT NULL,window_minutes INTEGER NOT NULL,resets_at INTEGER NOT NULL,used_percent REAL NOT NULL,plan_type TEXT,model TEXT NOT NULL,input_tokens INTEGER NOT NULL DEFAULT 0,cache_write_tokens INTEGER NOT NULL DEFAULT 0,cache_read_tokens INTEGER NOT NULL DEFAULT 0,output_tokens INTEGER NOT NULL DEFAULT 0,account TEXT NOT NULL DEFAULT '',session_provider TEXT NOT NULL DEFAULT '',client_share REAL NOT NULL DEFAULT 1.0,PRIMARY KEY(reading_key,quota_window));
          CREATE INDEX IF NOT EXISTS usage_quota_readings_idx ON usage_quota_readings(client,observed_at);
-         PRAGMA user_version=13;
+         PRAGMA user_version=14;
          COMMIT;"#
         )?;
     } else {
@@ -820,6 +820,17 @@ fn migrate(connection: &Connection) -> Result<()> {
                  ALTER TABLE usage_quota_readings ADD COLUMN account TEXT NOT NULL DEFAULT '';
                  ALTER TABLE usage_quota_readings ADD COLUMN session_provider TEXT NOT NULL DEFAULT '';
                  PRAGMA user_version=13;
+                 COMMIT;",
+            )?;
+            version = 13;
+        }
+        // A plan shared with other apps records the share its client used, so usage from those
+        // apps is not credited to the client.
+        if version == 13 {
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE usage_quota_readings ADD COLUMN client_share REAL NOT NULL DEFAULT 1.0;
+                 PRAGMA user_version=14;
                  COMMIT;",
             )?;
         }

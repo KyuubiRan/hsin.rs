@@ -4090,6 +4090,7 @@ fn usage_report() -> UsageStatsReport {
             },
         }),
         quota: vec![hsin_core::UsageQuotaEstimate {
+            plan_key: "1a2b3c4d|openai|pro".into(),
             account: Some("1a2b3c4d".into()),
             source: Some("openai".into()),
             current: true,
@@ -4177,6 +4178,7 @@ fn stats_render_wide_and_compact_without_losing_token_details() {
                 scroll: 0,
                 all_time: true,
                 day: None,
+                quota_filter: state::QuotaFilter::Recent,
             }),
             ..State::default()
         };
@@ -4532,4 +4534,48 @@ fn clicking_a_form_field_focuses_it_without_submitting() {
     };
     assert_eq!(form.field, 2);
     assert!(state.take_effect().is_none());
+}
+
+#[test]
+fn old_plans_hide_by_default_and_the_plan_filter_brings_them_back() {
+    let mut state = stats_state();
+    let InputMode::Stats(screen) = &mut state.input else {
+        panic!("stats screen is open");
+    };
+    let report = screen.report.as_mut().expect("report");
+    let mut old = report.quota[0].clone();
+    old.plan_key = "1a2b3c4d|openai|prolite".into();
+    old.plan_type = Some("prolite".into());
+    old.current = false;
+    old.observed_at = chrono::Utc::now().timestamp() - 60 * 86_400;
+    report.quota.push(old);
+
+    let rendered = render(&mut state, 120, 60);
+    assert!(rendered.contains("Plan quota · pro · openai"));
+    assert!(!rendered.contains("prolite"));
+    assert!(rendered.contains("1 window(s) of plans idle for over 30 days are hidden"));
+
+    state.reduce(key(KeyCode::Char('q')));
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Enter));
+    assert_eq!(stats_screen(&state).quota_filter, state::QuotaFilter::All);
+    let rendered = render(&mut state, 120, 60);
+    assert!(rendered.contains("Plan quota · prolite"));
+    assert!(
+        state.take_effect().is_none(),
+        "filtering plans needs no new query"
+    );
+
+    state.reduce(key(KeyCode::Char('q')));
+    for _ in 0..2 {
+        state.reduce(key(KeyCode::Down));
+    }
+    state.reduce(key(KeyCode::Enter));
+    assert_eq!(
+        stats_screen(&state).quota_filter,
+        state::QuotaFilter::Plan("1a2b3c4d|openai|prolite".into())
+    );
+    let rendered = render(&mut state, 120, 60);
+    assert!(rendered.contains("Plan quota · prolite"));
+    assert!(!rendered.contains("Plan quota · pro ·"));
 }

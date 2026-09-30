@@ -233,7 +233,7 @@
   "language_system": "跟随系统",
   "help": "q 退出 · tab 切换客户端 · ↑/↓ 选择 · enter 切换 · / 搜索 · a 添加 · e 编辑 · d 删除 · c 复制 · v 粘贴 · p 代理 · o 设置 · s 统计 · r 刷新",
   "image_help": "q 退出 · tab 切换客户端 · ↑/↓ 选择 · enter 启用 · / 搜索 · a 添加 · e 编辑 · d 停用/删除 · o 设置 · s 统计 · r 刷新",
-  "stats_help": "1/2 页面 · d 范围 · t 时间 · p Provider · m 模型 · r 同步 · tab 客户端 · s/esc 返回",
+  "stats_help": "1/2 页面 · d 范围 · t 时间 · p Provider · m 模型 · q 套餐 · r 同步 · tab 客户端 · s/esc 返回",
   "stats_filter_help": "↑/↓ 或 ←/→ 选择 · tab 切换输入 · enter 应用 · esc 取消",
   "stats_image_unsupported": "暂不支持图片 Token 统计。",
   "stats_invalid_date": "请输入有效的 YYYY-MM-DD 日期范围。",
@@ -466,5 +466,10 @@
   "stats_quota_pending": "额度计量还没变化满 1%，继续使用后即可估算总额度。",
   "stats_quota_note": "根据最近 {cycles} 个周期共 {percent}% 的额度变化，按 API 标价反推；官方未公布套餐的 Token 上限。",
   "stats_quota_past": "已不再使用",
-  "stats_quota_account": "账号"
+  "stats_quota_account": "账号",
+  "stats_quota_filter": "套餐",
+  "stats_quota_recent": "近 30 天活跃",
+  "stats_quota_all": "全部套餐",
+  "stats_quota_hidden": "已隐藏 {count} 个超过 30 天未使用的套餐窗口 · 按 q 查看",
+  "cli.stats.arg.all_plans": "同时列出超过 30 天未使用的套餐额度"
 }

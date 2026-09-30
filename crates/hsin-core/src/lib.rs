@@ -1534,6 +1534,10 @@ pub struct UsageQuotaCycle {
 /// provider and plan gets its own estimate: their allowances differ even when they share a client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageQuotaEstimate {
+    /// Identifies the plan this window belongs to — account, source and plan — so every window of
+    /// one plan can be filtered together.
+    #[serde(default)]
+    pub plan_key: String,
     /// A short hash of the account the readings came from, when the client names one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,

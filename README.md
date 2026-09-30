@@ -198,14 +198,17 @@ and the next 30 days. Press `d` to cycle all time, 7 and 30 days, or `t` for
 other ranges. Provider attribution from local session logs is inferred from
 Hsin's route history and is marked with `~`.
 
-For a Codex subscription, the overview also estimates the plan's allowance the
-way quota calculators do: Codex logs its quota meter with every request, so the
+For a Codex or Claude subscription, the overview also estimates the plan's
+allowance the way quota calculators do: Codex logs its quota meter with every
+request and Claude Code caches its meter in `~/.claude.json`, so the
 tokens spent while the meter moved, scaled to 100%, give the weekly allowance in
 tokens and in API list-price dollars, with the range the whole-percent meter
 leaves open, the remainder of the current window, and the equivalent per
 calendar month. Each account, session provider, plan and window is estimated
 separately, with its recent cycles listed, so switching between a relay and your
-own plan, or between plans, never mixes their allowances. It is an estimate;
+own plan, or between plans, never mixes their allowances. Plans active in the
+last 30 days show by default; press `q` on the stats screen (or pass
+`--all-plans`) to see older ones or pick one plan. It is an estimate;
 OpenAI does not publish token limits.
 
 Costs use built-in list prices, the public LiteLLM price list when you fetch it

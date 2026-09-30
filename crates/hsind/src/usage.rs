@@ -32,12 +32,18 @@ const LAST_CLEANUP_AT_KEY: &str = "usage_last_cleanup_at";
 const ROLLUP_VERSION_KEY: &str = "usage_rollup_version";
 const ROLLUP_VERSION: &str = "1";
 const CODEX_REPAIR_KEY: &str = "usage_codex_repair_version";
-/// Version 2 also fills in the account and session provider of stored quota readings.
-const CODEX_REPAIR_VERSION: &str = "2";
+/// Version 2 also fills in the account and session provider of stored quota readings; version 3
+/// reaches back over the longer quota history.
+const CODEX_REPAIR_VERSION: &str = "3";
 /// Cycles listed per quota window.
 const QUOTA_CYCLES_SHOWN: usize = 6;
-/// How far back quota readings are kept and repaired: a few weekly cycles.
-const QUOTA_HISTORY_DAYS: i64 = 35;
+/// How far back quota readings are kept and repaired. The screen shows the last 30 days by default
+/// and older plans on request.
+const QUOTA_HISTORY_DAYS: i64 = 90;
+/// Claude Code keeps its plan usage in this file, beside or one level above its settings.
+const CLAUDE_GLOBAL_CONFIG: &str = ".claude.json";
+/// The global config also holds project history; anything larger is not read.
+const MAX_CLAUDE_CONFIG_BYTES: u64 = 64 * 1024 * 1024;
 /// Readings whose reset times differ by more than this belong to different cycles.
 const QUOTA_CYCLE_TOLERANCE_SECONDS: i64 = 600;
 const UNKNOWN_MODEL: &str = "unknown";
@@ -128,9 +134,11 @@ struct QuotaRow {
     resets_at: i64,
     used_percent: f64,
     plan_type: Option<String>,
-    model: String,
     observed_at: i64,
-    tokens: UsageTokenSummary,
+    /// Usage since the previous reading of the series, by model.
+    usage: Vec<(String, UsageTokenSummary)>,
+    /// The part of the meter's movement the client itself caused, `0..=1`.
+    share: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +206,8 @@ pub(crate) struct UsageCollector {
     codex_home: PathBuf,
     claude_home: PathBuf,
     sync_lock: Mutex<()>,
+    /// Modification time and size of the Claude global config when it was last read.
+    claude_config_seen: Mutex<Option<(i64, u64)>>,
 }
 
 pub(crate) struct ProxyUsageObserver {
@@ -230,6 +240,7 @@ impl UsageCollector {
                 .unwrap_or_else(|| Path::new("."))
                 .to_path_buf(),
             sync_lock: Mutex::new(()),
+            claude_config_seen: Mutex::new(None),
         })
     }
 
@@ -356,6 +367,9 @@ impl UsageCollector {
             {
                 result.failed_files = result.failed_files.saturating_add(1);
             }
+        }
+        if self.sync_claude_quota(now).is_err() {
+            result.failed_files = result.failed_files.saturating_add(1);
         }
         self.set_meta(LAST_SYNCED_AT_KEY, &now.to_string(), now)?;
         self.set_meta(
@@ -657,7 +671,7 @@ impl UsageCollector {
         let rows = {
             let connection = self.db.connection.lock();
             let mut statement = connection.prepare(
-                "SELECT quota_window,limit_id,window_minutes,resets_at,used_percent,plan_type,model,observed_at,input_tokens,cache_write_tokens,cache_read_tokens,output_tokens,account,session_provider FROM usage_quota_readings WHERE client=?1 AND observed_at>=?2 ORDER BY observed_at,rowid",
+                "SELECT quota_window,limit_id,window_minutes,resets_at,used_percent,plan_type,model,observed_at,input_tokens,cache_write_tokens,cache_read_tokens,output_tokens,account,session_provider,client_share FROM usage_quota_readings WHERE client=?1 AND observed_at>=?2 ORDER BY observed_at,rowid",
             )?;
             let rows = statement.query_map(
                 params![client.to_string(), now - QUOTA_HISTORY_DAYS * 86_400],
@@ -671,16 +685,19 @@ impl UsageCollector {
                         resets_at: row.get(3)?,
                         used_percent: row.get(4)?,
                         plan_type: row.get(5)?,
-                        model: row.get(6)?,
                         observed_at: row.get(7)?,
-                        tokens: UsageTokenSummary {
-                            input_tokens: row.get(8)?,
-                            cache_write_tokens: row.get(9)?,
-                            cache_read_tokens: row.get(10)?,
-                            output_tokens: row.get(11)?,
-                            reasoning_output_tokens: 0,
-                            request_count: 1,
-                        },
+                        usage: vec![(
+                            row.get(6)?,
+                            UsageTokenSummary {
+                                input_tokens: row.get(8)?,
+                                cache_write_tokens: row.get(9)?,
+                                cache_read_tokens: row.get(10)?,
+                                output_tokens: row.get(11)?,
+                                reasoning_output_tokens: 0,
+                                request_count: 1,
+                            },
+                        )],
+                        share: row.get::<_, f64>(14)?.clamp(0.0, 1.0),
                     })
                 },
             )?;
@@ -688,6 +705,10 @@ impl UsageCollector {
         };
         // Different accounts, session providers and plans have different allowances, and a user
         // can move between them, so each gets its own series of readings.
+        let mut rows = rows;
+        if client == ClientKind::Claude {
+            self.attach_claude_usage(&mut rows, now)?;
+        }
         // Older clients do not name the account. When a provider and plan have exactly one known
         // account, their unnamed readings are that account's; otherwise they stay apart.
         let mut accounts = HashMap::<(String, Option<String>), BTreeSet<String>>::new();
@@ -697,7 +718,6 @@ impl UsageCollector {
                 .or_default()
                 .insert(row.account.clone());
         }
-        let mut rows = rows;
         for row in rows.iter_mut().filter(|row| row.account.is_empty()) {
             if let Some(known) = accounts.get(&(row.source.clone(), row.plan_type.clone()))
                 && let [account] = &known.iter().collect::<Vec<_>>()[..]
@@ -745,6 +765,109 @@ impl UsageCollector {
             )
         });
         Ok(estimates)
+    }
+
+    /// Claude Code refreshes its plan usage into its global config now and then. Each refresh is a
+    /// reading; only the cached usage block and the account's plan are read, never credentials.
+    fn sync_claude_quota(&self, now: i64) -> Result<()> {
+        let Some(path) = self.claude_global_config() else {
+            return Ok(());
+        };
+        let metadata = fs::metadata(&path)?;
+        let seen = (modified_seconds(&metadata), metadata.len());
+        if *self.claude_config_seen.lock() == Some(seen) {
+            return Ok(());
+        }
+        *self.claude_config_seen.lock() = Some(seen);
+        if metadata.len() > MAX_CLAUDE_CONFIG_BYTES {
+            return Ok(());
+        }
+        let config: Value = serde_json::from_slice(&fs::read(&path)?)?;
+        let Some(reading) = claude_quota_reading(&config) else {
+            return Ok(());
+        };
+        if reading.observed_at < now - QUOTA_HISTORY_DAYS * 86_400 {
+            return Ok(());
+        }
+        let key = digest(&format!(
+            "claude-quota:{}:{}",
+            reading.account, reading.observed_at
+        ));
+        let connection = self.db.connection.lock();
+        for window in &reading.windows {
+            connection.execute(
+                "INSERT OR IGNORE INTO usage_quota_readings(reading_key,quota_window,client,observed_at,limit_id,window_minutes,resets_at,used_percent,plan_type,model,account,session_provider,client_share) VALUES(?1,?2,'claude',?3,'claude',?4,?5,?6,?7,'',?8,'anthropic',?9)",
+                params![
+                    key, window.window, reading.observed_at, window.window_minutes,
+                    window.resets_at, window.used_percent, reading.plan_type, reading.account,
+                    window.share,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn claude_global_config(&self) -> Option<PathBuf> {
+        [
+            Some(self.claude_home.join(CLAUDE_GLOBAL_CONFIG)),
+            self.claude_home
+                .parent()
+                .map(|parent| parent.join(CLAUDE_GLOBAL_CONFIG)),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|path| path.is_file())
+    }
+
+    /// Claude readings carry no usage of their own: each is credited with the official-login
+    /// requests since the previous reading of its series. Requests through a relay are not the
+    /// plan's and are left out.
+    fn attach_claude_usage(&self, rows: &mut [QuotaRow], now: i64) -> Result<()> {
+        let events = {
+            let connection = self.db.connection.lock();
+            let mut statement = connection.prepare(
+                "SELECT model,event_at,input_tokens,cache_write_tokens,cache_read_tokens,output_tokens FROM usage_events WHERE client='claude' AND provider_id=?1 AND event_at>=?2 ORDER BY event_at",
+            )?;
+            let rows = statement.query_map(
+                params![
+                    format!("official-{}", ClientKind::Claude.as_str()),
+                    now - QUOTA_HISTORY_DAYS * 86_400
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        UsageTokenSummary {
+                            input_tokens: row.get(2)?,
+                            cache_write_tokens: row.get(3)?,
+                            cache_read_tokens: row.get(4)?,
+                            output_tokens: row.get(5)?,
+                            reasoning_output_tokens: 0,
+                            request_count: 1,
+                        },
+                    ))
+                },
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut previous = HashMap::<(String, String), i64>::new();
+        for row in rows.iter_mut() {
+            let series = (row.account.clone(), row.window.clone());
+            let since = previous.insert(series, row.observed_at);
+            let Some(since) = since else {
+                continue;
+            };
+            let mut usage = BTreeMap::<String, UsageTokenSummary>::new();
+            let start = events.partition_point(|event| event.1 <= since);
+            for (model, _, tokens) in events[start..]
+                .iter()
+                .take_while(|event| event.1 <= row.observed_at)
+            {
+                add_tokens(usage.entry(model.clone()).or_default(), tokens);
+            }
+            row.usage = usage.into_iter().collect();
+        }
+        Ok(())
     }
 
     /// Stores one event and marks the days it can have changed for the next rollup refresh, in one
@@ -1605,6 +1728,88 @@ fn codex_quota_readings(value: &Value, observed_at: i64) -> Vec<QuotaReading> {
         .collect()
 }
 
+struct ClaudeQuotaReading {
+    account: String,
+    plan_type: Option<String>,
+    observed_at: i64,
+    windows: Vec<ClaudeQuotaWindow>,
+}
+
+struct ClaudeQuotaWindow {
+    window: &'static str,
+    window_minutes: i64,
+    resets_at: i64,
+    used_percent: f64,
+    share: f64,
+}
+
+/// The plan usage Claude Code cached in its global config: the five-hour session window and the
+/// weekly window, the account, and the plan. The weekly window is shared with chat and other apps;
+/// its breakdown gives Claude Code's share.
+fn claude_quota_reading(config: &Value) -> Option<ClaudeQuotaReading> {
+    let cached = config.get("cachedUsageUtilization")?;
+    let observed_at = cached.get("fetchedAtMs").and_then(Value::as_i64)? / 1000;
+    let account_id = cached
+        .get("accountUuid")
+        .or_else(|| config.pointer("/oauthAccount/accountUuid"))
+        .and_then(Value::as_str)
+        .filter(|account| !account.is_empty())?;
+    let plan_type = [
+        "organizationType",
+        "userRateLimitTier",
+        "organizationRateLimitTier",
+    ]
+    .iter()
+    .find_map(|key| {
+        config
+            .pointer(&format!("/oauthAccount/{key}"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    })
+    .map(str::to_owned);
+    let utilization = cached.get("utilization")?;
+    let share = utilization
+        .pointer("/seven_day_breakdown/rows")
+        .and_then(Value::as_array)
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row.get("key").and_then(Value::as_str) == Some("claude_code"))
+        })
+        .and_then(|row| row.get("percent"))
+        .and_then(Value::as_f64)
+        .map_or(1.0, |percent| (percent / 100.0).clamp(0.0, 1.0));
+    let windows = [
+        ("five_hour", "primary", 300, 1.0),
+        ("seven_day", "secondary", 7 * 24 * 60, share),
+    ]
+    .into_iter()
+    .filter_map(|(name, window, window_minutes, share)| {
+        let limit = utilization.get(name).filter(|value| value.is_object())?;
+        let used_percent = limit.get("utilization").and_then(Value::as_f64)?;
+        let resets_at = limit
+            .get("resets_at")
+            .and_then(Value::as_str)
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())?
+            .timestamp();
+        (used_percent.is_finite() && (0.0..=100.0).contains(&used_percent)).then_some(
+            ClaudeQuotaWindow {
+                window,
+                window_minutes,
+                resets_at,
+                used_percent,
+                share,
+            },
+        )
+    })
+    .collect::<Vec<_>>();
+    (!windows.is_empty()).then(|| ClaudeQuotaReading {
+        account: digest(&format!("claude-account:{account_id}"))[..8].to_owned(),
+        plan_type,
+        observed_at,
+        windows,
+    })
+}
+
 /// Parses only the Codex lines the usage parser reads; the rest can be megabytes of transcript.
 fn codex_line(bytes: &[u8]) -> Option<Value> {
     if bytes.len() > MAX_SESSION_LINE_BYTES {
@@ -1690,12 +1895,14 @@ fn estimate_quota(
         let mut settled = (0_u64, Vec::new());
         let mut pending = (0_u64, Vec::new());
         for row in &cycle[1..] {
-            pending.0 += row.tokens.total_tokens();
-            let price = *resolved
-                .entry(row.model.as_str())
-                .or_insert_with(|| best_model_price(prices, None, &row.model));
-            if let Some(price) = price {
-                add_usage_cost(&mut pending.1, &price.currency, price.cost(&row.tokens));
+            for (model, usage) in &row.usage {
+                pending.0 += usage.total_tokens();
+                let price = *resolved
+                    .entry(model.as_str())
+                    .or_insert_with(|| best_model_price(prices, None, model));
+                if let Some(price) = price {
+                    add_usage_cost(&mut pending.1, &price.currency, price.cost(usage));
+                }
             }
             if row.used_percent > peak {
                 peak = row.used_percent;
@@ -1720,8 +1927,11 @@ fn estimate_quota(
             tokens: settled.0,
             cost: settled.1.clone(),
         });
-        let moved = peak - first;
-        if moved < 1.0 {
+        // Only the client's share of the movement answers for the client's usage; a plan shared
+        // with chat and other apps moves for them too.
+        let share = cycle.last().map_or(1.0, |row| row.share).max(0.05);
+        let moved = (peak - first) * share;
+        if peak - first < 1.0 {
             continue;
         }
         movement += moved;
@@ -1777,6 +1987,12 @@ fn estimate_quota(
     listed.sort_by_key(|cycle| std::cmp::Reverse(cycle.first_at));
     listed.truncate(QUOTA_CYCLES_SHOWN);
     Some(UsageQuotaEstimate {
+        plan_key: format!(
+            "{}|{}|{}",
+            latest.account,
+            latest.source,
+            latest.plan_type.as_deref().unwrap_or_default()
+        ),
         account: (!latest.account.is_empty()).then(|| latest.account.clone()),
         source: (!latest.source.is_empty()).then(|| latest.source.clone()),
         current: true,
@@ -2999,9 +3215,9 @@ mod tests {
             resets_at: 10_000,
             used_percent,
             plan_type: None,
-            model: "gpt-6.1-sol".into(),
             observed_at: 0,
-            tokens: tokens(input, 0),
+            usage: vec![("gpt-6.1-sol".into(), tokens(input, 0))],
+            share: 1.0,
         };
         let today = Local::now().date_naive();
         let flat = estimate_quota(&[row(3.0, 0), row(3.0, 500)], &[], 0, today).unwrap();
@@ -3038,9 +3254,9 @@ mod tests {
             resets_at: 10_000,
             used_percent,
             plan_type: Some("pro".into()),
-            model: "gpt-6.1-sol".into(),
             observed_at: 0,
-            tokens: tokens(input, 0),
+            usage: vec![("gpt-6.1-sol".into(), tokens(input, 0))],
+            share: 1.0,
         };
         // A session still reporting 4% interleaves with one at 5%; the trailing 900 tokens have
         // not moved the meter yet and stay out.
@@ -3167,6 +3383,114 @@ mod tests {
         assert_eq!(past.cycles.len(), 2);
         assert_eq!(past.cycles[0].tokens, 200_000);
         assert!((past.cycles[0].to_percent - 12.0).abs() < f64::EPSILON);
+        drop(collector);
+        drop(db);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    fn claude_config(fetched_at: i64, weekly: f64, resets_at: i64) -> serde_json::Value {
+        let resets = DateTime::<Utc>::from_timestamp(resets_at, 0)
+            .unwrap()
+            .to_rfc3339();
+        serde_json::json!({
+            "oauthAccount": {"accountUuid": "account-uuid", "emailAddress": "someone@example.test", "organizationType": "claude_pro"},
+            "cachedUsageUtilization": {
+                "fetchedAtMs": fetched_at * 1000,
+                "accountUuid": "account-uuid",
+                "utilization": {
+                    "five_hour": {"utilization": 21, "resets_at": resets},
+                    "seven_day": {"utilization": weekly, "resets_at": resets},
+                    "seven_day_opus": null,
+                    "seven_day_breakdown": {"rows": [
+                        {"key": "claude_code", "percent": 80},
+                        {"key": "chat", "percent": 20}
+                    ]}
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn claude_readings_come_from_the_cached_plan_usage_only() {
+        let reading = claude_quota_reading(&claude_config(1_000, 49.0, 5_000)).expect("reading");
+        assert_eq!(reading.observed_at, 1_000);
+        assert_eq!(reading.plan_type.as_deref(), Some("claude_pro"));
+        assert_eq!(reading.account.len(), 8);
+        assert!(!reading.account.contains("account"));
+        assert_eq!(reading.windows.len(), 2);
+        assert_eq!(reading.windows[0].window_minutes, 300);
+        assert!((reading.windows[0].share - 1.0).abs() < f64::EPSILON);
+        assert_eq!(reading.windows[1].window, "secondary");
+        assert!((reading.windows[1].share - 0.8).abs() < f64::EPSILON);
+        assert!((reading.windows[1].used_percent - 49.0).abs() < f64::EPSILON);
+        assert!(claude_quota_reading(&serde_json::json!({"oauthAccount": {}})).is_none());
+    }
+
+    #[test]
+    fn claude_quota_credits_official_usage_between_readings() {
+        let (root, db, collector) = test_collector();
+        collector.initialize().expect("initialize");
+        let now = unix_time();
+        let resets_at = now + 3 * 86_400;
+        let config = root.join("claude/.claude.json");
+        fs::write(
+            &config,
+            claude_config(now - 1_000, 10.0, resets_at).to_string(),
+        )
+        .expect("first");
+        collector.sync().expect("first reading");
+        let event = |key: &str, provider: &str, input: u64| UsageEvent {
+            client: ClientKind::Claude,
+            source: UsageDataSource::Session,
+            provider_id: Some(provider.into()),
+            provider_name: provider.into(),
+            provider_revision: 1,
+            model: "claude-sonnet-5".into(),
+            event_at: now - 700,
+            tokens: tokens(input, 0),
+            attribution: UsageAttribution::Inferred,
+            dedup_key: key.into(),
+            correlation_key: None,
+        };
+        collector
+            .insert_event(&event("plan", "official-claude", 800_000))
+            .expect("plan usage");
+        // A relay request in the same window is not the plan's.
+        collector
+            .insert_event(&event("relay", "relay-provider", 9_000_000))
+            .expect("relay usage");
+        fs::write(
+            &config,
+            claude_config(now - 500, 12.0, resets_at).to_string(),
+        )
+        .expect("second");
+        *collector.claude_config_seen.lock() = None;
+        collector.sync().expect("second reading");
+
+        let quota = collector
+            .query(all_time(ClientKind::Claude))
+            .expect("query")
+            .quota;
+        let weekly = quota
+            .iter()
+            .find(|estimate| estimate.window_minutes == 10_080)
+            .expect("weekly window");
+        assert_eq!(weekly.plan_type.as_deref(), Some("claude_pro"));
+        assert_eq!(weekly.source.as_deref(), Some("anthropic"));
+        // 800k tokens moved the meter two points, of which Claude Code caused 80%.
+        assert!((weekly.basis_percent - 1.6).abs() < 1e-9);
+        assert_eq!(weekly.capacity.as_ref().unwrap().tokens, 50_000_000);
+        // Sonnet 5 input lists at $2 per million.
+        assert!((weekly.capacity.as_ref().unwrap().cost[0].amount - 100.0).abs() < 1e-6);
+        let session = quota
+            .iter()
+            .find(|estimate| estimate.window_minutes == 300)
+            .expect("session window");
+        assert!(
+            session.capacity.is_none(),
+            "the five-hour meter did not move"
+        );
+        assert_eq!(session.plan_key, weekly.plan_key);
         drop(collector);
         drop(db);
         fs::remove_dir_all(root).expect("cleanup");
