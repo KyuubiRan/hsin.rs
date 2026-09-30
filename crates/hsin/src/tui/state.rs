@@ -5,25 +5,31 @@ use std::{
 };
 
 use chrono::{Local, NaiveDate, TimeZone};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use hsin_core::{
     AuthScheme, ClaudeModelMapping, ClaudeModelMappingUpdate, ClientAuthSettings, ClientKind,
     ClientSettings, CodexConfigNameUpdate, CodexImageConfig, CodexReasoningEffort,
     CodexTuningSettings, ConnectionMode, DEFAULT_CODEX_CONFIG_NAME, HSIN_CODEX_CONFIG_NAME,
     LANGUAGE_EN_US, LANGUAGE_SYSTEM, LANGUAGE_ZH_CN, ModelDiscoverParams, ModelDiscovery,
-    ModelSlot, ModelUpdate, OPENAI_CODEX_CONFIG_NAME, Provider, ProviderProxyConfig,
-    ProviderProxyMode, ProviderScope, ProxyProtocol, SecretInput, Settings, UpstreamProxyConfig,
-    UpstreamProxyMode, UsageStatsQuery, UsageStatsReport, convert_provider_base_url,
-    normalize_generated_provider_name, provider_name_from_url,
+    ModelPrice, ModelPriceInput, ModelPriceList, ModelPriceSource, ModelSlot, ModelUpdate,
+    OPENAI_CODEX_CONFIG_NAME, Provider, ProviderProxyConfig, ProviderProxyMode, ProviderScope,
+    ProxyProtocol, SecretInput, Settings, UpstreamProxyConfig, UpstreamProxyMode, UsageStatsQuery,
+    UsageStatsReport, convert_provider_base_url, normalize_generated_provider_name,
+    provider_name_from_url,
 };
+use ratatui::layout::Position;
 use zeroize::Zeroizing;
 
 use crate::rpc::StatusSnapshot;
 
-use super::effects::Effect;
+use super::{
+    effects::Effect,
+    mouse::{Hit, HitMap, plain},
+};
 
 pub(super) enum Action {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Loaded {
         providers: Vec<Provider>,
         status: StatusSnapshot,
@@ -45,6 +51,9 @@ pub(super) enum Action {
     MappingModelDiscoveryFailed(String),
     ProviderCopied(ProviderClipboard),
     UsageLoaded(UsageStatsReport),
+    /// The report for the day the heatmap popup shows.
+    DayUsageLoaded(UsageStatsReport),
+    PricesLoaded(ModelPriceList),
     /// Drives the timers the UI owns; today only the delete confirmation, which lapses on its own.
     Tick,
 }
@@ -75,6 +84,7 @@ pub(super) struct State {
     pub(super) client_auth: ClientAuthSettings,
     pub(super) claude_model_names_enabled: bool,
     pub(super) upstream_proxy: UpstreamProxyConfig,
+    pub(super) stats_chart_style: hsin_core::StatsChartStyle,
     pub(super) clipboard: Option<ProviderClipboard>,
     pub(super) loading: bool,
     pub(super) notice: Option<String>,
@@ -85,6 +95,8 @@ pub(super) struct State {
     /// Where the cursor sat in each client left behind, so returning to one resumes there instead
     /// of dropping back onto the official provider at the top.
     pub(super) parked: HashMap<ClientKind, usize>,
+    /// Clickable regions of the last drawn frame.
+    pub(super) hits: HitMap,
 }
 
 impl Default for State {
@@ -104,6 +116,7 @@ impl Default for State {
             client_auth: ClientAuthSettings::default(),
             claude_model_names_enabled: true,
             upstream_proxy: UpstreamProxyConfig::default(),
+            stats_chart_style: hsin_core::StatsChartStyle::default(),
             clipboard: None,
             loading: true,
             notice: None,
@@ -111,6 +124,7 @@ impl Default for State {
             pending_effect: None,
             search: String::new(),
             parked: HashMap::new(),
+            hits: HitMap::default(),
         }
     }
 }
@@ -153,7 +167,31 @@ pub(super) struct StatsScreen {
     pub(super) model: Option<String>,
     pub(super) filter: Option<StatsFilter>,
     pub(super) scroll: u16,
+    pub(super) scroll_max: u16,
+    /// Whether the last frame displayed a bar/line chart that `v` can switch.
+    pub(super) chart_visible: bool,
+    /// Covers everything recorded; `from` and `to` only matter for a custom range.
+    pub(super) all_time: bool,
+    /// The heatmap day under the pointer or last clicked.
+    pub(super) day: Option<NaiveDate>,
+    pub(super) quota_filter: QuotaFilter,
+    /// The heatmap day whose details are open, with its report once it arrives.
+    pub(super) day_detail: Option<Box<DayDetail>>,
+    /// Where the mouse pointer last moved, for the chart tooltip.
+    pub(super) pointer: Option<Position>,
 }
+
+pub(super) struct DayDetail {
+    pub(super) date: NaiveDate,
+    pub(super) report: Option<UsageStatsReport>,
+}
+
+/// The ranges in the time popup, in order: today, 7, 30 and 90 days, all time, then custom.
+pub(super) const STATS_TIME_DAYS: [i64; 4] = [1, 7, 30, 90];
+pub(super) const STATS_TIME_ALL: usize = 4;
+pub(super) const STATS_TIME_CUSTOM: usize = 5;
+/// The quick range chips, which `d` cycles through: all time, 7 days, 30 days.
+pub(super) const STATS_RANGE_CHIPS: [usize; 3] = [STATS_TIME_ALL, 1, 2];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StatsPage {
@@ -173,6 +211,68 @@ pub(super) enum StatsFilter {
     Model {
         selected: usize,
     },
+    Quota {
+        selected: usize,
+    },
+}
+
+/// Which plan quotas the overview shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) enum QuotaFilter {
+    /// Plans with readings in the last [`QUOTA_RECENT_DAYS`] days.
+    #[default]
+    Recent,
+    All,
+    Plan(String),
+}
+
+pub(super) const QUOTA_RECENT_DAYS: i64 = 30;
+
+/// Every plan in the report, as `(plan key, label)`, current plans first.
+pub(super) fn quota_plans(report: &UsageStatsReport) -> Vec<(String, String)> {
+    let mut plans = Vec::<(String, String)>::new();
+    for estimate in &report.quota {
+        if plans.iter().any(|(key, _)| key == &estimate.plan_key) {
+            continue;
+        }
+        let label = [
+            Some(estimate.plan_type.as_deref().unwrap_or("?")),
+            estimate.source.as_deref(),
+            estimate.account.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+        plans.push((estimate.plan_key.clone(), label));
+    }
+    plans
+}
+
+/// The quota windows a filter lets through, and how many recent-only filtering hid.
+pub(super) fn visible_quota<'a>(
+    report: &'a UsageStatsReport,
+    filter: &QuotaFilter,
+    now: i64,
+) -> (Vec<&'a hsin_core::UsageQuotaEstimate>, usize) {
+    let recent = |estimate: &hsin_core::UsageQuotaEstimate| {
+        estimate.observed_at >= now - QUOTA_RECENT_DAYS * 86_400
+    };
+    let shown = report
+        .quota
+        .iter()
+        .filter(|estimate| match filter {
+            QuotaFilter::Recent => recent(estimate),
+            QuotaFilter::All => true,
+            QuotaFilter::Plan(key) => &estimate.plan_key == key,
+        })
+        .collect::<Vec<_>>();
+    let hidden = if *filter == QuotaFilter::Recent {
+        report.quota.len() - shown.len()
+    } else {
+        0
+    };
+    (shown, hidden)
 }
 
 pub(super) struct SettingsScreen {
@@ -224,6 +324,99 @@ pub(super) enum SettingsPage {
         order: Vec<ClientKind>,
         moving: bool,
     },
+    Pricing {
+        selected: usize,
+        list: Option<ModelPriceList>,
+        editor: Option<PriceEditor>,
+        delete_armed: Option<(String, Instant)>,
+    },
+}
+
+/// Fields of the price rule editor, in order.
+pub(super) const PRICE_FIELD_COUNT: usize = 7;
+pub(super) const PRICE_PROVIDER_FIELD: usize = 1;
+
+pub(super) struct PriceEditor {
+    /// The user rule being replaced; `None` adds a rule, including one that overrides a built-in.
+    pub(super) id: Option<String>,
+    pub(super) field: usize,
+    pub(super) cursor: usize,
+    pub(super) pattern: String,
+    pub(super) provider_id: Option<String>,
+    pub(super) currency: String,
+    pub(super) input: String,
+    pub(super) cache_write: String,
+    pub(super) cache_read: String,
+    pub(super) output: String,
+}
+
+impl PriceEditor {
+    fn new() -> Self {
+        Self {
+            id: None,
+            field: 0,
+            cursor: 0,
+            pattern: String::new(),
+            provider_id: None,
+            currency: "USD".into(),
+            input: String::new(),
+            cache_write: String::new(),
+            cache_read: String::new(),
+            output: String::new(),
+        }
+    }
+
+    fn from_price(price: &ModelPrice) -> Self {
+        let number = |value: f64| value.to_string();
+        let pattern = price.model_pattern.clone();
+        Self {
+            id: (price.source == ModelPriceSource::User).then(|| price.id.clone()),
+            field: 0,
+            cursor: pattern.chars().count(),
+            pattern,
+            provider_id: price.provider_id.clone(),
+            currency: price.currency.clone(),
+            input: number(price.input),
+            cache_write: price.cache_write.map(number).unwrap_or_default(),
+            cache_read: price.cache_read.map(number).unwrap_or_default(),
+            output: number(price.output),
+        }
+    }
+
+    /// The text behind a field, or `None` for the provider choice.
+    pub(super) fn text_mut(&mut self, field: usize) -> Option<&mut String> {
+        match field {
+            0 => Some(&mut self.pattern),
+            2 => Some(&mut self.currency),
+            3 => Some(&mut self.input),
+            4 => Some(&mut self.cache_write),
+            5 => Some(&mut self.cache_read),
+            6 => Some(&mut self.output),
+            _ => None,
+        }
+    }
+
+    fn submission(&self) -> Option<ModelPriceInput> {
+        let required = |value: &str| value.trim().parse::<f64>().ok();
+        let optional = |value: &str| {
+            if value.trim().is_empty() {
+                Some(None)
+            } else {
+                required(value).map(Some)
+            }
+        };
+        let input = ModelPriceInput {
+            id: self.id.clone(),
+            model_pattern: self.pattern.trim().to_owned(),
+            provider_id: self.provider_id.clone(),
+            currency: self.currency.trim().to_ascii_uppercase(),
+            input: required(&self.input)?,
+            cache_write: optional(&self.cache_write)?,
+            cache_read: optional(&self.cache_read)?,
+            output: required(&self.output)?,
+        };
+        input.validate().ok().map(|()| input)
+    }
 }
 
 pub(super) struct ProviderForm {
@@ -573,6 +766,7 @@ pub(super) enum ModelPickerMode {
 }
 
 impl State {
+    #[allow(clippy::too_many_lines)]
     pub(super) fn reduce(&mut self, action: Action) -> Transition {
         match action {
             Action::Loaded {
@@ -584,6 +778,7 @@ impl State {
                 self.notice = Some(format!("@{key}"));
                 self.loading = false;
             }
+            Action::Mouse(mouse) => return self.reduce_mouse(mouse),
             Action::Tick => {
                 if let InputMode::DeleteConfirm { expires_at, .. } = &self.input
                     && Instant::now() >= *expires_at
@@ -595,6 +790,16 @@ impl State {
                     ..
                 }) = &mut self.input
                     && delete_armed.is_some_and(|(_, expires_at)| Instant::now() >= expires_at)
+                {
+                    *delete_armed = None;
+                }
+                if let InputMode::Settings(SettingsScreen {
+                    page: SettingsPage::Pricing { delete_armed, .. },
+                    ..
+                }) = &mut self.input
+                    && delete_armed
+                        .as_ref()
+                        .is_some_and(|(_, expires_at)| Instant::now() >= *expires_at)
                 {
                     *delete_armed = None;
                 }
@@ -667,6 +872,18 @@ impl State {
                 }
                 self.loading = false;
             }
+            Action::PricesLoaded(prices) => self.apply_prices(prices),
+            Action::DayUsageLoaded(report) => {
+                if let InputMode::Stats(StatsScreen {
+                    day_detail: Some(detail),
+                    ..
+                }) = &mut self.input
+                    && stats_query_day(&report.query) == Some(detail.date)
+                {
+                    detail.report = Some(report);
+                }
+                self.loading = false;
+            }
             Action::Key(key) => return self.reduce_key(key),
         }
         Transition::Continue
@@ -707,6 +924,7 @@ impl State {
         self.client_auth = settings.client_auth;
         self.claude_model_names_enabled = settings.claude_model_names_enabled;
         self.upstream_proxy = settings.upstream_proxy;
+        self.stats_chart_style = settings.stats_chart_style;
         if let InputMode::Settings(screen) = &mut self.input
             && matches!(
                 screen.page,
@@ -763,6 +981,77 @@ impl State {
         }
     }
 
+    /// Clicks replay the keyboard: they move the same cursors and press the same keys, so every
+    /// rule the keyboard enforces holds for the mouse too.
+    fn reduce_mouse(&mut self, mouse: MouseEvent) -> Transition {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.reduce_key(plain(KeyCode::Up)),
+            MouseEventKind::ScrollDown => self.reduce_key(plain(KeyCode::Down)),
+            // Motion only matters on the stats screen: over the heatmap it previews a day, and over
+            // a chart it shows the values under the pointer.
+            MouseEventKind::Moved => {
+                let hit = self.hits.at(mouse.column, mouse.row).cloned();
+                if let InputMode::Stats(screen) = &mut self.input {
+                    screen.pointer = Some(Position::new(mouse.column, mouse.row));
+                    if let Some(Hit::HeatDay(date)) = hit {
+                        screen.day = Some(date);
+                    }
+                }
+                Transition::Continue
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(hit) = self.hits.at(mouse.column, mouse.row).cloned() else {
+                    return Transition::Continue;
+                };
+                match hit {
+                    Hit::Barrier => Transition::Continue,
+                    Hit::Key(key) => self.reduce_key(key),
+                    Hit::HeatDay(date) => {
+                        self.open_day_detail(date);
+                        Transition::Continue
+                    }
+                    Hit::StatsRange(preset) => {
+                        self.set_stats_range(preset);
+                        Transition::Continue
+                    }
+                    Hit::Section(section) => {
+                        // Tab walks the same ring the header shows; the bound only guards against a
+                        // section that is no longer reachable.
+                        for _ in 0..self.visible_sections().len() {
+                            if self.section() == section {
+                                break;
+                            }
+                            self.reduce_key(plain(KeyCode::Tab));
+                        }
+                        Transition::Continue
+                    }
+                    Hit::Row {
+                        index,
+                        selected,
+                        activate,
+                    } => {
+                        if index == selected {
+                            return activate
+                                .map_or(Transition::Continue, |key| self.reduce_key(key));
+                        }
+                        let step = plain(if index > selected {
+                            KeyCode::Down
+                        } else {
+                            KeyCode::Up
+                        });
+                        for _ in 0..index.abs_diff(selected) {
+                            if self.reduce_key(step) == Transition::Quit {
+                                return Transition::Quit;
+                            }
+                        }
+                        Transition::Continue
+                    }
+                }
+            }
+            _ => Transition::Continue,
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn reduce_key(&mut self, key: KeyEvent) -> Transition {
         if matches!(&self.input, InputMode::Form(form) if form.discovering_models) {
@@ -782,6 +1071,7 @@ impl State {
         let client_settings = self.client_settings.clone();
         let client_auth = self.client_auth;
         let claude_model_names_enabled = self.claude_model_names_enabled;
+        let price_providers = self.price_providers();
         let language_selected = match self.language.as_str() {
             LANGUAGE_EN_US => 1,
             LANGUAGE_ZH_CN => 2,
@@ -1358,7 +1648,7 @@ impl State {
                         screen.selected = screen.selected.saturating_sub(1);
                     }
                     KeyCode::Down | KeyCode::Char('k') => {
-                        screen.selected = (screen.selected + 1).min(3);
+                        screen.selected = (screen.selected + 1).min(SETTINGS_ROOT_COUNT - 1);
                     }
                     KeyCode::Enter => match screen.selected {
                         0 => {
@@ -1386,10 +1676,20 @@ impl State {
                         2 => {
                             screen.page = SettingsPage::Clients { selected: 0 };
                         }
-                        _ => {
+                        3 => {
                             screen.page = SettingsPage::Language {
                                 selected: language_selected,
                             };
+                        }
+                        _ => {
+                            screen.page = SettingsPage::Pricing {
+                                selected: 0,
+                                list: None,
+                                editor: None,
+                                delete_armed: None,
+                            };
+                            self.pending_effect = Some(Effect::LoadPrices);
+                            self.loading = true;
                         }
                     },
                     _ => {}
@@ -1826,6 +2126,74 @@ impl State {
                             }
                             _ => {}
                         }
+                    }
+                }
+                SettingsPage::Pricing {
+                    selected,
+                    list,
+                    editor,
+                    delete_armed,
+                } => {
+                    if self.loading {
+                        return Transition::Continue;
+                    }
+                    if let Some(form) = editor {
+                        match reduce_price_editor(form, key, &price_providers) {
+                            Some(PriceEditorOutcome::Close) => *editor = None,
+                            Some(PriceEditorOutcome::Submit(input)) => {
+                                *editor = None;
+                                self.pending_effect = Some(Effect::SetPrice(input));
+                                self.loading = true;
+                            }
+                            Some(PriceEditorOutcome::Invalid) => {
+                                self.notice = Some("@pricing_invalid".into());
+                            }
+                            None => {}
+                        }
+                        return Transition::Continue;
+                    }
+                    let prices = list.as_ref().map_or(&[][..], |list| &list.prices[..]);
+                    let current = prices.get(*selected);
+                    if key.code != KeyCode::Char('d') {
+                        *delete_armed = None;
+                    }
+                    match key.code {
+                        KeyCode::Esc => {
+                            screen.selected = SETTINGS_ROOT_COUNT - 1;
+                            screen.page = SettingsPage::Root;
+                        }
+                        KeyCode::Up | KeyCode::Char('i') => {
+                            *selected = selected.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('k') => {
+                            *selected = (*selected + 1).min(prices.len().saturating_sub(1));
+                        }
+                        KeyCode::Char('a') => *editor = Some(PriceEditor::new()),
+                        KeyCode::Char('e') | KeyCode::Enter if let Some(price) = current => {
+                            *editor = Some(PriceEditor::from_price(price));
+                        }
+                        KeyCode::Char('d') if let Some(price) = current => {
+                            if price.source != ModelPriceSource::User {
+                                self.notice = Some("@pricing_user_only".into());
+                            } else if delete_armed.as_ref().is_some_and(|(armed, deadline)| {
+                                armed == &price.id && Instant::now() < *deadline
+                            }) {
+                                self.pending_effect = Some(Effect::RemovePrice(price.id.clone()));
+                                self.loading = true;
+                                *delete_armed = None;
+                            } else {
+                                *delete_armed = Some((
+                                    price.id.clone(),
+                                    Instant::now() + DELETE_CONFIRM_WINDOW,
+                                ));
+                            }
+                        }
+                        KeyCode::Char('u') => {
+                            self.pending_effect = Some(Effect::RefreshPrices);
+                            self.loading = true;
+                            self.notice = Some("@pricing_refreshing".into());
+                        }
+                        _ => {}
                     }
                 }
                 SettingsPage::ClientVisibility { selected } => match key.code {
@@ -2266,6 +2634,32 @@ impl State {
             unreachable!("stats reducer requires stats mode");
         };
         let mut keep = true;
+        if let Some(detail) = &screen.day_detail {
+            match key.code {
+                KeyCode::Esc => screen.day_detail = None,
+                KeyCode::Char('v') if screen.chart_visible => {
+                    self.stats_chart_style = self.stats_chart_style.toggled();
+                    self.queue_without_mode_change(Effect::SetStatsChartStyle(
+                        self.stats_chart_style,
+                    ));
+                }
+                // Narrow the whole screen to the day on show.
+                KeyCode::Enter => {
+                    let day = detail.date.format("%Y-%m-%d").to_string();
+                    screen.from.clone_from(&day);
+                    screen.to = day;
+                    screen.all_time = false;
+                    screen.day_detail = None;
+                    self.queue_without_mode_change(Effect::QueryUsage(stats_query(
+                        self.client,
+                        &screen,
+                    )));
+                }
+                _ => {}
+            }
+            self.input = InputMode::Stats(screen);
+            return Transition::Continue;
+        }
         if let Some(filter) = &mut screen.filter {
             match filter {
                 StatsFilter::Time {
@@ -2274,15 +2668,15 @@ impl State {
                     cursor,
                 } => match key.code {
                     KeyCode::Esc => screen.filter = None,
-                    KeyCode::Left | KeyCode::Char('j') if *selected < 4 => {
+                    KeyCode::Left | KeyCode::Char('j') if *selected < STATS_TIME_CUSTOM => {
                         *selected = selected.saturating_sub(1);
                     }
-                    KeyCode::Right | KeyCode::Char('l') if *selected < 4 => {
-                        *selected = (*selected + 1).min(4);
+                    KeyCode::Right | KeyCode::Char('l') if *selected < STATS_TIME_CUSTOM => {
+                        *selected = (*selected + 1).min(STATS_TIME_CUSTOM);
                     }
                     KeyCode::Up => *selected = selected.saturating_sub(1),
-                    KeyCode::Down => *selected = (*selected + 1).min(4),
-                    KeyCode::Tab if *selected == 4 => {
+                    KeyCode::Down => *selected = (*selected + 1).min(STATS_TIME_CUSTOM),
+                    KeyCode::Tab if *selected == STATS_TIME_CUSTOM => {
                         *custom_field = (*custom_field + 1) % 2;
                         *cursor = if *custom_field == 0 {
                             screen.from.chars().count()
@@ -2301,7 +2695,7 @@ impl State {
                             self.notice = Some("@stats_invalid_date".into());
                         }
                     }
-                    _ if *selected == 4 => {
+                    _ if *selected == STATS_TIME_CUSTOM => {
                         let field = if *custom_field == 0 {
                             &mut screen.from
                         } else {
@@ -2369,18 +2763,65 @@ impl State {
                         _ => {}
                     }
                 }
+                // Filtering plans needs no new query: the report carries every plan.
+                StatsFilter::Quota { selected } => {
+                    let plans = screen.report.as_ref().map(quota_plans).unwrap_or_default();
+                    match key.code {
+                        KeyCode::Esc => screen.filter = None,
+                        KeyCode::Up | KeyCode::Char('i') => {
+                            *selected = selected.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('k') => {
+                            *selected = (*selected + 1).min(plans.len() + 1);
+                        }
+                        KeyCode::Enter => {
+                            screen.quota_filter = match *selected {
+                                0 => QuotaFilter::Recent,
+                                1 => QuotaFilter::All,
+                                index => plans
+                                    .get(index - 2)
+                                    .map_or(QuotaFilter::Recent, |(key, _)| {
+                                        QuotaFilter::Plan(key.clone())
+                                    }),
+                            };
+                            screen.filter = None;
+                            screen.scroll = 0;
+                        }
+                        _ => {}
+                    }
+                }
             }
         } else {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('s') => keep = false,
-                KeyCode::Char('1') => screen.page = StatsPage::Overview,
-                KeyCode::Char('2') => screen.page = StatsPage::Models,
+                KeyCode::Char('1' | '2') => {
+                    screen.page = if key.code == KeyCode::Char('1') {
+                        StatsPage::Overview
+                    } else {
+                        StatsPage::Models
+                    };
+                    screen.scroll = 0;
+                }
                 KeyCode::Char('t') => {
                     screen.filter = Some(StatsFilter::Time {
-                        selected: 2,
+                        selected: current_time_preset(&screen),
                         custom_field: 0,
                         cursor: screen.from.chars().count(),
                     });
+                }
+                KeyCode::Char('d') => {
+                    let current = current_time_preset(&screen);
+                    let next = STATS_RANGE_CHIPS
+                        .iter()
+                        .position(|preset| *preset == current)
+                        .map_or(STATS_RANGE_CHIPS[0], |index| {
+                            STATS_RANGE_CHIPS[(index + 1) % STATS_RANGE_CHIPS.len()]
+                        });
+                    apply_range(&mut screen, next);
+                    self.queue_without_mode_change(Effect::QueryUsage(stats_query(
+                        self.client,
+                        &screen,
+                    )));
                 }
                 KeyCode::Char('p') => {
                     let selected = screen
@@ -2416,11 +2857,31 @@ impl State {
                         .unwrap_or(0);
                     screen.filter = Some(StatsFilter::Model { selected });
                 }
+                // Only switch the style when the bar/line charts are on screen.
+                KeyCode::Char('v') if screen.page == StatsPage::Models && screen.chart_visible => {
+                    self.stats_chart_style = self.stats_chart_style.toggled();
+                    self.queue_without_mode_change(Effect::SetStatsChartStyle(
+                        self.stats_chart_style,
+                    ));
+                }
+                KeyCode::Char('q') if screen.report.is_some() => {
+                    let selected = match &screen.quota_filter {
+                        QuotaFilter::Recent => 0,
+                        QuotaFilter::All => 1,
+                        QuotaFilter::Plan(key) => screen
+                            .report
+                            .as_ref()
+                            .map(quota_plans)
+                            .and_then(|plans| plans.iter().position(|(plan, _)| plan == key))
+                            .map_or(0, |index| index + 2),
+                    };
+                    screen.filter = Some(StatsFilter::Quota { selected });
+                }
                 KeyCode::Char('r') => self.queue_without_mode_change(Effect::QueryUsage(
                     stats_query(self.client, &screen),
                 )),
                 KeyCode::Down | KeyCode::Char('k') => {
-                    screen.scroll = screen.scroll.saturating_add(1);
+                    screen.scroll = screen.scroll.saturating_add(1).min(screen.scroll_max);
                 }
                 KeyCode::Up | KeyCode::Char('i') => {
                     screen.scroll = screen.scroll.saturating_sub(1);
@@ -2466,6 +2927,69 @@ impl State {
 
     pub(super) fn take_effect(&mut self) -> Option<Effect> {
         self.pending_effect.take()
+    }
+
+    fn apply_prices(&mut self, prices: ModelPriceList) {
+        if let InputMode::Settings(SettingsScreen {
+            page: SettingsPage::Pricing { selected, list, .. },
+            ..
+        }) = &mut self.input
+        {
+            *selected = (*selected).min(prices.prices.len().saturating_sub(1));
+            *list = Some(prices);
+        }
+        self.loading = false;
+    }
+
+    /// Opens the details of one heatmap day and asks for that day's report, keeping the screen's
+    /// provider and model filters.
+    fn open_day_detail(&mut self, date: NaiveDate) {
+        let InputMode::Stats(screen) = &mut self.input else {
+            return;
+        };
+        if screen.filter.is_some() {
+            return;
+        }
+        screen.day = Some(date);
+        screen.day_detail = Some(Box::new(DayDetail { date, report: None }));
+        let day = date.format("%Y-%m-%d").to_string();
+        let query = stats_query(
+            self.client,
+            &StatsScreen {
+                from: day.clone(),
+                to: day,
+                all_time: false,
+                provider_id: screen.provider_id.clone(),
+                model: screen.model.clone(),
+                ..default_stats_screen()
+            },
+        );
+        self.queue_without_mode_change(Effect::QueryUsageDay(query));
+    }
+
+    /// Switches the stats screen to a preset range and asks for it.
+    fn set_stats_range(&mut self, preset: usize) {
+        let InputMode::Stats(screen) = &mut self.input else {
+            return;
+        };
+        if screen.filter.is_some() || current_time_preset(screen) == preset {
+            return;
+        }
+        apply_range(screen, preset);
+        let query = stats_query(self.client, screen);
+        self.queue_without_mode_change(Effect::QueryUsage(query));
+    }
+
+    /// Providers a price rule can be scoped to, as `(id, name)`.
+    pub(super) fn price_providers(&self) -> Vec<(String, String)> {
+        let mut providers = self
+            .providers
+            .iter()
+            .filter(|provider| !provider.official && provider.scope == ProviderScope::Primary)
+            .map(|provider| (provider.id.clone(), provider.name.clone()))
+            .collect::<Vec<_>>();
+        providers.sort_by_key(|provider| provider.1.to_lowercase());
+        providers
     }
 
     /// The filter currently shaping the provider list: the in-progress draft while the search bar
@@ -3373,6 +3897,13 @@ fn default_stats_screen() -> StatsScreen {
         model: None,
         filter: None,
         scroll: 0,
+        scroll_max: 0,
+        chart_visible: false,
+        all_time: true,
+        day: None,
+        quota_filter: QuotaFilter::Recent,
+        day_detail: None,
+        pointer: None,
     }
 }
 
@@ -3381,13 +3912,8 @@ fn apply_time_preset(screen: &mut StatsScreen) -> bool {
         Some(StatsFilter::Time { selected, .. }) => *selected,
         _ => return false,
     };
-    let to = Local::now().date_naive();
-    if selected < 4 {
-        let days = [1, 7, 30, 90][selected];
-        screen.to = to.format("%Y-%m-%d").to_string();
-        screen.from = (to - chrono::Duration::days(days - 1))
-            .format("%Y-%m-%d")
-            .to_string();
+    if selected != STATS_TIME_CUSTOM {
+        apply_range(screen, selected);
         return true;
     }
     let Ok(from) = NaiveDate::parse_from_str(&screen.from, "%Y-%m-%d") else {
@@ -3396,13 +3922,49 @@ fn apply_time_preset(screen: &mut StatsScreen) -> bool {
     let Ok(to) = NaiveDate::parse_from_str(&screen.to, "%Y-%m-%d") else {
         return false;
     };
+    screen.all_time = false;
     from <= to
+}
+
+/// Applies a preset range that ends today; `preset` indexes the time popup.
+fn apply_range(screen: &mut StatsScreen, preset: usize) {
+    let to = Local::now().date_naive();
+    screen.all_time = preset == STATS_TIME_ALL;
+    if let Some(days) = STATS_TIME_DAYS.get(preset) {
+        screen.to = to.format("%Y-%m-%d").to_string();
+        screen.from = (to - chrono::Duration::days(days - 1))
+            .format("%Y-%m-%d")
+            .to_string();
+    }
+}
+
+/// Which popup entry describes the range on screen.
+pub(super) fn current_time_preset(screen: &StatsScreen) -> usize {
+    if screen.all_time {
+        return STATS_TIME_ALL;
+    }
+    let today = Local::now().date_naive();
+    let parse = |value: &str| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok();
+    match (parse(&screen.from), parse(&screen.to)) {
+        (Some(from), Some(to)) if to == today => STATS_TIME_DAYS
+            .iter()
+            .position(|days| from == today - chrono::Duration::days(days - 1))
+            .unwrap_or(STATS_TIME_CUSTOM),
+        _ => STATS_TIME_CUSTOM,
+    }
+}
+
+/// The local day a one-day query covers.
+fn stats_query_day(query: &UsageStatsQuery) -> Option<NaiveDate> {
+    chrono::DateTime::from_timestamp(query.from, 0)
+        .map(|value| value.with_timezone(&Local).date_naive())
 }
 
 fn stats_query(client: ClientKind, screen: &StatsScreen) -> UsageStatsQuery {
     let today = Local::now().date_naive();
     let from = NaiveDate::parse_from_str(&screen.from, "%Y-%m-%d").unwrap_or(today);
     let to = NaiveDate::parse_from_str(&screen.to, "%Y-%m-%d").unwrap_or(today);
+    let to = if screen.all_time { today } else { to };
     let timestamp = |date: NaiveDate| {
         date.and_hms_opt(0, 0, 0)
             .and_then(|value| Local.from_local_datetime(&value).earliest())
@@ -3410,11 +3972,93 @@ fn stats_query(client: ClientKind, screen: &StatsScreen) -> UsageStatsQuery {
     };
     UsageStatsQuery {
         client,
-        from: timestamp(from),
+        from: if screen.all_time { 0 } else { timestamp(from) },
         to: timestamp(to + chrono::Duration::days(1)),
         provider_id: screen.provider_id.clone(),
         model: screen.model.clone(),
     }
+}
+
+/// Entries of the settings root menu.
+pub(super) const SETTINGS_ROOT_COUNT: usize = 5;
+
+enum PriceEditorOutcome {
+    Close,
+    Submit(ModelPriceInput),
+    Invalid,
+}
+
+fn reduce_price_editor(
+    form: &mut PriceEditor,
+    key: KeyEvent,
+    providers: &[(String, String)],
+) -> Option<PriceEditorOutcome> {
+    let focus = |form: &mut PriceEditor, field: usize| {
+        form.field = field;
+        form.cursor = form.text_mut(field).map_or(0, |text| text.chars().count());
+    };
+    match key.code {
+        KeyCode::Esc => return Some(PriceEditorOutcome::Close),
+        KeyCode::Enter => {
+            return Some(
+                form.submission()
+                    .map_or(PriceEditorOutcome::Invalid, PriceEditorOutcome::Submit),
+            );
+        }
+        KeyCode::Down | KeyCode::Tab => focus(form, (form.field + 1) % PRICE_FIELD_COUNT),
+        KeyCode::Up | KeyCode::BackTab => {
+            focus(
+                form,
+                (form.field + PRICE_FIELD_COUNT - 1) % PRICE_FIELD_COUNT,
+            );
+        }
+        KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+            if form.field == PRICE_PROVIDER_FIELD =>
+        {
+            // `None` (every provider) sits before the providers in the cycle.
+            let position = form
+                .provider_id
+                .as_ref()
+                .and_then(|id| providers.iter().position(|(candidate, _)| candidate == id))
+                .map_or(0, |index| index + 1);
+            let count = providers.len() + 1;
+            let next = if key.code == KeyCode::Left {
+                (position + count - 1) % count
+            } else {
+                (position + 1) % count
+            };
+            form.provider_id = next
+                .checked_sub(1)
+                .and_then(|index| providers.get(index))
+                .map(|(id, _)| id.clone());
+        }
+        KeyCode::Char('u' | 'U') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            let field = form.field;
+            if let Some(text) = form.text_mut(field) {
+                text.clear();
+            }
+            form.cursor = 0;
+        }
+        _ => {
+            let field = form.field;
+            let mut cursor = form.cursor;
+            if let Some(text) = form.text_mut(field) {
+                let accepted = match key.code {
+                    KeyCode::Char(character) => match field {
+                        0 => !character.is_whitespace() && text.len() < 128,
+                        2 => character.is_ascii_alphabetic() && text.len() < 3,
+                        _ => (character.is_ascii_digit() || character == '.') && text.len() < 16,
+                    },
+                    _ => true,
+                };
+                if accepted {
+                    edit_text(text, &mut cursor, key);
+                }
+            }
+            form.cursor = cursor;
+        }
+    }
+    None
 }
 
 pub(super) fn visible_models(picker: &ModelPicker) -> Vec<&str> {

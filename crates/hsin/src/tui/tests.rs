@@ -65,13 +65,13 @@ fn a_held_key_keeps_deleting_instead_of_stalling_after_one_character() {
         kind: crossterm::event::KeyEventKind::Repeat,
         ..KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
     });
-    assert!(super::key_action(&repeat).is_some());
+    assert!(super::event_action(&repeat).is_some());
 
     let release = Event::Key(KeyEvent {
         kind: crossterm::event::KeyEventKind::Release,
         ..KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
     });
-    assert!(super::key_action(&release).is_none());
+    assert!(super::event_action(&release).is_none());
 }
 
 #[test]
@@ -88,13 +88,13 @@ fn shifted_text_reaches_the_form_on_press_and_repeat_but_not_release() {
                     modifiers,
                     kind,
                 ));
-                state.reduce(super::key_action(&event).expect("text input"));
+                state.reduce(super::event_action(&event).expect("text input"));
                 let release = Event::Key(KeyEvent::new_with_kind(
                     KeyCode::Char(character),
                     modifiers,
                     KeyEventKind::Release,
                 ));
-                assert!(super::key_action(&release).is_none());
+                assert!(super::event_action(&release).is_none());
             }
             assert!(matches!(
                 &state.input,
@@ -3981,6 +3981,7 @@ fn the_search_box_edits_at_the_caret() {
     assert_eq!(query, "example");
 }
 
+#[allow(clippy::too_many_lines)]
 fn usage_report() -> UsageStatsReport {
     let tokens = UsageTokenSummary {
         input_tokens: 100,
@@ -4013,14 +4014,16 @@ fn usage_report() -> UsageStatsReport {
             provider_revision: 1,
             inferred: true,
             tokens: tokens.clone(),
+            cost: vec![usd(0.25)],
         }],
         models: vec![UsageModelBreakdown {
             model: "gpt-5".into(),
             tokens: tokens.clone(),
             daily: vec![UsageDailyBucket {
                 date: "2026-09-14".into(),
-                tokens,
+                tokens: tokens.clone(),
             }],
+            cost: vec![usd(0.25)],
         }],
         attribution: UsageAttributionCounts {
             exact: 1,
@@ -4037,6 +4040,90 @@ fn usage_report() -> UsageStatsReport {
         },
         collected_since: 1_788_800_000,
         last_synced_at: Some(1_791_300_000),
+        cost: vec![usd(0.25)],
+        unpriced_tokens: 0,
+        overview: hsin_core::UsageOverview {
+            favorite_model: Some("gpt-5".into()),
+            active_days: 1,
+            current_streak: 1,
+            longest_streak: 1,
+            most_active_day: Some(UsageDailyBucket {
+                date: "2026-09-14".into(),
+                tokens: tokens.clone(),
+            }),
+            peak_hour: Some(14),
+        },
+        calendar: (0..hsin_core::USAGE_CALENDAR_DAYS)
+            .rev()
+            .map(|offset| {
+                let date = chrono::Local::now().date_naive()
+                    - chrono::Duration::days(i64::try_from(offset).unwrap());
+                hsin_core::UsageCalendarDay {
+                    date: date.format("%Y-%m-%d").to_string(),
+                    total_tokens: if offset == 0 { 250 } else { 0 },
+                    request_count: u64::from(offset == 0),
+                    cost: if offset == 0 {
+                        vec![usd(0.25)]
+                    } else {
+                        Vec::new()
+                    },
+                }
+            })
+            .collect(),
+        hourly: (0..24)
+            .map(|hour| {
+                if hour == 14 {
+                    tokens.clone()
+                } else {
+                    UsageTokenSummary::default()
+                }
+            })
+            .collect(),
+        quota: vec![hsin_core::UsageQuotaEstimate {
+            plan_key: "1a2b3c4d|openai|pro".into(),
+            account: Some("1a2b3c4d".into()),
+            source: Some("openai".into()),
+            current: true,
+            limit_id: "codex".into(),
+            window: "primary".into(),
+            window_minutes: 10_080,
+            plan_type: Some("pro".into()),
+            used_percent: 4.0,
+            resets_at: 1_791_335_429,
+            observed_at: 1_791_300_000,
+            basis_percent: 4.0,
+            basis_cycles: 1,
+            capacity: Some(hsin_core::UsageQuotaCapacity {
+                tokens: 2_000_000_000,
+                tokens_low: 1_600_000_000,
+                tokens_high: Some(2_600_000_000),
+                cost: vec![usd(1_250.0)],
+            }),
+            remaining: Some(hsin_core::UsageProjection {
+                tokens: 1_920_000_000,
+                cost: vec![usd(1_200.0)],
+            }),
+            monthly: Some(hsin_core::UsageProjection {
+                tokens: 8_571_428_571,
+                cost: vec![usd(5_357.0)],
+            }),
+            cycles: vec![hsin_core::UsageQuotaCycle {
+                resets_at: 1_791_335_429,
+                first_at: 1_790_730_000,
+                last_at: 1_791_300_000,
+                from_percent: 0.0,
+                to_percent: 4.0,
+                tokens: 80_000_000,
+                cost: vec![usd(50.0)],
+            }],
+        }],
+    }
+}
+
+fn usd(amount: f64) -> hsin_core::UsageCost {
+    hsin_core::UsageCost {
+        currency: "USD".into(),
+        amount,
     }
 }
 
@@ -4067,7 +4154,7 @@ fn stats_navigation_queries_filters_and_returns_home() {
 
 #[test]
 fn stats_render_wide_and_compact_without_losing_token_details() {
-    for (width, height) in [(100, 32), (48, 16)] {
+    for (width, height) in [(120, 44), (48, 16)] {
         let mut state = State {
             loading: false,
             input: InputMode::Stats(state::StatsScreen {
@@ -4079,6 +4166,13 @@ fn stats_render_wide_and_compact_without_losing_token_details() {
                 model: None,
                 filter: None,
                 scroll: 0,
+                scroll_max: 0,
+                chart_visible: false,
+                all_time: true,
+                day: None,
+                quota_filter: state::QuotaFilter::Recent,
+                day_detail: None,
+                pointer: None,
             }),
             ..State::default()
         };
@@ -4091,7 +4185,241 @@ fn stats_render_wide_and_compact_without_losing_token_details() {
         assert!(rendered.contains("Total"));
         assert!(rendered.contains("Hit"));
         assert!(rendered.contains("Output"));
+        if width >= 100 {
+            assert!(rendered.contains("$0.250"));
+            assert!(rendered.contains("Activity"));
+            assert!(rendered.contains("Favorite model"));
+            assert!(rendered.contains("All time"));
+        }
     }
+}
+
+#[test]
+fn hovering_a_model_chart_shows_the_three_token_kinds() {
+    let mut state = stats_state();
+    state.reduce(key(KeyCode::Char('2')));
+    let tooltip_rows = |rendered: &str| rendered.matches("Input (cache miss)").count();
+    for style in [
+        hsin_core::StatsChartStyle::Bar,
+        hsin_core::StatsChartStyle::Line,
+    ] {
+        state.stats_chart_style = style;
+        let locale = I18n::new(Some(LANGUAGE_EN_US));
+        let mut terminal = Terminal::new(TestBackend::new(120, 44)).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut state, &locale))
+            .expect("draw");
+        // The legend names each kind once.
+        assert_eq!(tooltip_rows(&terminal.backend().to_string()), 1);
+        // Any cell the series painted below the legend lies inside the chart.
+        let buffer = terminal.backend().buffer().clone();
+        let legend = (0..44)
+            .find(|&row| {
+                (0..120)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+                    .starts_with("■ Input (cache hit)")
+            })
+            .expect("legend row");
+        let (column, row) = (legend + 1..44)
+            .flat_map(|row| (0..120).map(move |column| (column, row)))
+            .find(|&(column, row)| {
+                let cell = &buffer[(column, row)];
+                cell.symbol() == "█"
+                    || (style == hsin_core::StatsChartStyle::Line
+                        && cell
+                            .symbol()
+                            .chars()
+                            .all(|c| ('\u{2801}'..='\u{28ff}').contains(&c)))
+            })
+            .expect("a painted chart cell");
+        state.reduce(Action::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }));
+        terminal
+            .draw(|frame| draw(frame, &mut state, &locale))
+            .expect("draw");
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("09-14"), "{style:?}: {rendered}");
+        assert_eq!(tooltip_rows(&rendered), 2, "{style:?}: {rendered}");
+        state.reduce(Action::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }));
+        terminal
+            .draw(|frame| draw(frame, &mut state, &locale))
+            .expect("draw");
+        assert_eq!(tooltip_rows(&terminal.backend().to_string()), 1);
+    }
+}
+
+fn stats_state() -> State {
+    let mut state = State {
+        providers: vec![example_provider()],
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Char('s')));
+    state.take_effect();
+    state.reduce(Action::UsageLoaded(usage_report()));
+    state
+}
+
+fn stats_screen(state: &State) -> &state::StatsScreen {
+    let InputMode::Stats(screen) = &state.input else {
+        panic!("stats screen is open");
+    };
+    screen
+}
+
+#[test]
+fn stats_open_on_all_time_and_d_cycles_like_the_range_chips() {
+    let mut state = State {
+        providers: vec![example_provider()],
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Char('s')));
+    assert!(matches!(state.take_effect(), Some(Effect::QueryUsage(ref query)) if query.from == 0));
+    for expected_days in [7, 30] {
+        state.reduce(key(KeyCode::Char('d')));
+        let Some(Effect::QueryUsage(query)) = state.take_effect() else {
+            panic!("d queries the next range");
+        };
+        assert_eq!((query.to - query.from + 3_600) / 86_400, expected_days);
+    }
+    state.reduce(key(KeyCode::Char('d')));
+    assert!(matches!(state.take_effect(), Some(Effect::QueryUsage(ref query)) if query.from == 0));
+}
+
+#[test]
+fn heatmap_days_and_range_chips_respond_to_the_mouse() {
+    let mut state = stats_state();
+    render(&mut state, 120, 44);
+    let today = chrono::Local::now().date_naive();
+    let cell = hit_area(&state, |hit| *hit == super::mouse::Hit::HeatDay(today));
+    state.reduce(Action::Mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column: cell.x,
+        row: cell.y,
+        modifiers: KeyModifiers::NONE,
+    }));
+    assert_eq!(stats_screen(&state).day, Some(today));
+    let rendered = render(&mut state, 120, 44);
+    assert!(rendered.contains(&today.format("%Y-%m-%d").to_string()));
+    assert!(rendered.contains("250 tokens"));
+    assert!(rendered.contains("Plan quota · pro · openai"));
+    assert!(rendered.contains("0→4%  ≈80.0m · ≈$50.00"));
+    assert!(rendered.contains("≈2.0b · ≈$1250"));
+    assert!(rendered.contains("(1.6b–2.6b)"));
+    assert!(rendered.contains("Per month"));
+
+    let week = hit_area(&state, |hit| *hit == super::mouse::Hit::StatsRange(1));
+    state.reduce(click_at(week));
+    assert!(matches!(state.take_effect(), Some(Effect::QueryUsage(ref query)) if query.from > 0));
+    assert!(!stats_screen(&state).all_time);
+}
+
+fn pricing_list() -> hsin_core::ModelPriceList {
+    let price = |id: &str, source| hsin_core::ModelPrice {
+        id: id.into(),
+        model_pattern: format!("{id}-model"),
+        provider_id: None,
+        currency: "USD".into(),
+        input: 1.0,
+        cache_write: None,
+        cache_read: Some(0.1),
+        output: 5.0,
+        source,
+        updated_at: 0,
+    };
+    hsin_core::ModelPriceList {
+        prices: vec![
+            price("builtin", hsin_core::ModelPriceSource::Builtin),
+            price("mine", hsin_core::ModelPriceSource::User),
+        ],
+        remote_fetched_at: None,
+    }
+}
+
+#[test]
+fn pricing_page_adds_overrides_and_deletes_only_custom_rules() {
+    let mut state = State {
+        providers: vec![example_provider()],
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Char('o')));
+    for _ in 0..4 {
+        state.reduce(key(KeyCode::Down));
+    }
+    state.reduce(key(KeyCode::Enter));
+    assert!(matches!(state.take_effect(), Some(Effect::LoadPrices)));
+    state.reduce(Action::PricesLoaded(pricing_list()));
+    assert!(!state.loading);
+    let rendered = render(&mut state, 110, 32);
+    assert!(rendered.contains("Model pricing"));
+    assert!(rendered.contains("builtin-model"));
+
+    state.reduce(key(KeyCode::Char('d')));
+    assert_eq!(state.notice.as_deref(), Some("@pricing_user_only"));
+    state.reduce(key(KeyCode::Char('e')));
+    state.reduce(key(KeyCode::Enter));
+    let Some(Effect::SetPrice(input)) = state.take_effect() else {
+        panic!("editing a built-in rule saves an overriding custom rule");
+    };
+    assert_eq!(input.id, None);
+    assert_eq!(input.model_pattern, "builtin-model");
+    assert_eq!(input.cache_read, Some(0.1));
+    assert_eq!(input.cache_write, None);
+    state.reduce(Action::PricesLoaded(pricing_list()));
+
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Char('d')));
+    assert!(state.take_effect().is_none());
+    state.reduce(key(KeyCode::Char('d')));
+    assert!(matches!(state.take_effect(), Some(Effect::RemovePrice(ref id)) if id == "mine"));
+    state.reduce(Action::PricesLoaded(pricing_list()));
+
+    state.reduce(key(KeyCode::Char('a')));
+    for character in "local-*".chars() {
+        state.reduce(key(KeyCode::Char(character)));
+    }
+    state.reduce(key(KeyCode::Enter));
+    assert_eq!(state.notice.as_deref(), Some("@pricing_invalid"));
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Right));
+    state.reduce(key(KeyCode::Down));
+    state.reduce(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    for character in "cny".chars() {
+        state.reduce(key(KeyCode::Char(character)));
+    }
+    state.reduce(key(KeyCode::Down));
+    for character in "2.5".chars() {
+        state.reduce(key(KeyCode::Char(character)));
+    }
+    for _ in 0..3 {
+        state.reduce(key(KeyCode::Down));
+    }
+    state.reduce(key(KeyCode::Char('8')));
+    state.reduce(key(KeyCode::Enter));
+    let Some(Effect::SetPrice(input)) = state.take_effect() else {
+        panic!("a complete rule is saved");
+    };
+    assert_eq!(input.model_pattern, "local-*");
+    assert_eq!(input.provider_id.as_deref(), Some("provider-1"));
+    assert_eq!(input.currency, "CNY");
+    assert!((input.input - 2.5).abs() < f64::EPSILON);
+    assert!((input.output - 8.0).abs() < f64::EPSILON);
+    state.reduce(Action::PricesLoaded(pricing_list()));
+
+    state.reduce(key(KeyCode::Char('u')));
+    assert!(matches!(state.take_effect(), Some(Effect::RefreshPrices)));
 }
 
 #[test]
@@ -4105,4 +4433,449 @@ fn image_stats_are_rejected_with_a_localized_notice() {
     assert!(matches!(state.input, InputMode::Normal));
     assert_eq!(state.notice.as_deref(), Some("@stats_image_unsupported"));
     assert!(state.take_effect().is_none());
+}
+
+fn click_at(area: Rect) -> Action {
+    Action::Mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: area.x,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
+fn mouse(kind: crossterm::event::MouseEventKind) -> crossterm::event::MouseEvent {
+    crossterm::event::MouseEvent {
+        kind,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+fn two_provider_state() -> State {
+    let mut state = State {
+        loading: false,
+        ..State::default()
+    };
+    state.providers.push(example_provider());
+    state.providers.push(Provider {
+        id: "provider-2".into(),
+        name: "Second".into(),
+        ..example_provider()
+    });
+    state
+}
+
+fn hit_area(state: &State, predicate: impl Fn(&super::mouse::Hit) -> bool) -> Rect {
+    state.hits.find(predicate).expect("clickable region")
+}
+
+#[test]
+fn mouse_events_reach_the_reducer_only_for_clicks_and_the_wheel() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::ScrollUp,
+        MouseEventKind::ScrollDown,
+        MouseEventKind::Moved,
+    ] {
+        assert!(super::event_action(&Event::Mouse(mouse(kind))).is_some());
+    }
+    for kind in [
+        MouseEventKind::Up(MouseButton::Left),
+        MouseEventKind::Down(MouseButton::Right),
+        MouseEventKind::Drag(MouseButton::Left),
+    ] {
+        assert!(super::event_action(&Event::Mouse(mouse(kind))).is_none());
+    }
+}
+
+#[test]
+fn footer_hints_name_the_keys_they_press() {
+    use super::mouse::{hint_key, plain};
+
+    assert_eq!(hint_key("enter"), Some(plain(KeyCode::Enter)));
+    assert_eq!(hint_key("esc"), Some(plain(KeyCode::Esc)));
+    assert_eq!(hint_key("s/esc"), Some(plain(KeyCode::Char('s'))));
+    assert_eq!(hint_key("/"), Some(plain(KeyCode::Char('/'))));
+    assert_eq!(hint_key("→"), Some(plain(KeyCode::Right)));
+    assert_eq!(
+        hint_key("ctrl+u"),
+        Some(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+    );
+    assert_eq!(hint_key("↑/↓"), None);
+    assert_eq!(hint_key("type"), None);
+}
+
+#[test]
+fn clicking_a_provider_selects_it_and_a_second_click_switches() {
+    let mut state = two_provider_state();
+    render(&mut state, 100, 30);
+    let second = hit_area(&state, |hit| {
+        matches!(hit, super::mouse::Hit::Row { index: 1, .. })
+    });
+    state.reduce(click_at(second));
+    assert_eq!(state.selected, 1);
+    assert!(state.take_effect().is_none());
+
+    render(&mut state, 100, 30);
+    state.reduce(click_at(second));
+    assert!(state.take_effect().is_some(), "second click activates");
+}
+
+#[test]
+fn wheel_moves_the_selection() {
+    let mut state = two_provider_state();
+    state.reduce(Action::Mouse(mouse(
+        crossterm::event::MouseEventKind::ScrollDown,
+    )));
+    assert_eq!(state.selected, 1);
+    state.reduce(Action::Mouse(mouse(
+        crossterm::event::MouseEventKind::ScrollUp,
+    )));
+    assert_eq!(state.selected, 0);
+}
+
+#[test]
+fn clicking_a_client_tab_switches_to_it() {
+    let mut state = two_provider_state();
+    render(&mut state, 100, 30);
+    let claude = hit_area(&state, |hit| {
+        *hit == super::mouse::Hit::Section(HomeSection::Client(ClientKind::Claude))
+    });
+    state.reduce(click_at(claude));
+    assert_eq!(state.client, ClientKind::Claude);
+    assert!(!state.image_section);
+}
+
+#[test]
+fn footer_hint_click_presses_its_key() {
+    let mut state = two_provider_state();
+    render(&mut state, 100, 30);
+    let settings = hit_area(&state, |hit| {
+        *hit == super::mouse::Hit::Key(super::mouse::plain(KeyCode::Char('o')))
+    });
+    state.reduce(click_at(settings));
+    assert!(matches!(state.input, InputMode::Settings(_)));
+}
+
+#[test]
+fn clicks_beside_an_open_dialog_do_not_reach_the_screen_underneath() {
+    let mut state = two_provider_state();
+    state.reduce(key(KeyCode::Char('a')));
+    render(&mut state, 100, 30);
+    state.reduce(click_at(Rect::new(0, 0, 1, 1)));
+    let row = Rect::new(2, 12, 1, 1);
+    state.reduce(click_at(row));
+    assert!(matches!(state.input, InputMode::Form(_)));
+    assert_eq!(state.selected, 0);
+}
+
+#[test]
+fn clicking_a_form_field_focuses_it_without_submitting() {
+    let mut state = two_provider_state();
+    state.reduce(key(KeyCode::Char('a')));
+    render(&mut state, 100, 40);
+    let field = hit_area(&state, |hit| {
+        matches!(hit, super::mouse::Hit::Row { index: 2, .. })
+    });
+    state.reduce(click_at(field));
+    render(&mut state, 100, 40);
+    state.reduce(click_at(field));
+    let InputMode::Form(form) = &state.input else {
+        panic!("form stays open");
+    };
+    assert_eq!(form.field, 2);
+    assert!(state.take_effect().is_none());
+}
+
+#[test]
+fn old_plans_hide_by_default_and_the_plan_filter_brings_them_back() {
+    let mut state = stats_state();
+    let InputMode::Stats(screen) = &mut state.input else {
+        panic!("stats screen is open");
+    };
+    let report = screen.report.as_mut().expect("report");
+    let mut old = report.quota[0].clone();
+    old.plan_key = "1a2b3c4d|openai|prolite".into();
+    old.plan_type = Some("prolite".into());
+    old.current = false;
+    old.observed_at = chrono::Utc::now().timestamp() - 60 * 86_400;
+    report.quota.push(old);
+
+    let rendered = render(&mut state, 120, 60);
+    assert!(rendered.contains("Plan quota · pro · openai"));
+    assert!(!rendered.contains("prolite"));
+    assert!(rendered.contains("1 window(s) of plans idle for over 30 days are hidden"));
+
+    state.reduce(key(KeyCode::Char('q')));
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Enter));
+    assert_eq!(stats_screen(&state).quota_filter, state::QuotaFilter::All);
+    let rendered = render(&mut state, 120, 60);
+    assert!(rendered.contains("Plan quota · prolite"));
+    assert!(
+        state.take_effect().is_none(),
+        "filtering plans needs no new query"
+    );
+
+    state.reduce(key(KeyCode::Char('q')));
+    for _ in 0..2 {
+        state.reduce(key(KeyCode::Down));
+    }
+    state.reduce(key(KeyCode::Enter));
+    assert_eq!(
+        stats_screen(&state).quota_filter,
+        state::QuotaFilter::Plan("1a2b3c4d|openai|prolite".into())
+    );
+    let rendered = render(&mut state, 120, 60);
+    assert!(rendered.contains("Plan quota · prolite"));
+    assert!(!rendered.contains("Plan quota · pro ·"));
+}
+
+#[test]
+fn clicking_a_heatmap_day_opens_its_details_and_can_filter_to_it() {
+    let mut state = stats_state();
+    render(&mut state, 120, 44);
+    let today = chrono::Local::now().date_naive();
+    let cell = hit_area(&state, |hit| *hit == super::mouse::Hit::HeatDay(today));
+    state.reduce(click_at(cell));
+    let Some(Effect::QueryUsageDay(query)) = state.take_effect() else {
+        panic!("clicking a day asks for that day");
+    };
+    assert_eq!((query.to - query.from + 3_600) / 86_400, 1);
+    assert!(stats_screen(&state).day_detail.is_some());
+    assert!(render(&mut state, 120, 44).contains("Loading"));
+
+    let mut report = usage_report();
+    report.query = query;
+    state.reduce(Action::DayUsageLoaded(report));
+    let rendered = render(&mut state, 120, 44);
+    assert!(rendered.contains(&format!("{} usage", today.format("%Y-%m-%d"))));
+    assert!(rendered.contains("By hour"));
+    assert!(rendered.contains("Peak hour 14:00"));
+    assert!(rendered.contains("By model"));
+    assert!(rendered.contains("gpt-5  250 · ≈$0.250"));
+    assert!(rendered.contains("show only this day"));
+
+    // A click beside the popup does not reach the heatmap underneath.
+    state.reduce(click_at(cell));
+    assert!(state.take_effect().is_none());
+
+    state.reduce(key(KeyCode::Enter));
+    let Some(Effect::QueryUsage(query)) = state.take_effect() else {
+        panic!("enter narrows the screen to the day");
+    };
+    assert_eq!((query.to - query.from + 3_600) / 86_400, 1);
+    let screen = stats_screen(&state);
+    assert!(screen.day_detail.is_none());
+    assert!(!screen.all_time);
+    assert_eq!(screen.from, today.format("%Y-%m-%d").to_string());
+
+    let cell = {
+        render(&mut state, 120, 44);
+        hit_area(&state, |hit| *hit == super::mouse::Hit::HeatDay(today))
+    };
+    state.reduce(click_at(cell));
+    state.take_effect();
+    state.reduce(key(KeyCode::Esc));
+    assert!(stats_screen(&state).day_detail.is_none());
+    assert!(
+        matches!(state.input, InputMode::Stats(_)),
+        "esc closes only the popup"
+    );
+}
+
+#[test]
+fn chart_style_toggles_saves_and_follows_the_daemon() {
+    let mut state = stats_state();
+    state.reduce(key(KeyCode::Char('2')));
+    let bars = render(&mut state, 120, 44);
+    assert!(bars.contains("Input (cache hit)"));
+    assert!(bars.contains("Input (cache miss)"));
+    assert!(!bars.contains("log"));
+
+    state.reduce(key(KeyCode::Char('v')));
+    assert_eq!(state.stats_chart_style, hsin_core::StatsChartStyle::Line);
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::SetStatsChartStyle(hsin_core::StatsChartStyle::Line))
+    ));
+    let lines = render(&mut state, 120, 44);
+    assert!(lines.contains("log"));
+    assert!(lines.contains("Output"));
+
+    // The saved style comes back with the settings, whatever the screen last showed.
+    state.reduce(Action::Loaded {
+        providers: vec![example_provider()],
+        status: crate::rpc::StatusSnapshot::default(),
+        settings: Settings {
+            stats_chart_style: hsin_core::StatsChartStyle::Bar,
+            ..Settings::default()
+        },
+    });
+    assert_eq!(state.stats_chart_style, hsin_core::StatsChartStyle::Bar);
+}
+
+#[test]
+fn stats_scroll_the_heatmap_and_stop_at_the_last_content_row() {
+    let mut state = stats_state();
+    let first = render(&mut state, 120, 26);
+    assert!(first.contains("Activity"), "{first}");
+    state.reduce(key(KeyCode::Down));
+    let scrolled = render(&mut state, 120, 26);
+    assert!(!scrolled.contains("Activity"), "the heatmap scrolls too");
+    for _ in 0..100 {
+        state.reduce(key(KeyCode::Down));
+        render(&mut state, 120, 26);
+    }
+    let last = render(&mut state, 120, 26);
+    assert!(last.contains("~Example"), "{last}");
+    state.reduce(key(KeyCode::Down));
+    assert_eq!(render(&mut state, 120, 26), last);
+}
+
+#[test]
+fn v_is_only_advertised_and_active_when_model_charts_are_visible() {
+    let mut state = stats_state();
+    let overview = render(&mut state, 120, 26);
+    assert!(!overview.contains("v chart"));
+    state.reduce(key(KeyCode::Char('v')));
+    assert_eq!(stats_screen(&state).page, state::StatsPage::Overview);
+    assert_eq!(state.stats_chart_style, hsin_core::StatsChartStyle::Bar);
+    assert!(state.take_effect().is_none());
+    state.reduce(key(KeyCode::Char('2')));
+    assert_eq!(stats_screen(&state).page, state::StatsPage::Models);
+    let charts = render(&mut state, 120, 26);
+    assert!(charts.contains("Input (cache hit)"), "{charts}");
+    assert!(charts.contains("09-14"), "{charts}");
+    assert!(charts.contains("v chart style"));
+}
+
+#[test]
+fn v_switches_the_chart_in_a_day_popup() {
+    let mut state = stats_state();
+    render(&mut state, 120, 44);
+    let today = chrono::Local::now().date_naive();
+    let cell = hit_area(&state, |hit| *hit == super::mouse::Hit::HeatDay(today));
+    state.reduce(click_at(cell));
+    let Some(Effect::QueryUsageDay(query)) = state.take_effect() else {
+        panic!("day query");
+    };
+    let mut report = usage_report();
+    report.query = query;
+    state.reduce(Action::DayUsageLoaded(report));
+    assert!(render(&mut state, 120, 44).contains("v chart style"));
+    state.reduce(key(KeyCode::Char('v')));
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::SetStatsChartStyle(hsin_core::StatsChartStyle::Line))
+    ));
+    assert!(render(&mut state, 120, 44).contains("log"));
+}
+
+#[test]
+fn scrolled_heatmap_clicks_keep_their_date_and_resize_clamps_the_offset() {
+    let mut state = stats_state();
+    render(&mut state, 120, 26);
+    let today = chrono::Local::now().date_naive();
+    let original = hit_area(&state, |hit| *hit == super::mouse::Hit::HeatDay(today));
+    state.reduce(key(KeyCode::Down));
+    render(&mut state, 120, 26);
+    let scrolled = hit_area(&state, |hit| *hit == super::mouse::Hit::HeatDay(today));
+    assert_eq!(scrolled.y, original.y - 1);
+    state.reduce(click_at(scrolled));
+    assert_eq!(
+        stats_screen(&state).day_detail.as_ref().unwrap().date,
+        today
+    );
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::QueryUsageDay(_))
+    ));
+    state.reduce(key(KeyCode::Esc));
+    for _ in 0..100 {
+        state.reduce(key(KeyCode::Down));
+    }
+    render(&mut state, 120, 26);
+    assert!(stats_screen(&state).scroll > 0);
+    let enlarged = render(&mut state, 120, 60);
+    assert_eq!(stats_screen(&state).scroll, 0);
+    assert!(enlarged.contains("Activity"));
+    assert!(enlarged.contains("~Example"));
+}
+
+#[test]
+fn short_model_view_scrolls_all_charts_and_rejects_v_without_visible_charts() {
+    let mut state = stats_state();
+    let mut report = usage_report();
+    report.models = (0..4)
+        .map(|index| {
+            let mut model = report.models[0].clone();
+            model.model = format!("chart-model-{index}");
+            model
+        })
+        .collect();
+    state.reduce(Action::UsageLoaded(report));
+    state.reduce(key(KeyCode::Char('2')));
+    for model in 0..4 {
+        let mut visible = false;
+        for _ in 0..50 {
+            let rendered = render(&mut state, 120, 26);
+            if rendered.contains(&format!("chart-model-{model} ·")) {
+                visible = true;
+                break;
+            }
+            state.reduce(key(KeyCode::Down));
+        }
+        assert!(visible, "chart {model} is reachable by scrolling");
+    }
+    let last = render(&mut state, 120, 26);
+    for _ in 0..100 {
+        state.reduce(key(KeyCode::Down));
+    }
+    let bottom = render(&mut state, 120, 26);
+    assert!(bottom.contains("chart-model-3"));
+    assert_ne!(bottom, last);
+    let narrow = render(&mut state, 48, 16);
+    assert!(!narrow.contains("v chart"));
+    let style = state.stats_chart_style;
+    state.reduce(key(KeyCode::Char('v')));
+    assert_eq!(state.stats_chart_style, style);
+    assert!(state.take_effect().is_none());
+}
+
+#[test]
+fn hovering_a_scrolled_chart_uses_the_visible_point() {
+    let mut state = stats_state();
+    let mut report = usage_report();
+    report.models = vec![report.models[0].clone(); 4];
+    state.reduce(Action::UsageLoaded(report));
+    state.reduce(key(KeyCode::Char('2')));
+    render(&mut state, 120, 26);
+    for _ in 0..20 {
+        state.reduce(key(KeyCode::Down));
+    }
+    let locale = I18n::new(Some(LANGUAGE_EN_US));
+    let mut terminal = Terminal::new(TestBackend::new(120, 26)).expect("terminal");
+    terminal
+        .draw(|frame| draw(frame, &mut state, &locale))
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    let (column, row) = (11..23)
+        .flat_map(|row| (0..120).map(move |column| (column, row)))
+        .find(|&(column, row)| buffer[(column, row)].symbol() == "█")
+        .expect("a visible bar after scrolling");
+    state.reduce(Action::Mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    }));
+    let tooltip = render(&mut state, 120, 26);
+    assert!(tooltip.contains("Input (cache hit)"), "{tooltip}");
+    assert!(tooltip.contains("09-14"), "{tooltip}");
+    assert!(tooltip.contains("250"), "{tooltip}");
 }

@@ -8,7 +8,8 @@ use crossterm::{
 };
 use crossterm::{
     event::{
-        Event, EventStream, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyEventKind,
+        KeyboardEnhancementFlags, MouseButton, MouseEventKind, PopKeyboardEnhancementFlags,
         PushKeyboardEnhancementFlags,
     },
     execute,
@@ -21,6 +22,7 @@ use tokio::sync::mpsc;
 use crate::{i18n::I18n, rpc::DaemonClient};
 
 mod effects;
+mod mouse;
 mod screens;
 mod state;
 mod theme;
@@ -48,7 +50,7 @@ pub async fn run(client: DaemonClient, i18n: &mut I18n, follow_saved_language: b
             event = events.next() => {
                 match event {
                     Some(Ok(event)) => {
-                        if let Some(action) = key_action(&event) {
+                        if let Some(action) = event_action(&event) {
                             if matches!(reduce_action(&mut state, i18n, follow_saved_language, action), Transition::Quit) {
                                 break;
                             }
@@ -76,10 +78,24 @@ pub async fn run(client: DaemonClient, i18n: &mut I18n, follow_saved_language: b
 /// Held-down keys. `REPORT_EVENT_TYPES` makes terminals that speak the kitty keyboard protocol
 /// split auto-repeat out as its own kind, so ignoring it froze backspace and the arrow keys under
 /// a long press while letters — which still arrive as plain text presses — kept repeating.
-fn key_action(event: &Event) -> Option<Action> {
+///
+/// Only left clicks, the wheel and plain motion reach the reducer; motion previews heatmap days,
+/// while drags and releases would redraw the screen for nothing.
+fn event_action(event: &Event) -> Option<Action> {
     match event {
         Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
             Some(Action::Key(*key))
+        }
+        Event::Mouse(mouse)
+            if matches!(
+                mouse.kind,
+                MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::Moved
+            ) =>
+        {
+            Some(Action::Mouse(*mouse))
         }
         _ => None,
     }
@@ -102,7 +118,7 @@ fn reduce_action(
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let _ = execute!(
         stdout,
         PushKeyboardEnhancementFlags(
@@ -124,6 +140,7 @@ impl Drop for RestoreTerminal {
         let _ = execute!(
             io::stdout(),
             PopKeyboardEnhancementFlags,
+            DisableMouseCapture,
             LeaveAlternateScreen
         );
         #[cfg(windows)]

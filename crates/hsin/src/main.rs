@@ -5,6 +5,7 @@ mod i18n;
 mod rpc;
 mod tui;
 mod updater;
+mod usage_format;
 
 use std::process::ExitCode;
 

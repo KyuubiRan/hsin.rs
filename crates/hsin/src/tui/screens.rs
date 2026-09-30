@@ -6,10 +6,12 @@ use ratatui::{
 use crate::i18n::I18n;
 
 use super::{
+    mouse::HitMap,
     state::{InputMode, State},
     widgets::{draw_banner, draw_footer},
 };
 
+mod chart;
 mod header;
 mod home;
 mod image_picker;
@@ -35,6 +37,13 @@ use settings::draw_settings_screen;
 use stats::draw_stats;
 
 pub(super) fn draw(frame: &mut Frame<'_>, state: &mut State, i18n: &I18n) {
+    let mut hits = HitMap::default();
+    draw_frame(frame, state, i18n, &mut hits);
+    state.hits = hits;
+}
+
+#[allow(clippy::too_many_lines)]
+fn draw_frame(frame: &mut Frame<'_>, state: &mut State, i18n: &I18n, hits: &mut HitMap) {
     let area = frame.area();
     let header_height = if area.height >= 21 { 7 } else { 3 };
     let banner_height = u16::from(super::widgets::banner_text(state, i18n).is_some());
@@ -48,17 +57,25 @@ pub(super) fn draw(frame: &mut Frame<'_>, state: &mut State, i18n: &I18n) {
         ])
         .split(area);
 
-    draw_header(frame, rows[0], state, i18n);
+    draw_header(frame, rows[0], state, i18n, hits);
     draw_banner(frame, rows[1], state, i18n);
 
     if let InputMode::Settings(screen) = &state.input {
-        draw_settings_screen(frame, rows[2], state, screen, i18n);
-        draw_footer(frame, rows[3], state, i18n);
+        draw_settings_screen(frame, rows[2], state, screen, i18n, hits);
+        draw_footer(frame, rows[3], state, i18n, hits);
         return;
     }
-    if let InputMode::Stats(screen) = &state.input {
-        draw_stats(frame, rows[2], screen, state.loading, i18n);
-        draw_footer(frame, rows[3], state, i18n);
+    if let InputMode::Stats(screen) = &mut state.input {
+        draw_stats(
+            frame,
+            rows[2],
+            screen,
+            state.loading,
+            state.stats_chart_style,
+            i18n,
+            hits,
+        );
+        draw_footer(frame, rows[3], state, i18n, hits);
         return;
     }
 
@@ -83,8 +100,17 @@ pub(super) fn draw(frame: &mut Frame<'_>, state: &mut State, i18n: &I18n) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(content);
-    draw_provider_list(frame, columns[0], state, i18n);
+    draw_provider_list(frame, columns[0], state, i18n, hits);
     draw_details(frame, columns[1], state, i18n);
+
+    // Everything drawn so far sits under whichever dialog is open; the footer, drawn last, stays
+    // clickable because its hints are the dialog's own keys.
+    if !matches!(
+        state.input,
+        InputMode::Normal | InputMode::DeleteConfirm { .. }
+    ) {
+        hits.barrier(area);
+    }
 
     // Dialogs opened from the provider form centre over the same region it uses, so switching
     // between them does not shift the popup on screen.
@@ -95,14 +121,14 @@ pub(super) fn draw(frame: &mut Frame<'_>, state: &mut State, i18n: &I18n) {
         height: rows[3].y.saturating_sub(area.y),
     };
     if let InputMode::Form(form) = &state.input {
-        draw_form(frame, overlay, form, i18n);
-        draw_footer(frame, rows[3], state, i18n);
+        draw_form(frame, overlay, form, i18n, hits);
+        draw_footer(frame, rows[3], state, i18n, hits);
         return;
     }
     if let InputMode::ContextPicker(picker) = &state.input {
-        draw_form(frame, overlay, &picker.form, i18n);
-        draw_context_picker(frame, overlay, picker, &state.client_settings, i18n);
-        draw_footer(frame, rows[3], state, i18n);
+        draw_form(frame, overlay, &picker.form, i18n, &mut HitMap::default());
+        draw_context_picker(frame, overlay, picker, &state.client_settings, i18n, hits);
+        draw_footer(frame, rows[3], state, i18n, hits);
         return;
     }
 
@@ -112,22 +138,30 @@ pub(super) fn draw(frame: &mut Frame<'_>, state: &mut State, i18n: &I18n) {
         InputMode::Search { .. } | InputMode::Normal | InputMode::DeleteConfirm { .. } => {}
         InputMode::Form(_) => unreachable!("provider form is drawn over the footer"),
         InputMode::ContextPicker(_) => unreachable!("context picker is drawn over the form"),
-        InputMode::Models(picker) => draw_models(frame, rows[2], picker, i18n),
-        InputMode::ImageModels(picker) => draw_image_models(frame, rows[2], picker, i18n),
+        InputMode::Models(picker) => draw_models(frame, rows[2], picker, i18n, hits),
+        InputMode::ImageModels(picker) => draw_image_models(frame, rows[2], picker, i18n, hits),
         InputMode::ImageSource { selected } => {
-            draw_image_source(frame, rows[2], *selected, i18n);
+            draw_image_source(frame, rows[2], *selected, i18n, hits);
         }
         InputMode::ImageImport { selected } => {
-            draw_image_import(frame, rows[2], state, *selected, i18n);
+            draw_image_import(frame, rows[2], state, *selected, i18n, hits);
         }
-        InputMode::ModelMapping(mapping) => draw_model_mapping(frame, overlay, mapping, i18n),
+        InputMode::ModelMapping(mapping) => {
+            draw_model_mapping(frame, overlay, mapping, i18n, hits);
+        }
         InputMode::MappingModels(picker) => {
-            draw_model_mapping(frame, overlay, &picker.mapping, i18n);
-            draw_mapping_models(frame, overlay, picker, i18n);
+            draw_model_mapping(
+                frame,
+                overlay,
+                &picker.mapping,
+                i18n,
+                &mut HitMap::default(),
+            );
+            draw_mapping_models(frame, overlay, picker, i18n, hits);
         }
         InputMode::Settings(_) => unreachable!("settings screen is drawn before the home page"),
         InputMode::Stats(_) => unreachable!("stats screen is drawn before the home page"),
     }
 
-    draw_footer(frame, rows[3], state, i18n);
+    draw_footer(frame, rows[3], state, i18n, hits);
 }

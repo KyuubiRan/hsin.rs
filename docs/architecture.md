@@ -42,3 +42,42 @@ Collection begins when a schema-9 daemon first starts, with existing complete
 lines marked as read. File cursors contain only a normalized-path hash, byte
 offset, modification metadata, and a tail fingerprint. Events older than the
 local-calendar 90-day boundary are removed.
+
+Every insert marks the local days it touches in `usage_rollup_dirty`, in the
+same transaction. Before a sync finishes or a query runs, those days are rebuilt
+into `usage_hourly` (per day, hour, Provider revision, and model). Rollups
+outlive the raw events, so reports read only from them: an all-time query
+(`from` = 0) starts at the first recorded day, and a report also carries a
+371-day activity calendar, streaks, and the peak hour.
+
+Codex `token_count` records also carry the plan's quota windows (`used_percent`,
+window length, reset time, plan type). Each is stored in `usage_quota_readings`
+with the tokens of the same record, for 35 days. Readings naming the same reset
+time form one cycle; concurrent sessions interleave slightly stale percentages,
+so a cycle's movement is the rise of its running peak over its first reading,
+and only usage up to the last rise counts. A window's allowance is
+Σ tokens × 100 / Σ movement over the recent cycles, and each cycle adds one
+point of uncertainty to the reported range. Readings also record the session's
+provider (`session_meta.model_provider`) and a hash of its account, and each
+account, provider, plan and window is estimated on its own: a user can move
+between plans and accounts, and relay sessions carry no quota readings at all.
+Windows missing from the newest readings are reported as no longer in use.
+
+Claude Code caches its plan usage (weekly window, reset time, and Claude
+Code's share of it) in its global config; its five-hour window resets too often
+to estimate from and is not read. Every
+refresh is a reading, credited with the official-login Claude requests since
+the previous reading of the same window; relay requests are left out, and the
+weekly movement is scaled by Claude Code's share because chat and other apps
+draw on the same allowance. Quota readings are kept 90 days; the overview shows
+plans active in the last 30 days unless another plan filter is chosen. Session cursors keep the Codex parser state (current
+model and cumulative counters) so a sync that resumes mid-file still knows the
+model; a one-time background pass relabels events an earlier version filed
+under `unknown`.
+
+Costs are estimates from `model_prices` plus a built-in table: a
+Provider-scoped rule beats a general one, a user rule beats a fetched one which
+beats a built-in one, and an exact model beats the longest matching prefix.
+Model names are compared lowercase without a `vendor/` prefix, a `[1m]` suffix,
+or a release date. Each currency is summed on its own; tokens no rule matches
+are reported as unpriced.

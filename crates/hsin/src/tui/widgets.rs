@@ -10,6 +10,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::i18n::I18n;
 
 use super::{
+    mouse::{HitMap, hint_key},
     state::{
         InputMode, ModelPickerMode, SettingsPage, State, form_context_compact_field,
         form_context_max_field,
@@ -168,12 +169,24 @@ fn footer_help(state: &State, i18n: &I18n) -> String {
             SettingsPage::Language { .. } | SettingsPage::Clients { .. } => {
                 i18n.text("settings_submenu_help")
             }
+            SettingsPage::Pricing {
+                editor: Some(_), ..
+            } => i18n.text("pricing_editor_help"),
+            SettingsPage::Pricing { .. } => i18n.text("pricing_help"),
         },
-        InputMode::Stats(screen) => i18n.text(if screen.filter.is_some() {
-            "stats_filter_help"
-        } else {
-            "stats_help"
-        }),
+        InputMode::Stats(screen) => {
+            i18n.text(if screen.day_detail.is_some() && screen.chart_visible {
+                "stats_day_detail_help"
+            } else if screen.day_detail.is_some() {
+                "stats_day_detail_no_chart_help"
+            } else if screen.filter.is_some() {
+                "stats_filter_help"
+            } else if !screen.chart_visible {
+                "stats_overview_help"
+            } else {
+                "stats_help"
+            })
+        }
     };
     // With a committed filter, esc clears it instead of quitting; advertise that.
     if matches!(state.input, InputMode::Normal) && !state.search.is_empty() {
@@ -182,7 +195,13 @@ fn footer_help(state: &State, i18n: &I18n) -> String {
     help.to_owned()
 }
 
-pub(super) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &State, i18n: &I18n) {
+pub(super) fn draw_footer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &State,
+    i18n: &I18n,
+    hits: &mut HitMap,
+) {
     let help = footer_help(state, i18n);
     let transient = match &state.input {
         InputMode::Form(form) => form.error.map(|error| i18n.text(error).to_owned()),
@@ -210,26 +229,76 @@ pub(super) fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
                 .to_owned()
         })
     });
-    let (line, color) = match transient {
-        Some(notice) => (notice, RED),
-        // The armed delete prompt is the one help line that is about to do something destructive,
-        // and it replaced a red dialog, so it keeps the warning colour rather than fading out.
-        None => (
-            help,
-            if matches!(state.input, InputMode::DeleteConfirm { .. }) {
-                RED
-            } else {
-                MUTED
-            },
-        ),
+    if let Some(notice) = transient {
+        frame.render_widget(
+            Paragraph::new(notice)
+                .style(Style::default().fg(RED))
+                .wrap(Wrap { trim: true })
+                .block(Block::default().borders(Borders::TOP)),
+            area,
+        );
+        return;
+    }
+    // The armed delete prompt is the one help line that is about to do something destructive,
+    // and it replaced a red dialog, so it keeps the warning colour rather than fading out.
+    let color = if matches!(state.input, InputMode::DeleteConfirm { .. }) {
+        RED
+    } else {
+        MUTED
     };
+    let block = Block::default().borders(Borders::TOP);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let lines = footer_lines(&help, inner, hits);
     frame.render_widget(
-        Paragraph::new(line)
-            .style(Style::default().fg(color))
-            .wrap(Wrap { trim: true })
-            .block(Block::default().borders(Borders::TOP)),
-        area,
+        Paragraph::new(lines).style(Style::default().fg(color)),
+        inner,
     );
+}
+
+/// Lays the ` · `-separated hints out whole, wrapping between hints rather than inside one, and
+/// registers each hint that names a key so clicking it presses that key.
+fn footer_lines(help: &str, area: Rect, hits: &mut HitMap) -> Vec<Line<'static>> {
+    const SEPARATOR: &str = " · ";
+    let width = usize::from(area.width);
+    let separator_width = display_width(SEPARATOR);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut used = 0_usize;
+    for hint in help.split(SEPARATOR) {
+        let hint_width = display_width(hint);
+        if used > 0 && used + separator_width + hint_width > width {
+            lines.push(Line::from(std::mem::take(&mut line)));
+            used = 0;
+        }
+        if used > 0 {
+            line.push_str(SEPARATOR);
+            used += separator_width;
+        }
+        let row = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        if row < area.height
+            && let Some(key) = hint.split_whitespace().next().and_then(hint_key)
+        {
+            let x = u16::try_from(used).unwrap_or(u16::MAX);
+            hits.key(
+                Rect {
+                    x: area.x.saturating_add(x),
+                    y: area.y.saturating_add(row),
+                    width: u16::try_from(hint_width)
+                        .unwrap_or(u16::MAX)
+                        .min(area.width.saturating_sub(x)),
+                    height: 1,
+                },
+                key,
+            );
+        }
+        line.push_str(hint);
+        used += hint_width;
+    }
+    if !line.is_empty() {
+        lines.push(Line::from(line));
+    }
+    lines
 }
 
 pub(super) fn display_width(value: &str) -> usize {

@@ -15,7 +15,8 @@ use hsin_core::{
     ClientKind, ClientSettings, CodexConfigNameUpdate, CodexImageConfigUpdate,
     CodexImageListParams, CodexImageSwitchParams, ConnectionMode, DaemonStatus, DoctorFinding,
     DoctorReport, DoctorSeverity, ErrorCode, ImportCurrentParams, ImportCurrentResult,
-    KeyStoreState, ModelDiscoverParams, ModelDiscovery, ModelUpdate, Provider, ProviderAddParams,
+    KeyStoreState, ModelDiscoverParams, ModelDiscovery, ModelPrice, ModelPriceInput,
+    ModelPriceList, ModelUpdate, PricingRefreshResult, Provider, ProviderAddParams,
     ProviderEditParams, ProviderListParams, ProviderProxyConfig, ProviderProxyMode,
     ProviderRemoveParams, ProviderScope, ProviderSwitchParams, SecretInput, SecurityStatus,
     Settings, SettingsPatch, UpstreamProxyConfig, UpstreamProxyMode, UsageStatsQuery,
@@ -42,6 +43,7 @@ use crate::{
 const CODEX_AUTH_BACKUP_KEY: &str = "codex_auth_backup_v1";
 const CLAUDE_MODEL_ENV_BEFORE_KEY: &str = "claude_model_env_before";
 const CLAUDE_MODEL_NAMES_ENABLED_KEY: &str = "claude_model_names_enabled";
+const STATS_CHART_STYLE_KEY: &str = "stats_chart_style";
 const UPSTREAM_PROXY_KEY: &str = "upstream_proxy";
 const UPSTREAM_PROXY_PASSWORD_KEY: &str = "upstream_proxy_password";
 /// Records that the operator holds a copy of the current master key. Losing the
@@ -219,6 +221,38 @@ impl App {
         })
         .await
         .map_err(|error| DaemonError::Internal(error.to_string()))?
+    }
+
+    pub fn list_prices(&self) -> Result<ModelPriceList> {
+        crate::pricing::list(&self.db)
+    }
+
+    pub async fn set_price(&self, input: ModelPriceInput) -> Result<ModelPrice> {
+        let _guard = self.mutation.lock().await;
+        crate::pricing::set_user_price(&self.db, &input, chrono::Utc::now().timestamp())
+    }
+
+    pub async fn remove_price(&self, id: &str) -> Result<()> {
+        let _guard = self.mutation.lock().await;
+        crate::pricing::remove_user_price(&self.db, id)
+    }
+
+    /// Fetches the public price list through the global upstream proxy. Only ever runs when the
+    /// user asks for it.
+    pub async fn refresh_prices(&self) -> Result<PricingRefreshResult> {
+        let proxy = self.upstream_outbound_proxy()?;
+        let _guard = self.mutation.lock().await;
+        crate::pricing::refresh(&self.db, &proxy, chrono::Utc::now().timestamp()).await
+    }
+
+    fn upstream_outbound_proxy(&self) -> Result<OutboundProxySnapshot> {
+        let config = self.upstream_proxy_config()?;
+        let password = if config.manual.password_configured {
+            self.protected_secret(UPSTREAM_PROXY_PASSWORD_KEY)?
+        } else {
+            None
+        };
+        Ok(OutboundProxySnapshot { config, password })
     }
 
     fn record_usage_route(&self, client: ClientKind) {
@@ -826,15 +860,7 @@ impl App {
         password: SecretInput,
     ) -> Result<OutboundProxySnapshot> {
         match config.mode {
-            ProviderProxyMode::Inherit => {
-                let config = self.upstream_proxy_config()?;
-                let password = if config.manual.password_configured {
-                    self.protected_secret(UPSTREAM_PROXY_PASSWORD_KEY)?
-                } else {
-                    None
-                };
-                Ok(OutboundProxySnapshot { config, password })
-            }
+            ProviderProxyMode::Inherit => self.upstream_outbound_proxy(),
             ProviderProxyMode::Direct => Ok(OutboundProxySnapshot::direct()),
             ProviderProxyMode::System => Ok(OutboundProxySnapshot {
                 config: UpstreamProxyConfig {
@@ -1832,6 +1858,10 @@ impl App {
             client_auth: self.client_auth_settings()?,
             claude_model_names_enabled: self.claude_model_names_enabled()?,
             upstream_proxy: self.upstream_proxy_config()?,
+            stats_chart_style: match self.db.setting(STATS_CHART_STYLE_KEY)?.as_deref() {
+                Some("line") => hsin_core::StatsChartStyle::Line,
+                _ => hsin_core::StatsChartStyle::Bar,
+            },
         })
     }
 
@@ -2043,6 +2073,7 @@ impl App {
             codex_preserve_official_auth,
             claude_model_names_enabled,
             upstream_proxy,
+            stats_chart_style,
         } = patch;
         if clients.as_ref().is_some_and(|clients| !clients.is_valid()) {
             return Err(DaemonError::Invalid(
@@ -2078,6 +2109,9 @@ impl App {
         }
         if let Some(update) = upstream_proxy {
             self.update_upstream_proxy_setting(update)?;
+        }
+        if let Some(style) = stats_chart_style {
+            self.db.set_setting(STATS_CHART_STYLE_KEY, style.as_str())?;
         }
         if proxy_enabled == Some(false) {
             self.disable_all_client_proxies_locked()?;
@@ -3231,6 +3265,7 @@ mod tests {
                 client_auth: None,
                 codex_preserve_official_auth: None,
                 claude_model_names_enabled: None,
+                stats_chart_style: None,
                 upstream_proxy: None,
             })
             .await
@@ -3252,12 +3287,32 @@ mod tests {
                 client_auth: None,
                 codex_preserve_official_auth: None,
                 claude_model_names_enabled: None,
+                stats_chart_style: None,
                 upstream_proxy: None,
             })
             .await;
         assert!(matches!(invalid, Err(DaemonError::Invalid(_))));
         assert_eq!(app.settings().unwrap().clients, clients);
+
+        assert_eq!(
+            app.settings().unwrap().stats_chart_style,
+            hsin_core::StatsChartStyle::Bar,
+            "bars are the default"
+        );
+        app.update_settings(SettingsPatch {
+            stats_chart_style: Some(hsin_core::StatsChartStyle::Line),
+            ..SettingsPatch::default()
+        })
+        .await
+        .unwrap();
         drop(app);
+        let reopened = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
+        assert_eq!(
+            reopened.settings().unwrap().stats_chart_style,
+            hsin_core::StatsChartStyle::Line,
+            "the chart style survives a restart"
+        );
+        drop(reopened);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3346,6 +3401,7 @@ mod tests {
                 }),
                 codex_preserve_official_auth: None,
                 claude_model_names_enabled: None,
+                stats_chart_style: None,
                 upstream_proxy: None,
             })
             .await
@@ -3389,6 +3445,7 @@ mod tests {
                 }),
                 codex_preserve_official_auth: None,
                 claude_model_names_enabled: None,
+                stats_chart_style: None,
                 upstream_proxy: None,
             })
             .await
@@ -3422,6 +3479,7 @@ mod tests {
                 client_auth: None,
                 codex_preserve_official_auth: Some(true),
                 claude_model_names_enabled: None,
+                stats_chart_style: None,
                 upstream_proxy: None,
             })
             .await
@@ -3487,6 +3545,7 @@ mod tests {
                 }),
                 codex_preserve_official_auth: None,
                 claude_model_names_enabled: None,
+                stats_chart_style: None,
                 upstream_proxy: None,
             })
             .await
@@ -4635,6 +4694,7 @@ mod tests {
                 client_auth: None,
                 codex_preserve_official_auth: None,
                 claude_model_names_enabled: None,
+                stats_chart_style: None,
                 upstream_proxy: None,
             })
             .await
@@ -4702,6 +4762,7 @@ mod tests {
             }),
             codex_preserve_official_auth: None,
             claude_model_names_enabled: None,
+            stats_chart_style: None,
             upstream_proxy: None,
         })
         .await
@@ -4737,6 +4798,7 @@ mod tests {
                 client_auth: None,
                 codex_preserve_official_auth: None,
                 claude_model_names_enabled: None,
+                stats_chart_style: None,
                 upstream_proxy: None,
             })
             .await
@@ -4788,6 +4850,7 @@ mod tests {
             client_auth: None,
             codex_preserve_official_auth: None,
             claude_model_names_enabled: None,
+            stats_chart_style: None,
             upstream_proxy: None,
         })
         .await
@@ -4909,6 +4972,7 @@ mod tests {
                 client_auth: None,
                 codex_preserve_official_auth: None,
                 claude_model_names_enabled: Some(false),
+                stats_chart_style: None,
                 upstream_proxy: None,
             })
             .await
@@ -4940,6 +5004,7 @@ mod tests {
             client_auth: None,
             codex_preserve_official_auth: None,
             claude_model_names_enabled: Some(true),
+            stats_chart_style: None,
             upstream_proxy: None,
         })
         .await
@@ -4956,6 +5021,7 @@ mod tests {
             client_auth: None,
             codex_preserve_official_auth: None,
             claude_model_names_enabled: Some(false),
+            stats_chart_style: None,
             upstream_proxy: None,
         })
         .await

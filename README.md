@@ -118,14 +118,20 @@ installed release build.
 
 ## Usage
 
-Run `hsin` with no arguments for the terminal UI. Every action is also
-scriptable:
+Run `hsin` with no arguments for the terminal UI. The mouse works alongside the
+keyboard: click a client tab, a list row or a footer hint, click a selected row
+again to activate it, and scroll with the wheel. Hold Shift while dragging to
+select text in terminals that support it. Every action is also scriptable:
 
 ```bash
 hsin status                                   # daemon, proxy and client state
 hsin stats codex                              # last 30 days of Codex token usage
+hsin stats codex --all                        # everything recorded, with plan quotas
 hsin stats claude --from 2026-09-01 --to 2026-09-14
 hsin stats codex --provider <id> --model gpt-5 --json
+hsin pricing list                             # price rules used for cost estimates
+hsin pricing set 'local-*' --input 2 --output 8 --currency CNY
+hsin pricing refresh                          # fetch the public LiteLLM price list
 hsin doctor                                   # configuration, security and service checks
 hsin update                                   # update to the latest release
 
@@ -184,9 +190,33 @@ Press `s` on a Codex or Claude Code TUI page to open token statistics. Hsin
 combines exact usage observed by its local proxy with usage metadata from new
 Codex and Claude Code session-log entries, so official-login and direct-mode
 requests are included too. Collection begins after the upgraded daemon first
-starts: old sessions are not backfilled, and normalized usage events are kept
-for 90 days. Provider attribution from local session logs is inferred from
+starts: old sessions are not backfilled. Request detail is kept for 90 days and
+hourly totals indefinitely, so the overview opens on all time: an activity
+heatmap of the last year (hover a day to preview it, click it for that day's
+details), streaks, the favorite model, the peak hour, and an estimated cost per
+currency. Press `d` to cycle all time, 7 and 30 days, or `t` for
+other ranges. The model and daily charts split cache-hit input, other input and
+output by shade, as stacked bars or, after `v`, as lines on a log scale; the
+choice is saved. Provider attribution from local session logs is inferred from
 Hsin's route history and is marked with `~`.
+
+For a Codex or Claude subscription, the overview also estimates the plan's
+allowance the way quota calculators do: Codex logs its quota meter with every
+request and Claude Code caches its meter in `~/.claude.json`, so the
+tokens spent while the meter moved, scaled to 100%, give the weekly allowance in
+tokens and in API list-price dollars, with the range the whole-percent meter
+leaves open, the remainder of the current window, and the equivalent per
+calendar month. Each account, session provider, plan and window is estimated
+separately, with its recent cycles listed, so switching between a relay and your
+own plan, or between plans, never mixes their allowances. Plans active in the
+last 30 days show by default; press `q` on the stats screen (or pass
+`--all-plans`) to see older ones or pick one plan. It is an estimate;
+OpenAI does not publish token limits.
+
+Costs use built-in list prices, the public LiteLLM price list when you fetch it
+(`u` on Settings → Model pricing, or `hsin pricing refresh`), and your own
+rules, which always win and can be limited to one provider. Amounts are
+estimates at today's prices and are never converted between currencies.
 
 Set `HSIN_HOME` to run isolated instances; each one keeps its own storage, IPC
 endpoint, keyring entries and service identity. `CODEX_HOME` and

@@ -9,6 +9,7 @@ use ratatui::{
 use crate::i18n::I18n;
 
 use super::super::{
+    mouse::{Hit, HitMap},
     state::{HomeSection, InputMode, State},
     theme::{INPUT_BG, MUTED, RED, WHITE},
     widgets::display_width,
@@ -30,7 +31,13 @@ const BANNER: [(&str, &str, &str); 6] = [
     ("╚═╝  ╚═╝", "╚══════╝", "╚═╝╚═╝  ╚═══╝"),
 ];
 
-pub(super) fn draw_header(frame: &mut Frame<'_>, area: Rect, state: &State, i18n: &I18n) {
+pub(super) fn draw_header(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &State,
+    i18n: &I18n,
+    hits: &mut HitMap,
+) {
     let block = Block::default()
         .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(RED));
@@ -48,7 +55,7 @@ pub(super) fn draw_header(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
             },
         );
         if !matches!(&state.input, InputMode::Settings(_)) {
-            draw_compact_client_switcher(frame, inner, state, i18n, title_width);
+            draw_compact_client_switcher(frame, inner, state, i18n, title_width, hits);
         }
         return;
     }
@@ -105,6 +112,37 @@ pub(super) fn draw_header(frame: &mut Frame<'_>, area: Rect, state: &State, i18n
         Paragraph::new(client_switcher_line(state, i18n)).alignment(Alignment::Right),
         controls,
     );
+    if client_switcher_width(state, i18n) <= controls.width {
+        register_sections(hits, controls.right(), controls.y, state, i18n);
+    }
+}
+
+/// Marks each tab of a right-aligned switcher ending at `right`, walking the same widths the
+/// line is built from.
+fn register_sections(hits: &mut HitMap, right: u16, y: u16, state: &State, i18n: &I18n) {
+    let mut x = right.saturating_sub(client_switcher_width(state, i18n));
+    for section in state.visible_sections() {
+        // The stats screen cycles clients only; the image tab has nothing to show there.
+        if matches!(state.input, InputMode::Stats(_)) && section == HomeSection::CodexImage {
+            x = x.saturating_add(section_width(section, i18n) + 1);
+            continue;
+        }
+        let width = section_width(section, i18n);
+        hits.push(
+            Rect {
+                x,
+                y,
+                width,
+                height: 1,
+            },
+            Hit::Section(section),
+        );
+        x = x.saturating_add(width + 1);
+    }
+}
+
+fn section_width(section: HomeSection, i18n: &I18n) -> u16 {
+    u16::try_from(display_width(section_label(section, i18n)).saturating_add(2)).unwrap_or(u16::MAX)
 }
 
 fn compact_title_line() -> Line<'static> {
@@ -133,6 +171,7 @@ fn draw_compact_client_switcher(
     state: &State,
     i18n: &I18n,
     title_width: u16,
+    hits: &mut HitMap,
 ) {
     let full_width = client_switcher_width(state, i18n);
     let title_right = area.x.saturating_add(1).saturating_add(title_width);
@@ -157,6 +196,9 @@ fn draw_compact_client_switcher(
             height: 1,
         },
     );
+    if available >= full_width {
+        register_sections(hits, area.right(), area.y, state, i18n);
+    }
 }
 
 fn client_switcher_line<'a>(state: &State, i18n: &'a I18n) -> Line<'a> {

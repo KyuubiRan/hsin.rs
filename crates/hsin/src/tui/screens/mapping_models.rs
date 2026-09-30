@@ -8,6 +8,7 @@ use ratatui::{
 use crate::i18n::I18n;
 
 use super::super::{
+    mouse::{ENTER, HitMap},
     state::{MappingModelPicker, ModelPickerMode, visible_mapping_models},
     theme::{MUTED, RED},
     widgets::{
@@ -25,6 +26,7 @@ pub(super) fn draw_mapping_models(
     area: Rect,
     picker: &MappingModelPicker,
     i18n: &I18n,
+    hits: &mut HitMap,
 ) {
     let models = visible_mapping_models(picker);
     let longest = models
@@ -111,6 +113,9 @@ pub(super) fn draw_mapping_models(
         &mut state,
     );
     draw_list_scroll_indicators(frame, popup, rows[1], &state, (0..item_count).map(|_| 1));
+    if matches!(picker.mode, ModelPickerMode::Browse) {
+        hits.list(rows[1], &state, (0..item_count).map(|_| 1), ENTER);
+    }
 }
 
 /// The label of the row the dialog was opened from, so the popup title says which tier it fills.

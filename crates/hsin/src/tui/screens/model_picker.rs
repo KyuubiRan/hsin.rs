@@ -9,6 +9,7 @@ use ratatui::{
 use crate::i18n::I18n;
 
 use super::super::{
+    mouse::{ENTER, HitMap},
     state::{ContextPicker, ModelPicker, ModelPickerMode, visible_models},
     theme::RED,
     widgets::{
@@ -22,6 +23,7 @@ pub(super) fn draw_context_picker(
     picker: &ContextPicker,
     settings: &ClientSettings,
     i18n: &I18n,
+    hits: &mut HitMap,
 ) {
     let presets = picker.kind.presets(settings);
     let width = content_width(area, 20, 32, 50);
@@ -49,9 +51,16 @@ pub(super) fn draw_context_picker(
         &mut state,
     );
     draw_list_scroll_indicators(frame, popup, inner, &state, (0..=presets.len()).map(|_| 1));
+    hits.list(inner, &state, (0..=presets.len()).map(|_| 1), ENTER);
 }
 
-pub(super) fn draw_models(frame: &mut Frame<'_>, area: Rect, picker: &ModelPicker, i18n: &I18n) {
+pub(super) fn draw_models(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    picker: &ModelPicker,
+    i18n: &I18n,
+    hits: &mut HitMap,
+) {
     let models = visible_models(picker);
     let longest = models
         .iter()
@@ -127,4 +136,7 @@ pub(super) fn draw_models(frame: &mut Frame<'_>, area: Rect, picker: &ModelPicke
         &mut state,
     );
     draw_list_scroll_indicators(frame, popup, rows[1], &state, (0..item_count).map(|_| 1));
+    if matches!(picker.mode, ModelPickerMode::Browse) {
+        hits.list(rows[1], &state, (0..item_count).map(|_| 1), ENTER);
+    }
 }

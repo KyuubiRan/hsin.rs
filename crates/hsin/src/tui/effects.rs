@@ -2,10 +2,10 @@ use anyhow::{Context, Result, ensure};
 use hsin_core::{
     ClaudeModelMappingUpdate, ClientAuthUpdate, ClientKind, ClientSettings, CodexConfigNameUpdate,
     CodexImageConfigUpdate, CodexImageListParams, CodexImageSwitchParams, ConnectionMode,
-    ImportCurrentParams, ImportCurrentResult, ModeSetParams, ModelDiscoverParams, ModelUpdate,
-    Provider, ProviderAddParams, ProviderDraft, ProviderEditParams, ProviderPatch,
-    ProviderRemoveParams, ProviderSwitchParams, SecretInput, Settings, SettingsPatch,
-    UsageStatsQuery, UsageStatsReport,
+    ImportCurrentParams, ImportCurrentResult, ModeSetParams, ModelDiscoverParams, ModelPriceInput,
+    ModelPriceList, ModelUpdate, Provider, ProviderAddParams, ProviderDraft, ProviderEditParams,
+    ProviderPatch, ProviderRemoveParams, ProviderSwitchParams, SecretInput, Settings,
+    SettingsPatch, UsageStatsQuery, UsageStatsReport,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -52,9 +52,17 @@ pub(super) enum Effect {
         config: hsin_core::UpstreamProxyConfig,
         password: SecretInput,
     },
+    SetStatsChartStyle(hsin_core::StatsChartStyle),
     QueryUsage(UsageStatsQuery),
+    QueryUsageDay(UsageStatsQuery),
+    LoadPrices,
+    SetPrice(ModelPriceInput),
+    RemovePrice(String),
+    /// Fetches the public price list; only ever sent on the user's request.
+    RefreshPrices,
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn worker(
     client: DaemonClient,
     mut effects: mpsc::Receiver<Effect>,
@@ -87,6 +95,36 @@ pub(super) async fn worker(
                     let _ = actions.send(Action::Failed(error_notice(&error))).await;
                 }
             }
+            continue;
+        }
+        if matches!(
+            effect,
+            Effect::LoadPrices
+                | Effect::SetPrice(_)
+                | Effect::RemovePrice(_)
+                | Effect::RefreshPrices
+        ) {
+            let action = match pricing(&client, effect).await {
+                Ok((prices, notice)) => {
+                    if let Some(notice) = notice {
+                        let _ = actions.send(Action::Notice(notice)).await;
+                    }
+                    Action::PricesLoaded(prices)
+                }
+                Err(error) => Action::Failed(error_notice(&error)),
+            };
+            let _ = actions.send(action).await;
+            continue;
+        }
+        if let Effect::QueryUsageDay(query) = effect {
+            let action = match client
+                .call::<_, UsageStatsReport>(hsin_ipc::method::STATS_QUERY, &query)
+                .await
+            {
+                Ok(report) => Action::DayUsageLoaded(report),
+                Err(error) => Action::Failed(error_notice(&error)),
+            };
+            let _ = actions.send(action).await;
             continue;
         }
         if let Effect::QueryUsage(query) = effect {
@@ -129,6 +167,34 @@ pub(super) async fn worker(
             }
         }
     }
+}
+
+/// Runs a price-rule change and returns the list as it stands afterwards.
+async fn pricing(
+    client: &DaemonClient,
+    effect: Effect,
+) -> Result<(ModelPriceList, Option<&'static str>)> {
+    use hsin_ipc::method;
+
+    let notice = match effect {
+        Effect::SetPrice(input) => {
+            let _: Value = client.call(method::PRICING_SET, &input).await?;
+            Some("pricing_saved")
+        }
+        Effect::RemovePrice(id) => {
+            let _: Value = client
+                .call(method::PRICING_REMOVE, &json!({ "id": id }))
+                .await?;
+            Some("pricing_removed")
+        }
+        Effect::RefreshPrices => {
+            let _: Value = client.call(method::PRICING_REFRESH, &json!({})).await?;
+            Some("pricing_refreshed")
+        }
+        _ => None,
+    };
+    let prices = client.call(method::PRICING_LIST, &json!({})).await?;
+    Ok((prices, notice))
 }
 
 /// Run a model lookup, folding any failure into the message the caller reports.
@@ -260,12 +326,32 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
         Effect::SetUpstreamProxy { config, password } => {
             update_upstream_proxy(client, config, password).await
         }
+        Effect::SetStatsChartStyle(style) => {
+            let _: Value = client
+                .call(
+                    "settings.set",
+                    &SettingsPatch {
+                        stats_chart_style: Some(style),
+                        ..SettingsPatch::default()
+                    },
+                )
+                .await?;
+            Ok(None)
+        }
         Effect::DiscoverModels(_) => unreachable!("model discovery is handled by the worker"),
         Effect::DiscoverMappingModels(_) => {
             unreachable!("mapping model discovery is handled by the worker")
         }
         Effect::CopyProvider(_) => unreachable!("provider copying is handled by the worker"),
-        Effect::QueryUsage(_) => unreachable!("usage queries are handled by the worker"),
+        Effect::QueryUsage(_) | Effect::QueryUsageDay(_) => {
+            unreachable!("usage queries are handled by the worker")
+        }
+        Effect::LoadPrices
+        | Effect::SetPrice(_)
+        | Effect::RemovePrice(_)
+        | Effect::RefreshPrices => {
+            unreachable!("price rules are handled by the worker")
+        }
     }
 }
 
@@ -413,6 +499,7 @@ async fn update_proxy_enabled(
                 clients: None,
                 client_auth: None,
                 codex_preserve_official_auth: None,
+                stats_chart_style: None,
                 claude_model_names_enabled: None,
                 upstream_proxy: None,
             },
@@ -437,6 +524,7 @@ async fn update_proxy_host(client: &DaemonClient, host: String) -> Result<Option
                 clients: None,
                 client_auth: None,
                 codex_preserve_official_auth: None,
+                stats_chart_style: None,
                 claude_model_names_enabled: None,
                 upstream_proxy: None,
             },
@@ -457,6 +545,7 @@ async fn update_proxy_port(client: &DaemonClient, port: u16) -> Result<Option<&'
                 clients: None,
                 client_auth: None,
                 codex_preserve_official_auth: None,
+                stats_chart_style: None,
                 claude_model_names_enabled: None,
                 upstream_proxy: None,
             },
@@ -477,6 +566,7 @@ async fn update_language(client: &DaemonClient, language: String) -> Result<Opti
                 clients: None,
                 client_auth: None,
                 codex_preserve_official_auth: None,
+                stats_chart_style: None,
                 claude_model_names_enabled: None,
                 upstream_proxy: None,
             },
@@ -517,6 +607,7 @@ async fn update_clients(
                 clients: Some(clients.clone()),
                 client_auth: None,
                 codex_preserve_official_auth: None,
+                stats_chart_style: None,
                 claude_model_names_enabled: None,
                 upstream_proxy: None,
             },
@@ -548,6 +639,7 @@ async fn update_client_auth(
                     disable_custom_auth,
                 }),
                 codex_preserve_official_auth: None,
+                stats_chart_style: None,
                 claude_model_names_enabled: None,
                 upstream_proxy: None,
             },
@@ -571,6 +663,7 @@ async fn update_codex_official_auth_preservation(
                 clients: None,
                 client_auth: None,
                 codex_preserve_official_auth: Some(enabled),
+                stats_chart_style: None,
                 claude_model_names_enabled: None,
                 upstream_proxy: None,
             },
@@ -594,6 +687,7 @@ async fn update_claude_model_names(
                 clients: None,
                 client_auth: None,
                 codex_preserve_official_auth: None,
+                stats_chart_style: None,
                 claude_model_names_enabled: Some(enabled),
                 upstream_proxy: None,
             },

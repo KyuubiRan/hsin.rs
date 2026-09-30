@@ -1,4 +1,7 @@
-use hsin_core::{ClientKind, LANGUAGE_EN_US, LANGUAGE_ZH_CN, ProxyProtocol, UpstreamProxyMode};
+use hsin_core::{
+    ClientKind, LANGUAGE_EN_US, LANGUAGE_ZH_CN, ModelPrice, ModelPriceSource, ProxyProtocol,
+    UpstreamProxyMode,
+};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -12,9 +15,12 @@ use ratatui::{
 use crate::i18n::I18n;
 
 use super::super::{
-    state::{SettingsPage, SettingsScreen, State},
+    mouse::{ENTER, HitMap},
+    state::{
+        PRICE_FIELD_COUNT, PRICE_PROVIDER_FIELD, PriceEditor, SettingsPage, SettingsScreen, State,
+    },
     theme::{MUTED, RED, WHITE},
-    widgets::{centered_fixed, display_width, draw_input_field},
+    widgets::{centered_fixed, display_width, draw_input_field, scrolling_rows},
 };
 
 #[allow(clippy::too_many_lines)]
@@ -24,7 +30,33 @@ pub(super) fn draw_settings_screen(
     state: &State,
     screen: &SettingsScreen,
     i18n: &I18n,
+    hits: &mut HitMap,
 ) {
+    if let SettingsPage::Pricing {
+        selected,
+        list,
+        editor,
+        delete_armed,
+    } = &screen.page
+    {
+        let prices = list
+            .as_ref()
+            .map(|list| (&list.prices[..], list.remote_fetched_at));
+        draw_pricing(
+            frame,
+            area,
+            state,
+            prices,
+            *selected,
+            delete_armed.is_some(),
+            i18n,
+            hits,
+        );
+        if let Some(editor) = editor {
+            draw_price_editor(frame, area, state, editor, i18n, hits);
+        }
+        return;
+    }
     let proxy = if state.proxy_enabled {
         i18n.text("enabled")
     } else {
@@ -67,6 +99,7 @@ pub(super) fn draw_settings_screen(
                 settings_option_item(i18n.text("upstream_proxy"), upstream_mode, option_width),
                 ListItem::new(i18n.text("client_configuration")),
                 settings_option_item(i18n.text("language"), language, option_width),
+                ListItem::new(i18n.text("model_pricing")),
             ];
             match screen.selected {
                 0 => (
@@ -100,6 +133,14 @@ pub(super) fn draw_settings_screen(
                     i18n.text("language"),
                     i18n.text("settings_language_description"),
                     Some(language),
+                ),
+                4 => (
+                    items,
+                    screen.selected,
+                    i18n.text("settings_options"),
+                    i18n.text("model_pricing"),
+                    i18n.text("settings_model_pricing_description"),
+                    None,
                 ),
                 _ => unreachable!("root settings selection is bounded"),
             }
@@ -474,7 +515,9 @@ pub(super) fn draw_settings_screen(
             }),
             None,
         ),
+        SettingsPage::Pricing { .. } => unreachable!("the pricing page is drawn on its own"),
     };
+    let item_count = items.len();
     let mut list_state = ListState::default().with_selected(Some(selected));
     let list = List::new(items)
         .highlight_symbol("› ")
@@ -492,6 +535,12 @@ pub(super) fn draw_settings_screen(
                 .border_style(Style::default().fg(MUTED)),
         );
     frame.render_stateful_widget(list, columns[0], &mut list_state);
+    hits.list(
+        columns[0].inner(ratatui::layout::Margin::new(1, 1)),
+        &list_state,
+        (0..item_count).map(|_| 1),
+        ENTER,
+    );
 
     frame.render_widget(
         Paragraph::new(
@@ -538,6 +587,7 @@ pub(super) fn draw_settings_screen(
     } = &screen.page
     {
         let popup = centered_fixed(area, 48, 5);
+        hits.barrier(area);
         frame.render_widget(Clear, popup);
         let block = Block::default()
             .title(i18n.text(if editor.original.is_some() {
@@ -559,6 +609,249 @@ pub(super) fn draw_settings_screen(
             true,
         );
     }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn draw_pricing(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &State,
+    prices: Option<(&[ModelPrice], Option<i64>)>,
+    selected: usize,
+    delete_armed: bool,
+    i18n: &I18n,
+    hits: &mut HitMap,
+) {
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .split(area);
+    let providers = state.price_providers();
+    let provider_name = |id: &str| {
+        providers
+            .iter()
+            .find(|(candidate, _)| candidate == id)
+            .map_or_else(|| id.to_owned(), |(_, name)| name.clone())
+    };
+    let width = usize::from(columns[0].width.saturating_sub(4));
+    let items = prices.map_or_else(
+        || vec![ListItem::new(i18n.text("loading"))],
+        |(prices, _)| {
+            prices
+                .iter()
+                .map(|price| {
+                    let scope = price
+                        .provider_id
+                        .as_deref()
+                        .map(|id| format!(" @{}", provider_name(id)))
+                        .unwrap_or_default();
+                    settings_option_item(
+                        &format!("{}{scope}", price.model_pattern),
+                        price_source_label(price.source, i18n),
+                        width,
+                    )
+                })
+                .collect()
+        },
+    );
+    let item_count = items.len();
+    let mut list_state = ListState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_symbol("› ")
+            .highlight_spacing(HighlightSpacing::Always)
+            .highlight_style(
+                Style::default()
+                    .fg(RED)
+                    .bg(Color::Rgb(55, 28, 32))
+                    .add_modifier(Modifier::BOLD),
+            )
+            .block(
+                Block::default()
+                    .title(i18n.text("model_pricing"))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(MUTED)),
+            ),
+        columns[0],
+        &mut list_state,
+    );
+    if prices.is_some() {
+        hits.list(
+            columns[0].inner(ratatui::layout::Margin::new(1, 1)),
+            &list_state,
+            (0..item_count).map(|_| 1),
+            ENTER,
+        );
+    }
+
+    let label =
+        |key: &str| Span::styled(format!("{}: ", i18n.text(key)), Style::default().fg(MUTED));
+    let mut lines = Vec::new();
+    if let Some(price) = prices.and_then(|(prices, _)| prices.get(selected)) {
+        let per_million = |value: Option<f64>| {
+            value.map_or_else(
+                || i18n.text("pricing_same_as_input").to_owned(),
+                |value| value.to_string(),
+            )
+        };
+        lines.extend([
+            Line::from(Span::styled(
+                price.model_pattern.clone(),
+                Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                label("pricing_provider"),
+                Span::raw(price.provider_id.as_deref().map_or_else(
+                    || i18n.text("pricing_all_providers").to_owned(),
+                    provider_name,
+                )),
+            ]),
+            Line::from(vec![
+                label("pricing_currency"),
+                Span::raw(price.currency.clone()),
+            ]),
+            Line::from(vec![
+                label("pricing_input"),
+                Span::raw(price.input.to_string()),
+            ]),
+            Line::from(vec![
+                label("pricing_cache_write"),
+                Span::raw(per_million(price.cache_write)),
+            ]),
+            Line::from(vec![
+                label("pricing_cache_read"),
+                Span::raw(per_million(price.cache_read)),
+            ]),
+            Line::from(vec![
+                label("pricing_output"),
+                Span::raw(price.output.to_string()),
+            ]),
+            Line::from(vec![
+                label("pricing_source"),
+                Span::styled(
+                    price_source_label(price.source, i18n),
+                    Style::default().fg(RED),
+                ),
+            ]),
+            Line::from(""),
+        ]);
+        if delete_armed {
+            lines.push(Line::from(Span::styled(
+                i18n.text("pricing_delete_confirm"),
+                Style::default().fg(RED),
+            )));
+            lines.push(Line::from(""));
+        }
+    }
+    lines.push(Line::from(i18n.text("pricing_description")));
+    if let Some((_, fetched)) = prices {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            label("pricing_remote_fetched"),
+            Span::raw(fetched.map_or_else(
+                || i18n.text("pricing_never").to_owned(),
+                |at| {
+                    chrono::DateTime::from_timestamp(at, 0).map_or_else(String::new, |value| {
+                        value
+                            .with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d %H:%M")
+                            .to_string()
+                    })
+                },
+            )),
+        ]));
+    }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .title(i18n.text("settings_description"))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(MUTED)),
+        ),
+        columns[1],
+    );
+}
+
+fn draw_price_editor(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &State,
+    editor: &PriceEditor,
+    i18n: &I18n,
+    hits: &mut HitMap,
+) {
+    hits.barrier(area);
+    let height = u16::try_from(PRICE_FIELD_COUNT * 3 + 2).unwrap_or(u16::MAX);
+    let popup = centered_fixed(area, 64, height);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(i18n.text(if editor.id.is_some() {
+            "pricing_edit"
+        } else {
+            "pricing_add"
+        }))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(RED));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let providers = state.price_providers();
+    let provider = editor.provider_id.as_deref().map_or_else(
+        || i18n.text("pricing_all_providers").to_owned(),
+        |id| {
+            providers
+                .iter()
+                .find(|(candidate, _)| candidate == id)
+                .map_or_else(|| id.to_owned(), |(_, name)| name.clone())
+        },
+    );
+    let rows = scrolling_rows(inner, editor.field, PRICE_FIELD_COUNT, 3);
+    for &(index, row) in &rows {
+        let focus = (editor.field == index).then_some(editor.cursor);
+        let (label, value, placeholder) = match index {
+            0 => (
+                "pricing_pattern",
+                editor.pattern.clone(),
+                Some("claude-sonnet-*"),
+            ),
+            PRICE_PROVIDER_FIELD => ("pricing_provider", format!("‹ {provider} ›"), None),
+            2 => ("pricing_currency", editor.currency.clone(), Some("USD")),
+            3 => ("pricing_input", editor.input.clone(), Some("3.0")),
+            4 => (
+                "pricing_cache_write",
+                editor.cache_write.clone(),
+                Some(i18n.text("pricing_same_as_input")),
+            ),
+            5 => (
+                "pricing_cache_read",
+                editor.cache_read.clone(),
+                Some(i18n.text("pricing_same_as_input")),
+            ),
+            _ => ("pricing_output", editor.output.clone(), Some("15.0")),
+        };
+        draw_input_field(
+            frame,
+            row,
+            i18n.text(label),
+            &value,
+            placeholder,
+            if index == PRICE_PROVIDER_FIELD {
+                focus.map(|_| 0)
+            } else {
+                focus
+            },
+            true,
+        );
+    }
+    hits.rows(&rows, editor.field, None);
+}
+
+fn price_source_label(source: ModelPriceSource, i18n: &I18n) -> &str {
+    i18n.text(match source {
+        ModelPriceSource::Builtin => "pricing_source_builtin",
+        ModelPriceSource::Remote => "pricing_source_remote",
+        ModelPriceSource::User => "pricing_source_user",
+    })
 }
 
 fn upstream_proxy_mode_label(mode: UpstreamProxyMode, i18n: &I18n) -> &str {

@@ -1416,7 +1416,7 @@ pub struct UsageDailyBucket {
     pub tokens: UsageTokenSummary,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageProviderBreakdown {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
@@ -1424,13 +1424,153 @@ pub struct UsageProviderBreakdown {
     pub provider_revision: u64,
     pub inferred: bool,
     pub tokens: UsageTokenSummary,
+    /// Estimated cost, one entry per currency. Empty when no price matches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cost: Vec<UsageCost>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageModelBreakdown {
     pub model: String,
     pub tokens: UsageTokenSummary,
+    /// Daily buckets for at most the last [`USAGE_MODEL_SERIES_DAYS`] days of the query, so a long
+    /// range still fits in one IPC frame.
     pub daily: Vec<UsageDailyBucket>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cost: Vec<UsageCost>,
+}
+
+/// How many trailing days each model's daily series carries.
+pub const USAGE_MODEL_SERIES_DAYS: usize = 92;
+/// How many days the activity calendar covers: 53 full weeks.
+pub const USAGE_CALENDAR_DAYS: usize = 371;
+
+/// An estimated amount in one currency. Amounts in different currencies are never converted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageCost {
+    /// ISO 4217 code, for example `USD` or `CNY`.
+    pub currency: String,
+    pub amount: f64,
+}
+
+/// Adds `amount` to the entry for `currency`, keeping the list sorted by currency code.
+pub fn add_usage_cost(costs: &mut Vec<UsageCost>, currency: &str, amount: f64) {
+    match costs.binary_search_by(|cost| cost.currency.as_str().cmp(currency)) {
+        Ok(index) => costs[index].amount += amount,
+        Err(index) => costs.insert(
+            index,
+            UsageCost {
+                currency: currency.to_owned(),
+                amount,
+            },
+        ),
+    }
+}
+
+/// Highlights of a range, in the spirit of an activity overview.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageOverview {
+    /// The model with the most output tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub favorite_model: Option<String>,
+    pub active_days: u64,
+    /// Consecutive active days ending today, or yesterday when today has no usage yet.
+    pub current_streak: u64,
+    pub longest_streak: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub most_active_day: Option<UsageDailyBucket>,
+    /// Local hour, `0..24`, with the most tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_hour: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageCalendarDay {
+    /// Local calendar date in `YYYY-MM-DD` form.
+    pub date: String,
+    pub total_tokens: u64,
+    pub request_count: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cost: Vec<UsageCost>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UsageProjection {
+    pub tokens: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cost: Vec<UsageCost>,
+}
+
+/// A plan allowance back-calculated from usage: the tokens and API list-price cost spent while
+/// the plan's quota meter moved, scaled to the full 100%.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageQuotaCapacity {
+    pub tokens: u64,
+    /// The range the whole-percent meter leaves open; `tokens_high` is `None` while the meter has
+    /// moved too little to bound it.
+    pub tokens_low: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_high: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cost: Vec<UsageCost>,
+}
+
+/// One reset cycle of a quota window and what it contributed to the estimate.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageQuotaCycle {
+    pub resets_at: i64,
+    /// First and last reading seen in the cycle.
+    pub first_at: i64,
+    pub last_at: i64,
+    pub from_percent: f64,
+    pub to_percent: f64,
+    /// Usage between the first reading and the last rise of the meter.
+    pub tokens: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cost: Vec<UsageCost>,
+}
+
+/// One quota window of one subscription, as the client last reported it. Each account, source
+/// provider and plan gets its own estimate: their allowances differ even when they share a client.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageQuotaEstimate {
+    /// Identifies the plan this window belongs to — account, source and plan — so every window of
+    /// one plan can be filtered together.
+    #[serde(default)]
+    pub plan_key: String,
+    /// A short hash of the account the readings came from, when the client names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// The provider the client's session used, such as `openai`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Whether this window appears in the client's newest readings; an older one belongs to a
+    /// plan or account no longer in use.
+    #[serde(default)]
+    pub current: bool,
+    pub limit_id: String,
+    /// `primary` or `secondary`, as the client labels its windows.
+    pub window: String,
+    pub window_minutes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
+    /// Share of the window already used, `0..=100`; zero once the window has reset.
+    pub used_percent: f64,
+    pub resets_at: i64,
+    pub observed_at: i64,
+    /// Meter movement the estimate rests on, summed over the cycles used.
+    pub basis_percent: f64,
+    pub basis_cycles: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<UsageQuotaCapacity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<UsageProjection>,
+    /// The allowance over a calendar month, for windows of a day or longer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monthly: Option<UsageProjection>,
+    /// Recent cycles, newest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cycles: Vec<UsageQuotaCycle>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1469,6 +1609,24 @@ pub struct UsageStatsReport {
     pub collected_since: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_synced_at: Option<i64>,
+    /// Estimated cost of the range, one entry per currency.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cost: Vec<UsageCost>,
+    /// Tokens of models no price matched, left out of `cost`.
+    #[serde(default)]
+    pub unpriced_tokens: u64,
+    #[serde(default)]
+    pub overview: UsageOverview,
+    /// The last [`USAGE_CALENDAR_DAYS`] days ending today, whatever the range.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calendar: Vec<UsageCalendarDay>,
+    /// Usage by local hour of day, `0..24`, over the queried range.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hourly: Vec<UsageTokenSummary>,
+    /// Subscription quota windows the client reports, newest reading first. Independent of the
+    /// query's range and filters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quota: Vec<UsageQuotaEstimate>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1477,6 +1635,226 @@ pub struct UsageSyncResult {
     pub skipped: u64,
     pub failed_files: u64,
     pub synced_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPriceSource {
+    /// Shipped with this release.
+    Builtin,
+    /// Fetched on request from the public price list.
+    Remote,
+    /// Entered by the user; always wins over the other two.
+    User,
+}
+
+impl ModelPriceSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Remote => "remote",
+            Self::User => "user",
+        }
+    }
+}
+
+/// A price rule. Prices are per million tokens. A missing cache price falls back to the input
+/// price.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelPrice {
+    pub id: String,
+    /// A model ID, or a prefix ending in `*`. Matched after [`normalize_model_name`].
+    pub model_pattern: String,
+    /// Restricts the rule to one provider; `None` applies to every provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    pub currency: String,
+    pub input: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<f64>,
+    pub output: f64,
+    pub source: ModelPriceSource,
+    pub updated_at: i64,
+}
+
+impl ModelPrice {
+    /// How closely this rule fits `model`, higher is closer, or `None` when it does not apply.
+    #[must_use]
+    pub fn specificity(&self, provider_id: Option<&str>, model: &str) -> Option<(u8, u8, usize)> {
+        let scoped = match &self.provider_id {
+            Some(id) if Some(id.as_str()) == provider_id => 1,
+            Some(_) => return None,
+            None => 0,
+        };
+        let model = normalize_model_name(model);
+        let pattern = self.model_pattern.to_ascii_lowercase();
+        let length = if let Some(prefix) = pattern.strip_suffix('*') {
+            if !model.starts_with(prefix) {
+                return None;
+            }
+            prefix.len()
+        } else if normalize_model_name(&pattern) == model {
+            usize::MAX
+        } else {
+            return None;
+        };
+        let source = match self.source {
+            ModelPriceSource::Builtin => 0,
+            ModelPriceSource::Remote => 1,
+            ModelPriceSource::User => 2,
+        };
+        Some((scoped, source, length))
+    }
+
+    /// The cost of `tokens` at this price.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn cost(&self, tokens: &UsageTokenSummary) -> f64 {
+        // Token counts stay far below 2^52, where f64 stops being exact.
+        let per_million = |count: u64, price: f64| count as f64 * price / 1_000_000.0;
+        per_million(tokens.input_tokens, self.input)
+            + per_million(
+                tokens.cache_write_tokens,
+                self.cache_write.unwrap_or(self.input),
+            )
+            + per_million(
+                tokens.cache_read_tokens,
+                self.cache_read.unwrap_or(self.input),
+            )
+            + per_million(tokens.output_tokens, self.output)
+    }
+}
+
+/// The price rule that best fits `model` served by `provider_id`: a provider-scoped rule beats a
+/// general one, a user rule beats a fetched one which beats a built-in one, and an exact ID beats
+/// the longest matching prefix.
+#[must_use]
+pub fn best_model_price<'a>(
+    prices: &'a [ModelPrice],
+    provider_id: Option<&str>,
+    model: &str,
+) -> Option<&'a ModelPrice> {
+    prices
+        .iter()
+        .filter_map(|price| {
+            price
+                .specificity(provider_id, model)
+                .map(|rank| (rank, price))
+        })
+        .max_by_key(|(rank, _)| *rank)
+        .map(|(_, price)| price)
+}
+
+/// Lowercases a model ID and strips what varies between gateways for the same model: a
+/// `vendor/` prefix, a `[1m]`-style context suffix, and a trailing release date written as
+/// `-20250805` or `-2025-08-05`.
+#[must_use]
+pub fn normalize_model_name(model: &str) -> String {
+    let mut model = model.trim().to_ascii_lowercase();
+    if let Some(index) = model.find('[') {
+        model.truncate(index);
+    }
+    if let Some(index) = model.rfind('/') {
+        model = model[index + 1..].to_owned();
+    }
+    let bytes = model.as_bytes();
+    let is_digits = |range: std::ops::Range<usize>| bytes[range].iter().all(u8::is_ascii_digit);
+    let length = bytes.len();
+    let date_suffix = if length > 9 && bytes[length - 9] == b'-' && is_digits(length - 8..length) {
+        9
+    } else if length > 11
+        && bytes[length - 11] == b'-'
+        && bytes[length - 6] == b'-'
+        && bytes[length - 3] == b'-'
+        && is_digits(length - 10..length - 6)
+        && is_digits(length - 5..length - 3)
+        && is_digits(length - 2..length)
+    {
+        11
+    } else {
+        0
+    };
+    model.truncate(length - date_suffix);
+    model
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelPriceInput {
+    /// Set to replace an existing user rule; omitted to add one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub model_pattern: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    pub currency: String,
+    pub input: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<f64>,
+    pub output: f64,
+}
+
+impl ModelPriceInput {
+    /// # Errors
+    ///
+    /// Returns [`ValidationError`] for an empty or malformed pattern, a currency that is not three
+    /// uppercase letters, or a price that is negative, not finite, or implausibly large.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        let pattern = self.model_pattern.trim();
+        if pattern.is_empty() {
+            return Err(ValidationError::new("model_pattern", "empty"));
+        }
+        if pattern.len() > 128
+            || pattern != self.model_pattern
+            || pattern.chars().any(char::is_whitespace)
+            || pattern.trim_end_matches('*').contains('*')
+            || pattern == "*"
+        {
+            return Err(ValidationError::new("model_pattern", "invalid"));
+        }
+        if self.currency.len() != 3 || !self.currency.chars().all(|c| c.is_ascii_uppercase()) {
+            return Err(ValidationError::new("currency", "invalid"));
+        }
+        let valid = |price: f64| price.is_finite() && (0.0..=1_000_000.0).contains(&price);
+        if !valid(self.input) {
+            return Err(ValidationError::new("input", "invalid"));
+        }
+        if !valid(self.output) {
+            return Err(ValidationError::new("output", "invalid"));
+        }
+        if self.cache_write.is_some_and(|price| !valid(price)) {
+            return Err(ValidationError::new("cache_write", "invalid"));
+        }
+        if self.cache_read.is_some_and(|price| !valid(price)) {
+            return Err(ValidationError::new("cache_read", "invalid"));
+        }
+        if self
+            .provider_id
+            .as_ref()
+            .is_some_and(|id| id.trim().is_empty())
+        {
+            return Err(ValidationError::new("provider_id", "empty"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelPriceList {
+    pub prices: Vec<ModelPrice>,
+    /// When the public price list was last fetched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_fetched_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PricingRefreshResult {
+    pub imported: u64,
+    pub fetched_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1494,6 +1872,37 @@ pub struct Settings {
     pub claude_model_names_enabled: bool,
     #[serde(default)]
     pub upstream_proxy: UpstreamProxyConfig,
+    #[serde(default)]
+    pub stats_chart_style: StatsChartStyle,
+}
+
+/// How the statistics screens draw token series.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatsChartStyle {
+    /// Bars stacked by kind of token.
+    #[default]
+    Bar,
+    /// One line per kind of token.
+    Line,
+}
+
+impl StatsChartStyle {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bar => "bar",
+            Self::Line => "line",
+        }
+    }
+
+    #[must_use]
+    pub const fn toggled(self) -> Self {
+        match self {
+            Self::Bar => Self::Line,
+            Self::Line => Self::Bar,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1569,6 +1978,7 @@ impl Default for Settings {
             client_auth: ClientAuthSettings::default(),
             claude_model_names_enabled: true,
             upstream_proxy: UpstreamProxyConfig::default(),
+            stats_chart_style: StatsChartStyle::default(),
         }
     }
 }
@@ -1600,6 +2010,8 @@ pub struct SettingsPatch {
     pub claude_model_names_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_proxy: Option<UpstreamProxyUpdate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats_chart_style: Option<StatsChartStyle>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1821,6 +2233,68 @@ pub fn json_object<T: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_names_normalize_across_gateways() {
+        assert_eq!(
+            normalize_model_name("anthropic/Claude-Opus-4-1-20250805"),
+            "claude-opus-4-1"
+        );
+        assert_eq!(
+            normalize_model_name("claude-opus-5-5[1m]"),
+            "claude-opus-5-5"
+        );
+        assert_eq!(normalize_model_name("gpt-5.4-2026-03-05"), "gpt-5.4");
+        assert_eq!(normalize_model_name("deepseek-v4-pro"), "deepseek-v4-pro");
+        assert_eq!(normalize_model_name("model-12345678x"), "model-12345678x");
+    }
+
+    #[test]
+    fn price_input_validation_rejects_bad_patterns_currencies_and_prices() {
+        let valid = ModelPriceInput {
+            id: None,
+            model_pattern: "claude-*".into(),
+            provider_id: None,
+            currency: "CNY".into(),
+            input: 1.0,
+            cache_write: None,
+            cache_read: Some(0.1),
+            output: 2.0,
+        };
+        assert!(valid.validate().is_ok());
+        for invalid in [
+            ModelPriceInput {
+                model_pattern: "*".into(),
+                ..valid.clone()
+            },
+            ModelPriceInput {
+                model_pattern: "a*b".into(),
+                ..valid.clone()
+            },
+            ModelPriceInput {
+                currency: "usd".into(),
+                ..valid.clone()
+            },
+            ModelPriceInput {
+                input: -1.0,
+                ..valid.clone()
+            },
+            ModelPriceInput {
+                output: f64::NAN,
+                ..valid.clone()
+            },
+            ModelPriceInput {
+                cache_read: Some(f64::INFINITY),
+                ..valid.clone()
+            },
+            ModelPriceInput {
+                provider_id: Some(" ".into()),
+                ..valid.clone()
+            },
+        ] {
+            assert!(invalid.validate().is_err(), "{invalid:?}");
+        }
+    }
 
     #[test]
     fn usage_summary_uses_non_overlapping_token_buckets() {

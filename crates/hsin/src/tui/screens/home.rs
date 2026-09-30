@@ -4,7 +4,7 @@ use hsin_core::{
 };
 use ratatui::{
     Frame,
-    layout::Rect,
+    layout::{Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
@@ -13,6 +13,7 @@ use ratatui::{
 use crate::i18n::I18n;
 
 use super::super::{
+    mouse::{ENTER, HitMap},
     state::{InputMode, MAPPING_TIERS, State},
     theme::{MUTED, RED, WHITE},
     widgets::draw_input_field,
@@ -23,6 +24,7 @@ pub(super) fn draw_provider_list(
     area: Rect,
     state: &mut State,
     i18n: &I18n,
+    hits: &mut HitMap,
 ) {
     let active = state.active_id().map(str::to_owned);
     let searching = !state.active_query().is_empty();
@@ -88,6 +90,14 @@ pub(super) fn draw_provider_list(
                 .border_style(Style::default().fg(MUTED)),
         );
     frame.render_stateful_widget(list, area, &mut list_state);
+    if !providers.is_empty() {
+        hits.list(
+            area.inner(Margin::new(1, 1)),
+            &list_state,
+            providers.iter().map(|_| 1),
+            ENTER,
+        );
+    }
 }
 
 #[allow(clippy::too_many_lines)]
