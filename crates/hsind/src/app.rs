@@ -15,7 +15,8 @@ use hsin_core::{
     ClientKind, ClientSettings, CodexConfigNameUpdate, CodexImageConfigUpdate,
     CodexImageListParams, CodexImageSwitchParams, ConnectionMode, DaemonStatus, DoctorFinding,
     DoctorReport, DoctorSeverity, ErrorCode, ImportCurrentParams, ImportCurrentResult,
-    KeyStoreState, ModelDiscoverParams, ModelDiscovery, ModelUpdate, Provider, ProviderAddParams,
+    KeyStoreState, ModelDiscoverParams, ModelDiscovery, ModelPrice, ModelPriceInput,
+    ModelPriceList, ModelUpdate, PricingRefreshResult, Provider, ProviderAddParams,
     ProviderEditParams, ProviderListParams, ProviderProxyConfig, ProviderProxyMode,
     ProviderRemoveParams, ProviderScope, ProviderSwitchParams, SecretInput, SecurityStatus,
     Settings, SettingsPatch, UpstreamProxyConfig, UpstreamProxyMode, UsageStatsQuery,
@@ -219,6 +220,38 @@ impl App {
         })
         .await
         .map_err(|error| DaemonError::Internal(error.to_string()))?
+    }
+
+    pub fn list_prices(&self) -> Result<ModelPriceList> {
+        crate::pricing::list(&self.db)
+    }
+
+    pub async fn set_price(&self, input: ModelPriceInput) -> Result<ModelPrice> {
+        let _guard = self.mutation.lock().await;
+        crate::pricing::set_user_price(&self.db, &input, chrono::Utc::now().timestamp())
+    }
+
+    pub async fn remove_price(&self, id: &str) -> Result<()> {
+        let _guard = self.mutation.lock().await;
+        crate::pricing::remove_user_price(&self.db, id)
+    }
+
+    /// Fetches the public price list through the global upstream proxy. Only ever runs when the
+    /// user asks for it.
+    pub async fn refresh_prices(&self) -> Result<PricingRefreshResult> {
+        let proxy = self.upstream_outbound_proxy()?;
+        let _guard = self.mutation.lock().await;
+        crate::pricing::refresh(&self.db, &proxy, chrono::Utc::now().timestamp()).await
+    }
+
+    fn upstream_outbound_proxy(&self) -> Result<OutboundProxySnapshot> {
+        let config = self.upstream_proxy_config()?;
+        let password = if config.manual.password_configured {
+            self.protected_secret(UPSTREAM_PROXY_PASSWORD_KEY)?
+        } else {
+            None
+        };
+        Ok(OutboundProxySnapshot { config, password })
     }
 
     fn record_usage_route(&self, client: ClientKind) {
@@ -826,15 +859,7 @@ impl App {
         password: SecretInput,
     ) -> Result<OutboundProxySnapshot> {
         match config.mode {
-            ProviderProxyMode::Inherit => {
-                let config = self.upstream_proxy_config()?;
-                let password = if config.manual.password_configured {
-                    self.protected_secret(UPSTREAM_PROXY_PASSWORD_KEY)?
-                } else {
-                    None
-                };
-                Ok(OutboundProxySnapshot { config, password })
-            }
+            ProviderProxyMode::Inherit => self.upstream_outbound_proxy(),
             ProviderProxyMode::Direct => Ok(OutboundProxySnapshot::direct()),
             ProviderProxyMode::System => Ok(OutboundProxySnapshot {
                 config: UpstreamProxyConfig {

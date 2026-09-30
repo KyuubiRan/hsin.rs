@@ -20,6 +20,10 @@ pub(super) enum Hit {
         selected: usize,
         activate: Option<KeyEvent>,
     },
+    /// A quick range chip on the stats screen; the value indexes the time popup.
+    StatsRange(usize),
+    /// A heatmap cell; clicking or hovering shows that day.
+    HeatDay(chrono::NaiveDate),
 }
 
 /// The clickable regions of the last frame, in draw order. Later regions sit on top.

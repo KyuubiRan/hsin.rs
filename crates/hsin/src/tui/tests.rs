@@ -3981,6 +3981,7 @@ fn the_search_box_edits_at_the_caret() {
     assert_eq!(query, "example");
 }
 
+#[allow(clippy::too_many_lines)]
 fn usage_report() -> UsageStatsReport {
     let tokens = UsageTokenSummary {
         input_tokens: 100,
@@ -4013,14 +4014,16 @@ fn usage_report() -> UsageStatsReport {
             provider_revision: 1,
             inferred: true,
             tokens: tokens.clone(),
+            cost: vec![usd(0.25)],
         }],
         models: vec![UsageModelBreakdown {
             model: "gpt-5".into(),
             tokens: tokens.clone(),
             daily: vec![UsageDailyBucket {
                 date: "2026-09-14".into(),
-                tokens,
+                tokens: tokens.clone(),
             }],
+            cost: vec![usd(0.25)],
         }],
         attribution: UsageAttributionCounts {
             exact: 1,
@@ -4037,6 +4040,62 @@ fn usage_report() -> UsageStatsReport {
         },
         collected_since: 1_788_800_000,
         last_synced_at: Some(1_791_300_000),
+        cost: vec![usd(0.25)],
+        unpriced_tokens: 0,
+        overview: hsin_core::UsageOverview {
+            favorite_model: Some("gpt-5".into()),
+            active_days: 1,
+            current_streak: 1,
+            longest_streak: 1,
+            most_active_day: Some(UsageDailyBucket {
+                date: "2026-09-14".into(),
+                tokens: tokens.clone(),
+            }),
+            peak_hour: Some(14),
+        },
+        calendar: (0..hsin_core::USAGE_CALENDAR_DAYS)
+            .rev()
+            .map(|offset| {
+                let date = chrono::Local::now().date_naive()
+                    - chrono::Duration::days(i64::try_from(offset).unwrap());
+                hsin_core::UsageCalendarDay {
+                    date: date.format("%Y-%m-%d").to_string(),
+                    total_tokens: if offset == 0 { 250 } else { 0 },
+                    request_count: u64::from(offset == 0),
+                    cost: if offset == 0 {
+                        vec![usd(0.25)]
+                    } else {
+                        Vec::new()
+                    },
+                }
+            })
+            .collect(),
+        forecast: Some(hsin_core::UsageForecast {
+            basis_days: 28,
+            daily_average: hsin_core::UsageProjection {
+                tokens: 250,
+                cost: vec![usd(0.25)],
+            },
+            month_to_date: hsin_core::UsageProjection {
+                tokens: 250,
+                cost: vec![usd(0.25)],
+            },
+            month_end: hsin_core::UsageProjection {
+                tokens: 4_000,
+                cost: vec![usd(4.0)],
+            },
+            next_30_days: hsin_core::UsageProjection {
+                tokens: 7_500,
+                cost: vec![usd(7.5)],
+            },
+        }),
+    }
+}
+
+fn usd(amount: f64) -> hsin_core::UsageCost {
+    hsin_core::UsageCost {
+        currency: "USD".into(),
+        amount,
     }
 }
 
@@ -4067,7 +4126,7 @@ fn stats_navigation_queries_filters_and_returns_home() {
 
 #[test]
 fn stats_render_wide_and_compact_without_losing_token_details() {
-    for (width, height) in [(100, 32), (48, 16)] {
+    for (width, height) in [(120, 44), (48, 16)] {
         let mut state = State {
             loading: false,
             input: InputMode::Stats(state::StatsScreen {
@@ -4079,6 +4138,8 @@ fn stats_render_wide_and_compact_without_losing_token_details() {
                 model: None,
                 filter: None,
                 scroll: 0,
+                all_time: true,
+                day: None,
             }),
             ..State::default()
         };
@@ -4091,7 +4152,175 @@ fn stats_render_wide_and_compact_without_losing_token_details() {
         assert!(rendered.contains("Total"));
         assert!(rendered.contains("Hit"));
         assert!(rendered.contains("Output"));
+        if width >= 100 {
+            assert!(rendered.contains("$0.250"));
+            assert!(rendered.contains("Activity"));
+            assert!(rendered.contains("Favorite model"));
+            assert!(rendered.contains("All time"));
+        }
     }
+}
+
+fn stats_state() -> State {
+    let mut state = State {
+        providers: vec![example_provider()],
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Char('s')));
+    state.take_effect();
+    state.reduce(Action::UsageLoaded(usage_report()));
+    state
+}
+
+fn stats_screen(state: &State) -> &state::StatsScreen {
+    let InputMode::Stats(screen) = &state.input else {
+        panic!("stats screen is open");
+    };
+    screen
+}
+
+#[test]
+fn stats_open_on_all_time_and_d_cycles_like_the_range_chips() {
+    let mut state = State {
+        providers: vec![example_provider()],
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Char('s')));
+    assert!(matches!(state.take_effect(), Some(Effect::QueryUsage(ref query)) if query.from == 0));
+    for expected_days in [7, 30] {
+        state.reduce(key(KeyCode::Char('d')));
+        let Some(Effect::QueryUsage(query)) = state.take_effect() else {
+            panic!("d queries the next range");
+        };
+        assert_eq!((query.to - query.from + 3_600) / 86_400, expected_days);
+    }
+    state.reduce(key(KeyCode::Char('d')));
+    assert!(matches!(state.take_effect(), Some(Effect::QueryUsage(ref query)) if query.from == 0));
+}
+
+#[test]
+fn heatmap_days_and_range_chips_respond_to_the_mouse() {
+    let mut state = stats_state();
+    render(&mut state, 120, 44);
+    let today = chrono::Local::now().date_naive();
+    let cell = hit_area(&state, |hit| *hit == super::mouse::Hit::HeatDay(today));
+    state.reduce(Action::Mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column: cell.x,
+        row: cell.y,
+        modifiers: KeyModifiers::NONE,
+    }));
+    assert_eq!(stats_screen(&state).day, Some(today));
+    let rendered = render(&mut state, 120, 44);
+    assert!(rendered.contains(&today.format("%Y-%m-%d").to_string()));
+    assert!(rendered.contains("250 tokens"));
+    assert!(rendered.contains("Forecast"));
+    assert!(rendered.contains("Month end"));
+    assert!(rendered.contains("$4.00"));
+
+    let week = hit_area(&state, |hit| *hit == super::mouse::Hit::StatsRange(1));
+    state.reduce(click_at(week));
+    assert!(matches!(state.take_effect(), Some(Effect::QueryUsage(ref query)) if query.from > 0));
+    assert!(!stats_screen(&state).all_time);
+}
+
+fn pricing_list() -> hsin_core::ModelPriceList {
+    let price = |id: &str, source| hsin_core::ModelPrice {
+        id: id.into(),
+        model_pattern: format!("{id}-model"),
+        provider_id: None,
+        currency: "USD".into(),
+        input: 1.0,
+        cache_write: None,
+        cache_read: Some(0.1),
+        output: 5.0,
+        source,
+        updated_at: 0,
+    };
+    hsin_core::ModelPriceList {
+        prices: vec![
+            price("builtin", hsin_core::ModelPriceSource::Builtin),
+            price("mine", hsin_core::ModelPriceSource::User),
+        ],
+        remote_fetched_at: None,
+    }
+}
+
+#[test]
+fn pricing_page_adds_overrides_and_deletes_only_custom_rules() {
+    let mut state = State {
+        providers: vec![example_provider()],
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Char('o')));
+    for _ in 0..4 {
+        state.reduce(key(KeyCode::Down));
+    }
+    state.reduce(key(KeyCode::Enter));
+    assert!(matches!(state.take_effect(), Some(Effect::LoadPrices)));
+    state.reduce(Action::PricesLoaded(pricing_list()));
+    assert!(!state.loading);
+    let rendered = render(&mut state, 110, 32);
+    assert!(rendered.contains("Model pricing"));
+    assert!(rendered.contains("builtin-model"));
+
+    state.reduce(key(KeyCode::Char('d')));
+    assert_eq!(state.notice.as_deref(), Some("@pricing_user_only"));
+    state.reduce(key(KeyCode::Char('e')));
+    state.reduce(key(KeyCode::Enter));
+    let Some(Effect::SetPrice(input)) = state.take_effect() else {
+        panic!("editing a built-in rule saves an overriding custom rule");
+    };
+    assert_eq!(input.id, None);
+    assert_eq!(input.model_pattern, "builtin-model");
+    assert_eq!(input.cache_read, Some(0.1));
+    assert_eq!(input.cache_write, None);
+    state.reduce(Action::PricesLoaded(pricing_list()));
+
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Char('d')));
+    assert!(state.take_effect().is_none());
+    state.reduce(key(KeyCode::Char('d')));
+    assert!(matches!(state.take_effect(), Some(Effect::RemovePrice(ref id)) if id == "mine"));
+    state.reduce(Action::PricesLoaded(pricing_list()));
+
+    state.reduce(key(KeyCode::Char('a')));
+    for character in "local-*".chars() {
+        state.reduce(key(KeyCode::Char(character)));
+    }
+    state.reduce(key(KeyCode::Enter));
+    assert_eq!(state.notice.as_deref(), Some("@pricing_invalid"));
+    state.reduce(key(KeyCode::Down));
+    state.reduce(key(KeyCode::Right));
+    state.reduce(key(KeyCode::Down));
+    state.reduce(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    for character in "cny".chars() {
+        state.reduce(key(KeyCode::Char(character)));
+    }
+    state.reduce(key(KeyCode::Down));
+    for character in "2.5".chars() {
+        state.reduce(key(KeyCode::Char(character)));
+    }
+    for _ in 0..3 {
+        state.reduce(key(KeyCode::Down));
+    }
+    state.reduce(key(KeyCode::Char('8')));
+    state.reduce(key(KeyCode::Enter));
+    let Some(Effect::SetPrice(input)) = state.take_effect() else {
+        panic!("a complete rule is saved");
+    };
+    assert_eq!(input.model_pattern, "local-*");
+    assert_eq!(input.provider_id.as_deref(), Some("provider-1"));
+    assert_eq!(input.currency, "CNY");
+    assert!((input.input - 2.5).abs() < f64::EPSILON);
+    assert!((input.output - 8.0).abs() < f64::EPSILON);
+    state.reduce(Action::PricesLoaded(pricing_list()));
+
+    state.reduce(key(KeyCode::Char('u')));
+    assert!(matches!(state.take_effect(), Some(Effect::RefreshPrices)));
 }
 
 #[test]
@@ -4151,6 +4380,7 @@ fn mouse_events_reach_the_reducer_only_for_clicks_and_the_wheel() {
         MouseEventKind::Down(MouseButton::Left),
         MouseEventKind::ScrollUp,
         MouseEventKind::ScrollDown,
+        MouseEventKind::Moved,
     ] {
         assert!(super::event_action(&Event::Mouse(mouse(kind))).is_some());
     }
@@ -4158,7 +4388,6 @@ fn mouse_events_reach_the_reducer_only_for_clicks_and_the_wheel() {
         MouseEventKind::Up(MouseButton::Left),
         MouseEventKind::Down(MouseButton::Right),
         MouseEventKind::Drag(MouseButton::Left),
-        MouseEventKind::Moved,
     ] {
         assert!(super::event_action(&Event::Mouse(mouse(kind))).is_none());
     }

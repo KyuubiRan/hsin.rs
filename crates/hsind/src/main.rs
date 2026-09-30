@@ -14,6 +14,7 @@ mod error;
 mod model;
 mod network_proxy;
 mod paths;
+mod pricing;
 mod proxy;
 mod rpc;
 mod service;

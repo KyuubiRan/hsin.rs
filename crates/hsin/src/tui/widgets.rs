@@ -169,6 +169,10 @@ fn footer_help(state: &State, i18n: &I18n) -> String {
             SettingsPage::Language { .. } | SettingsPage::Clients { .. } => {
                 i18n.text("settings_submenu_help")
             }
+            SettingsPage::Pricing {
+                editor: Some(_), ..
+            } => i18n.text("pricing_editor_help"),
+            SettingsPage::Pricing { .. } => i18n.text("pricing_help"),
         },
         InputMode::Stats(screen) => i18n.text(if screen.filter.is_some() {
             "stats_filter_help"

@@ -19,6 +19,7 @@ use crate::{
     i18n::I18n,
     rpc::DaemonClient,
     tui, updater,
+    usage_format::format_cost,
 };
 
 pub async fn run(cli: Cli, i18n: &mut I18n) -> Result<()> {
@@ -49,6 +50,7 @@ pub async fn run(cli: Cli, i18n: &mut I18n) -> Result<()> {
             print_value(&value, cli.json)
         }
         Command::Stats(args) => run_stats(args, &client, cli.json).await,
+        Command::Pricing { command } => run_pricing(command, &client, cli.json).await,
         Command::Doctor => unreachable!("doctor handled before bootstrapping"),
         Command::Update => unreachable!("update command handled before connecting"),
         Command::Security { command } => run_security(command, &client, cli.json).await,
@@ -101,7 +103,11 @@ async fn run_stats(args: crate::cli::StatsArgs, client: &DaemonClient, json: boo
     if from_date > to_date {
         bail!("--from must not be later than --to");
     }
-    let from = local_midnight(from_date)?;
+    let from = if args.all {
+        0
+    } else {
+        local_midnight(from_date)?
+    };
     let to = local_midnight(to_date + chrono::Duration::days(1))?;
     let report: UsageStatsReport = client
         .call(
@@ -118,8 +124,18 @@ async fn run_stats(args: crate::cli::StatsArgs, client: &DaemonClient, json: boo
     if json {
         return print_json(&report);
     }
-    println!("{}  {} — {}", report.query.client, from_date, to_date);
+    let from_label = report
+        .daily
+        .first()
+        .map_or_else(|| from_date.to_string(), |day| day.date.clone());
+    println!("{}  {} — {}", report.query.client, from_label, to_date);
     println!("Total tokens: {}", report.summary.total_tokens());
+    if !report.cost.is_empty() {
+        println!("Estimated cost: {}", format_cost(&report.cost));
+    }
+    if report.unpriced_tokens > 0 {
+        println!("Tokens without a price: {}", report.unpriced_tokens);
+    }
     println!(
         "Cache hit rate: {:.2}%",
         report.summary.cache_hit_rate() * 100.0
@@ -138,24 +154,171 @@ async fn run_stats(args: crate::cli::StatsArgs, client: &DaemonClient, json: boo
         "Attribution: exact {} · inferred {} · unattributed {}",
         report.attribution.exact, report.attribution.inferred, report.attribution.unattributed
     );
+    print_highlights(&report);
+    Ok(())
+}
+
+/// The overview, forecast and per-provider and per-model totals of a stats report.
+fn print_highlights(report: &UsageStatsReport) {
+    let overview = &report.overview;
+    println!(
+        "\nActive days: {} · current streak {} · longest streak {}",
+        overview.active_days, overview.current_streak, overview.longest_streak
+    );
+    if let Some(model) = &overview.favorite_model {
+        println!("Favorite model: {model}");
+    }
+    if let Some(day) = &overview.most_active_day {
+        println!(
+            "Most active day: {} ({} tokens)",
+            day.date,
+            day.tokens.total_tokens()
+        );
+    }
+    if let Some(hour) = overview.peak_hour {
+        println!("Peak hour: {hour:02}:00");
+    }
+    match &report.forecast {
+        Some(forecast) => {
+            let projection = |projection: &hsin_core::UsageProjection| {
+                if projection.cost.is_empty() {
+                    format!("{} tokens", projection.tokens)
+                } else {
+                    format!(
+                        "{} tokens · {}",
+                        projection.tokens,
+                        format_cost(&projection.cost)
+                    )
+                }
+            };
+            println!("\nForecast (from {} days):", forecast.basis_days);
+            println!("  Month to date: {}", projection(&forecast.month_to_date));
+            println!("  Month end: {}", projection(&forecast.month_end));
+            println!("  Next 30 days: {}", projection(&forecast.next_30_days));
+            println!("  Daily average: {}", projection(&forecast.daily_average));
+        }
+        None => println!("\nForecast: not enough history yet"),
+    }
+    let cost = |costs: &[hsin_core::UsageCost]| {
+        if costs.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", format_cost(costs))
+        }
+    };
     if !report.providers.is_empty() {
         println!("\nProviders:");
         for provider in &report.providers {
             println!(
-                "  {}{}  {} tokens",
+                "  {}{}  {} tokens{}",
                 if provider.inferred { "~" } else { "" },
                 provider.provider_name,
-                provider.tokens.total_tokens()
+                provider.tokens.total_tokens(),
+                cost(&provider.cost)
             );
         }
     }
     if !report.models.is_empty() {
         println!("\nModels:");
         for model in &report.models {
-            println!("  {}  {} tokens", model.model, model.tokens.total_tokens());
+            println!(
+                "  {}  {} tokens{}",
+                model.model,
+                model.tokens.total_tokens(),
+                cost(&model.cost)
+            );
         }
     }
-    Ok(())
+}
+
+async fn run_pricing(
+    command: crate::cli::PricingCommand,
+    client: &DaemonClient,
+    json: bool,
+) -> Result<()> {
+    use crate::cli::PricingCommand;
+    use hsin_core::{ModelPriceInput, ModelPriceList, PricingRefreshResult};
+    use hsin_ipc::method;
+
+    match command {
+        PricingCommand::List => {
+            let list: ModelPriceList = client.call(method::PRICING_LIST, &json!({})).await?;
+            if json {
+                return print_json(&list);
+            }
+            for price in &list.prices {
+                let optional = |value: Option<f64>| {
+                    value.map_or_else(|| "=input".into(), |value| value.to_string())
+                };
+                println!(
+                    "{}  [{}]  {} {}/{}  cache {}/{}{}  ({})",
+                    price.model_pattern,
+                    price.source.as_str(),
+                    price.currency,
+                    price.input,
+                    price.output,
+                    optional(price.cache_write),
+                    optional(price.cache_read),
+                    price
+                        .provider_id
+                        .as_deref()
+                        .map(|id| format!("  provider {id}"))
+                        .unwrap_or_default(),
+                    price.id
+                );
+            }
+            Ok(())
+        }
+        PricingCommand::Set {
+            pattern,
+            input,
+            output,
+            cache_write,
+            cache_read,
+            currency,
+            provider,
+            id,
+        } => {
+            let price: hsin_core::ModelPrice = client
+                .call(
+                    method::PRICING_SET,
+                    &ModelPriceInput {
+                        id,
+                        model_pattern: pattern,
+                        provider_id: provider,
+                        currency: currency.to_ascii_uppercase(),
+                        input,
+                        cache_write,
+                        cache_read,
+                        output,
+                    },
+                )
+                .await?;
+            if json {
+                return print_json(&price);
+            }
+            println!("{}", price.id);
+            Ok(())
+        }
+        PricingCommand::Remove { id } => {
+            let list: ModelPriceList = client
+                .call(method::PRICING_REMOVE, &json!({ "id": id }))
+                .await?;
+            if json {
+                return print_json(&list);
+            }
+            Ok(())
+        }
+        PricingCommand::Refresh => {
+            let result: PricingRefreshResult =
+                client.call(method::PRICING_REFRESH, &json!({})).await?;
+            if json {
+                return print_json(&result);
+            }
+            println!("{} prices imported", result.imported);
+            Ok(())
+        }
+    }
 }
 
 fn parse_date(value: &str) -> Result<NaiveDate> {

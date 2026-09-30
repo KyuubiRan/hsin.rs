@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use hsin_core::{
-    ClientKind, ImportCurrentParams, ModeSetParams, ModelDiscoverParams, PROTOCOL_VERSION,
-    ProviderListParams, SettingsPatch, UsageStatsQuery, VERSION_CODE,
+    ClientKind, ImportCurrentParams, ModeSetParams, ModelDiscoverParams, ModelPriceInput,
+    PROTOCOL_VERSION, ProviderListParams, SettingsPatch, UsageStatsQuery, VERSION_CODE,
 };
 use hsin_ipc::{
     HelloParams, HelloResult, IpcListener, JsonRpcRequest, JsonRpcResponse, RpcError, capability,
@@ -108,6 +108,7 @@ async fn serve_connection(
                         capability::MODEL_DISCOVERY.into(),
                         capability::CODEX_IMAGE.into(),
                         capability::USAGE_STATS.into(),
+                        capability::USAGE_PRICING.into(),
                         capability::CONTEXT_PRESETS.into(),
                         capability::PLAN_MODE_REASONING.into(),
                     ],
@@ -198,6 +199,19 @@ async fn dispatch(
         method::STATS_QUERY => {
             call!(async { app.query_usage(parse::<UsageStatsQuery>(params)?).await }.await)
         }
+        method::PRICING_LIST => call!(app.list_prices()),
+        method::PRICING_SET => {
+            call!(async { app.set_price(parse::<ModelPriceInput>(params)?).await }.await)
+        }
+        method::PRICING_REMOVE => call!(
+            async {
+                let params: PriceRemoveParams = parse(params)?;
+                app.remove_price(&params.id).await?;
+                app.list_prices()
+            }
+            .await
+        ),
+        method::PRICING_REFRESH => call!(app.refresh_prices().await),
         method::DOCTOR => call!(app.doctor()),
         method::SETTINGS_GET => call!(app.settings()),
         method::SETTINGS_SET => {
@@ -250,6 +264,10 @@ async fn dispatch(
 #[derive(serde::Deserialize)]
 struct RecoveryKeyParams {
     recovery_key: String,
+}
+#[derive(serde::Deserialize)]
+struct PriceRemoveParams {
+    id: String,
 }
 #[derive(serde::Deserialize)]
 struct CredentialParams {

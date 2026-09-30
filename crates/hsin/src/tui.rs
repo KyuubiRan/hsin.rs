@@ -79,8 +79,8 @@ pub async fn run(client: DaemonClient, i18n: &mut I18n, follow_saved_language: b
 /// split auto-repeat out as its own kind, so ignoring it froze backspace and the arrow keys under
 /// a long press while letters — which still arrive as plain text presses — kept repeating.
 ///
-/// Only left clicks and the wheel reach the reducer; drags, releases and motion would redraw the
-/// screen for nothing.
+/// Only left clicks, the wheel and plain motion reach the reducer; motion previews heatmap days,
+/// while drags and releases would redraw the screen for nothing.
 fn event_action(event: &Event) -> Option<Action> {
     match event {
         Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
@@ -92,6 +92,7 @@ fn event_action(event: &Event) -> Option<Action> {
                 MouseEventKind::Down(MouseButton::Left)
                     | MouseEventKind::ScrollUp
                     | MouseEventKind::ScrollDown
+                    | MouseEventKind::Moved
             ) =>
         {
             Some(Action::Mouse(*mouse))

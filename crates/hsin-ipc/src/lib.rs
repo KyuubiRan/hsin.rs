@@ -65,6 +65,10 @@ pub mod method {
     pub const CREDENTIAL_RESOLVE: &str = "credential.resolve";
     pub const STATS_SYNC: &str = "stats.sync";
     pub const STATS_QUERY: &str = "stats.query";
+    pub const PRICING_LIST: &str = "pricing.list";
+    pub const PRICING_SET: &str = "pricing.set";
+    pub const PRICING_REMOVE: &str = "pricing.remove";
+    pub const PRICING_REFRESH: &str = "pricing.refresh";
     pub const DAEMON_SHUTDOWN: &str = "daemon.shutdown";
 }
 
@@ -77,6 +81,7 @@ pub mod capability {
     pub const MODEL_DISCOVERY: &str = "model_discovery.v1";
     pub const CODEX_IMAGE: &str = "codex_image.v1";
     pub const USAGE_STATS: &str = "usage_stats.v1";
+    pub const USAGE_PRICING: &str = "usage_pricing.v1";
     pub const CONTEXT_PRESETS: &str = "context_presets.v1";
     pub const PLAN_MODE_REASONING: &str = "plan_mode_reasoning.v1";
 }

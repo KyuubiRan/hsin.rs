@@ -1,22 +1,51 @@
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
+use chrono::{Datelike, Duration, Local, NaiveDate};
+use hsin_core::{UsageCalendarDay, UsageProjection, UsageStatsReport};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Sparkline, Wrap},
 };
 
-use crate::i18n::I18n;
+use crate::{
+    i18n::I18n,
+    usage_format::{compact_tokens as compact, format_cost},
+};
 
 use super::super::{
     mouse::{ENTER, Hit, HitMap, plain},
-    state::{StatsFilter, StatsPage, StatsScreen},
+    state::{
+        STATS_RANGE_CHIPS, STATS_TIME_CUSTOM, StatsFilter, StatsPage, StatsScreen,
+        current_time_preset,
+    },
     theme::{INPUT_BG, MUTED, RED, WHITE},
     widgets::{centered_fixed, display_width, draw_input_field},
 };
+
+/// Heatmap intensities from idle to busiest.
+const HEAT: [Color; 5] = [
+    Color::Rgb(48, 48, 56),
+    Color::Rgb(96, 38, 45),
+    Color::Rgb(140, 45, 54),
+    Color::Rgb(180, 52, 62),
+    RED,
+];
+const HEAT_LABEL_WIDTH: u16 = 4;
+const HEATMAP_HEIGHT: u16 = 9;
+const MAX_WEEKS: u16 = 53;
+
+/// Labels of the time popup, in the order of its presets.
+const TIME_LABELS: [&str; 6] = [
+    "stats_today",
+    "stats_last_7",
+    "stats_last_30",
+    "stats_last_90",
+    "stats_all_time",
+    "stats_custom",
+];
 
 pub(super) fn draw_stats(
     frame: &mut Frame<'_>,
@@ -34,32 +63,8 @@ pub(super) fn draw_stats(
             Constraint::Min(5),
         ])
         .split(area);
-    let pages = [
-        ('1', i18n.text("stats_overview"), StatsPage::Overview),
-        ('2', i18n.text("stats_models"), StatsPage::Models),
-    ];
-    let mut spans = Vec::new();
-    let mut x = rows[0].x;
-    for (key, label, page) in pages {
-        if !spans.is_empty() {
-            spans.push(Span::raw("  "));
-            x = x.saturating_add(2);
-        }
-        let span = tab(&format!("{key} {label}"), screen.page == page);
-        let width = u16::try_from(span.width()).unwrap_or(u16::MAX);
-        hits.key(
-            Rect {
-                x,
-                y: rows[0].y,
-                width: width.min(rows[0].right().saturating_sub(x)),
-                height: 1,
-            },
-            plain(crossterm::event::KeyCode::Char(key)),
-        );
-        x = x.saturating_add(width);
-        spans.push(span);
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), rows[0]);
+    let tabs_width = draw_tabs(frame, rows[0], screen, i18n, hits);
+    draw_range_chips(frame, rows[0], tabs_width, screen, i18n, hits);
     let provider_label = screen.provider_id.as_ref().map_or_else(
         || i18n.text("stats_all").to_owned(),
         |id| {
@@ -85,10 +90,13 @@ pub(super) fn draw_stats(
                 )
         },
     );
+    let range = if screen.all_time {
+        i18n.text("stats_all_time").to_owned()
+    } else {
+        format!("{} — {}", screen.from, screen.to)
+    };
     let filters = format!(
-        "{} — {}  ·  {}: {}  ·  {}: {}{}",
-        screen.from,
-        screen.to,
+        "{range}  ·  {}: {}  ·  {}: {}{}",
         i18n.text("stats_provider"),
         provider_label,
         i18n.text("stats_model"),
@@ -104,7 +112,7 @@ pub(super) fn draw_stats(
     );
     match (&screen.report, screen.page) {
         (Some(report), StatsPage::Overview) => {
-            draw_overview(frame, rows[2], report, screen.scroll, i18n);
+            draw_overview(frame, rows[2], screen, report, i18n, hits);
         }
         (Some(report), StatsPage::Models) => {
             draw_models(frame, rows[2], report, screen.scroll, i18n);
@@ -120,96 +128,414 @@ pub(super) fn draw_stats(
     }
 }
 
+/// The page tabs; returns the width they take.
+fn draw_tabs(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    screen: &StatsScreen,
+    i18n: &I18n,
+    hits: &mut HitMap,
+) -> u16 {
+    let pages = [
+        ('1', i18n.text("stats_overview"), StatsPage::Overview),
+        ('2', i18n.text("stats_models"), StatsPage::Models),
+    ];
+    let mut spans = Vec::new();
+    let mut x = area.x;
+    for (key, label, page) in pages {
+        if !spans.is_empty() {
+            spans.push(Span::raw("  "));
+            x = x.saturating_add(2);
+        }
+        let span = tab(&format!("{key} {label}"), screen.page == page);
+        let width = u16::try_from(span.width()).unwrap_or(u16::MAX);
+        hits.key(
+            Rect {
+                x,
+                y: area.y,
+                width: width.min(area.right().saturating_sub(x)),
+                height: 1,
+            },
+            plain(crossterm::event::KeyCode::Char(key)),
+        );
+        x = x.saturating_add(width);
+        spans.push(span);
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    x.saturating_sub(area.x)
+}
+
+/// All time · 7 days · 30 days, right-aligned beside the tabs when they fit.
+fn draw_range_chips(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    tabs_width: u16,
+    screen: &StatsScreen,
+    i18n: &I18n,
+    hits: &mut HitMap,
+) {
+    let current = current_time_preset(screen);
+    let chips = STATS_RANGE_CHIPS
+        .iter()
+        .map(|preset| {
+            (
+                *preset,
+                tab(i18n.text(TIME_LABELS[*preset]), current == *preset),
+            )
+        })
+        .collect::<Vec<_>>();
+    let width = chips
+        .iter()
+        .map(|(_, span)| u16::try_from(span.width()).unwrap_or(u16::MAX))
+        .sum::<u16>()
+        .saturating_add(u16::try_from(chips.len().saturating_sub(1)).unwrap_or(0));
+    if tabs_width.saturating_add(width).saturating_add(2) > area.width {
+        return;
+    }
+    let start = area.right().saturating_sub(width);
+    let mut x = start;
+    let mut spans = Vec::new();
+    for (preset, span) in chips {
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+            x = x.saturating_add(1);
+        }
+        let chip_width = u16::try_from(span.width()).unwrap_or(u16::MAX);
+        hits.push(
+            Rect {
+                x,
+                y: area.y,
+                width: chip_width,
+                height: 1,
+            },
+            Hit::StatsRange(preset),
+        );
+        x = x.saturating_add(chip_width);
+        spans.push(span);
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect {
+            x: start,
+            y: area.y,
+            width,
+            height: 1,
+        },
+    );
+}
+
 fn draw_overview(
     frame: &mut Frame<'_>,
     area: Rect,
-    report: &hsin_core::UsageStatsReport,
-    scroll: u16,
+    screen: &StatsScreen,
+    report: &UsageStatsReport,
     i18n: &I18n,
+    hits: &mut HitMap,
 ) {
-    if area.height < 14 || area.width < 56 {
-        draw_summary(frame, area, report, scroll, i18n);
+    if area.height < 16 || area.width < 56 {
+        draw_summary(frame, area, report, screen.scroll, i18n);
         return;
     }
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(9), Constraint::Min(5)])
+        .constraints([
+            Constraint::Length(HEATMAP_HEIGHT),
+            Constraint::Length(2),
+            Constraint::Min(4),
+        ])
         .split(area);
-    draw_heatmap(frame, rows[0], report, i18n);
-    draw_summary(frame, rows[1], report, scroll, i18n);
+    draw_heatmap(frame, rows[0], report, screen.day, i18n, hits);
+    draw_day_detail(frame, rows[1], report, screen.day, i18n);
+    draw_summary(frame, rows[2], report, screen.scroll, i18n);
 }
 
+/// A contribution-style calendar: one column per week ending with the current one, one row per
+/// weekday, as many weeks as fit up to a year.
+#[allow(clippy::too_many_lines)]
 fn draw_heatmap(
     frame: &mut Frame<'_>,
     area: Rect,
-    report: &hsin_core::UsageStatsReport,
+    report: &UsageStatsReport,
+    selected: Option<NaiveDate>,
     i18n: &I18n,
+    hits: &mut HitMap,
 ) {
-    let daily = report
-        .daily
-        .iter()
-        .map(|bucket| (bucket.date.as_str(), bucket.tokens.total_tokens()))
-        .collect::<BTreeMap<_, _>>();
-    let Some(from) = local_date(report.query.from) else {
+    let days = calendar_days(&report.calendar);
+    let today = days
+        .keys()
+        .next_back()
+        .copied()
+        .unwrap_or_else(|| Local::now().date_naive());
+    let weeks = (area.width.saturating_sub(HEAT_LABEL_WIDTH) / 2).min(MAX_WEEKS);
+    if weeks == 0 || area.height < HEATMAP_HEIGHT {
         return;
-    };
-    let Some(to) = local_date(report.query.to.saturating_sub(1)) else {
-        return;
-    };
-    let start = from - chrono::Duration::days(i64::from(from.weekday().num_days_from_monday()));
-    let max = daily.values().copied().max().unwrap_or(0);
-    let weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-    let mut lines = Vec::new();
-    for (weekday, label) in weekdays.iter().enumerate() {
-        let mut spans = vec![Span::styled(
-            format!("{label} "),
-            Style::default().fg(MUTED),
-        )];
-        let mut day = start + chrono::Duration::days(i64::try_from(weekday).unwrap_or(0));
-        while day <= to {
-            if day < from {
-                spans.push(Span::raw("  "));
-            } else {
-                let key = day.format("%Y-%m-%d").to_string();
-                let value = daily.get(key.as_str()).copied().unwrap_or(0);
-                let color = heat_color(value, max);
-                spans.push(Span::styled("■ ", Style::default().fg(color)));
-            }
-            day += chrono::Duration::days(7);
+    }
+    let this_monday = today - Duration::days(i64::from(today.weekday().num_days_from_monday()));
+    let start = this_monday - Duration::weeks(i64::from(weeks) - 1);
+    let thresholds = heat_thresholds(
+        days.iter()
+            .filter(|(date, _)| **date >= start && **date <= today)
+            .map(|(_, day)| day.total_tokens),
+    );
+
+    let title = i18n.text("stats_activity");
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            title,
+            Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+        ))),
+        Rect { height: 1, ..area },
+    );
+    let mut legend = vec![Span::styled(
+        format!("{} ", i18n.text("stats_less")),
+        Style::default().fg(MUTED),
+    )];
+    legend.extend(
+        HEAT.iter()
+            .map(|color| Span::styled("■ ", Style::default().fg(*color))),
+    );
+    legend.push(Span::styled(
+        i18n.text("stats_more"),
+        Style::default().fg(MUTED),
+    ));
+    let legend = Line::from(legend);
+    let legend_width = u16::try_from(legend.width()).unwrap_or(u16::MAX);
+    if legend_width.saturating_add(display_width_u16(title) + 2) <= area.width {
+        frame.render_widget(
+            Paragraph::new(legend),
+            Rect {
+                x: area.right().saturating_sub(legend_width),
+                y: area.y,
+                width: legend_width,
+                height: 1,
+            },
+        );
+    }
+
+    let grid_x = area.x + HEAT_LABEL_WIDTH;
+    let months = i18n.text("stats_months").split(',').collect::<Vec<_>>();
+    let mut month_line = String::new();
+    for week in 0..weeks {
+        let monday = start + Duration::weeks(i64::from(week));
+        let first = week == 0 || (monday - Duration::weeks(1)).month() != monday.month();
+        let column = usize::from(week) * 2;
+        let used = display_width(&month_line);
+        if first && (used == 0 || used < column) {
+            let label = usize::try_from(monday.month0())
+                .ok()
+                .and_then(|month| months.get(month))
+                .copied()
+                .unwrap_or_default();
+            month_line.push_str(&" ".repeat(column.saturating_sub(used)));
+            month_line.push_str(label);
         }
-        lines.push(Line::from(spans));
     }
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .title(i18n.text("stats_daily_tokens"))
-                .borders(Borders::BOTTOM),
-        ),
-        area,
+        Paragraph::new(month_line).style(Style::default().fg(MUTED)),
+        Rect {
+            x: grid_x,
+            y: area.y + 1,
+            width: area.width.saturating_sub(HEAT_LABEL_WIDTH),
+            height: 1,
+        },
     );
+
+    let weekdays = i18n.text("stats_weekdays").split(',').collect::<Vec<_>>();
+    for weekday in 0..7_u16 {
+        let y = area.y + 2 + weekday;
+        let label = weekdays
+            .get(usize::from(weekday))
+            .copied()
+            .unwrap_or_default();
+        let mut spans = vec![Span::styled(
+            format!(
+                "{label}{}",
+                " ".repeat(usize::from(HEAT_LABEL_WIDTH).saturating_sub(display_width(label)))
+            ),
+            Style::default().fg(MUTED),
+        )];
+        for week in 0..weeks {
+            let date = start + Duration::days(i64::from(week) * 7 + i64::from(weekday));
+            if date > today {
+                spans.push(Span::raw("  "));
+                continue;
+            }
+            let tokens = days.get(&date).map_or(0, |day| day.total_tokens);
+            let mut style = Style::default().fg(HEAT[heat_level(tokens, &thresholds)]);
+            if selected == Some(date) {
+                style = style.bg(Color::Rgb(78, 78, 88));
+            }
+            spans.push(Span::styled("■", style));
+            spans.push(Span::raw(" "));
+            hits.push(
+                Rect {
+                    x: grid_x + week * 2,
+                    y,
+                    width: 2,
+                    height: 1,
+                },
+                Hit::HeatDay(date),
+            );
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            },
+        );
+    }
 }
 
+fn draw_day_detail(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    report: &UsageStatsReport,
+    selected: Option<NaiveDate>,
+    i18n: &I18n,
+) {
+    let date = selected.map(|date| date.format("%Y-%m-%d").to_string());
+    let day = date
+        .as_ref()
+        .and_then(|date| report.calendar.iter().find(|day| &day.date == date));
+    let line = match (date, day) {
+        (Some(date), Some(day)) => {
+            let mut spans = vec![
+                Span::styled(
+                    date,
+                    Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "  {} {}  ·  {} {}",
+                        compact(day.total_tokens),
+                        i18n.text("stats_tokens"),
+                        day.request_count,
+                        i18n.text("stats_requests_unit")
+                    ),
+                    Style::default().fg(WHITE),
+                ),
+            ];
+            if !day.cost.is_empty() {
+                spans.push(Span::styled(
+                    format!("  ·  ≈{}", format_cost(&day.cost)),
+                    Style::default().fg(RED),
+                ));
+            }
+            Line::from(spans)
+        }
+        (Some(date), None) => Line::from(Span::styled(date, Style::default().fg(MUTED))),
+        (None, _) => Line::from(Span::styled(
+            i18n.text("stats_day_hint"),
+            Style::default().fg(MUTED),
+        )),
+    };
+    frame.render_widget(Paragraph::new(line), Rect { height: 1, ..area });
+}
+
+#[allow(clippy::too_many_lines)]
 fn draw_summary(
     frame: &mut Frame<'_>,
     area: Rect,
-    report: &hsin_core::UsageStatsReport,
+    report: &UsageStatsReport,
     scroll: u16,
     i18n: &I18n,
 ) {
     let tokens = &report.summary;
-    let mut lines = vec![
-        Line::from(vec![
-            metric(i18n.text("stats_total_tokens"), tokens.total_tokens()),
-            Span::raw("   "),
+    let overview = &report.overview;
+    let none = || "—".to_owned();
+    let days = |count: u64| format!("{count} {}", i18n.text("stats_days_unit"));
+    let cells = [
+        (
+            i18n.text("stats_favorite_model"),
+            overview.favorite_model.clone().unwrap_or_else(none),
+        ),
+        (
+            i18n.text("stats_total_tokens"),
+            compact(tokens.total_tokens()),
+        ),
+        (i18n.text("stats_active_days"), days(overview.active_days)),
+        (
+            i18n.text("stats_most_active_day"),
+            overview.most_active_day.as_ref().map_or_else(none, |day| {
+                format!("{} · {}", day.date, compact(day.tokens.total_tokens()))
+            }),
+        ),
+        (
+            i18n.text("stats_current_streak"),
+            days(overview.current_streak),
+        ),
+        (
+            i18n.text("stats_longest_streak"),
+            days(overview.longest_streak),
+        ),
+        (
+            i18n.text("stats_peak_hour"),
+            overview
+                .peak_hour
+                .map_or_else(none, |hour| format!("{hour:02}:00")),
+        ),
+        (
+            i18n.text("stats_hit_rate"),
+            format!("{:.1}%", tokens.cache_hit_rate() * 100.0),
+        ),
+        (
+            i18n.text("stats_requests"),
+            tokens.request_count.to_string(),
+        ),
+        (
+            i18n.text("stats_cost"),
+            if report.cost.is_empty() {
+                none()
+            } else {
+                format!("≈{}", format_cost(&report.cost))
+            },
+        ),
+    ];
+    let cell = |label: &str, value: &str| {
+        vec![
+            Span::styled(format!("{label}  "), Style::default().fg(MUTED)),
             Span::styled(
-                format!(
-                    "{} {:.1}%",
-                    i18n.text("stats_hit_rate"),
-                    tokens.cache_hit_rate() * 100.0
-                ),
-                Style::default().fg(WHITE),
+                value.to_owned(),
+                Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
             ),
-        ]),
+        ]
+    };
+    let mut lines = Vec::new();
+    if area.width >= 60 {
+        let column = usize::from(area.width / 2);
+        for pair in cells.chunks(2) {
+            let mut spans = cell(pair[0].0, &pair[0].1);
+            let used = display_width(pair[0].0) + 2 + display_width(&pair[0].1);
+            spans.push(Span::raw(" ".repeat(column.saturating_sub(used).max(2))));
+            if let Some((label, value)) = pair.get(1) {
+                spans.extend(cell(label, value));
+            }
+            lines.push(Line::from(spans));
+        }
+    } else {
+        lines.extend(
+            cells
+                .iter()
+                .map(|(label, value)| Line::from(cell(label, value))),
+        );
+    }
+    if report.unpriced_tokens > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} {}",
+                i18n.text("stats_unpriced"),
+                compact(report.unpriced_tokens)
+            ),
+            Style::default().fg(MUTED),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.extend(forecast_lines(report, i18n));
+    let mut details = vec![
+        Line::from(""),
         Line::from(format!(
             "{} {}  ·  {} {}  ·  {} {}",
             i18n.text("stats_hit"),
@@ -247,14 +573,42 @@ fn draw_summary(
             Style::default().fg(MUTED),
         )),
     ];
-    lines.extend(report.providers.iter().take(4).map(|provider| {
+    details.extend(report.providers.iter().take(4).map(|provider| {
+        let cost = if provider.cost.is_empty() {
+            String::new()
+        } else {
+            format!("  ≈{}", format_cost(&provider.cost))
+        };
         Line::from(format!(
-            "{}{}  {}",
+            "{}{}  {}{cost}",
             if provider.inferred { "~" } else { "" },
             provider.provider_name,
             compact(provider.tokens.total_tokens())
         ))
     }));
+    // A narrow terminal leads with the token breakdown, which the grid only summarizes.
+    if area.width < 60 {
+        details.remove(0);
+        details.insert(
+            0,
+            Line::from(vec![
+                metric(i18n.text("stats_total_tokens"), tokens.total_tokens()),
+                Span::styled(
+                    format!(
+                        "   {} {:.1}%",
+                        i18n.text("stats_hit_rate"),
+                        tokens.cache_hit_rate() * 100.0
+                    ),
+                    Style::default().fg(WHITE),
+                ),
+            ]),
+        );
+        details.push(Line::from(""));
+        details.append(&mut lines);
+        lines = details;
+    } else {
+        lines.append(&mut details);
+    }
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: true })
@@ -263,10 +617,78 @@ fn draw_summary(
     );
 }
 
+fn metric(label: &str, value: u64) -> Span<'static> {
+    Span::styled(
+        format!("{label} {}", compact(value)),
+        Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+    )
+}
+
+fn forecast_lines(report: &UsageStatsReport, i18n: &I18n) -> Vec<Line<'static>> {
+    let Some(forecast) = &report.forecast else {
+        return vec![Line::from(Span::styled(
+            i18n.text("stats_forecast_unavailable").to_owned(),
+            Style::default().fg(MUTED),
+        ))];
+    };
+    let projection = |projection: &UsageProjection| {
+        if projection.cost.is_empty() {
+            compact(projection.tokens)
+        } else {
+            format!(
+                "{} · ≈{}",
+                compact(projection.tokens),
+                format_cost(&projection.cost)
+            )
+        }
+    };
+    let label =
+        |key: &str| Span::styled(format!("{}  ", i18n.text(key)), Style::default().fg(MUTED));
+    let value = |text: String| {
+        Span::styled(
+            text,
+            Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+        )
+    };
+    vec![
+        Line::from(vec![
+            Span::styled(
+                i18n.text("stats_forecast").to_owned(),
+                Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "  {}",
+                    i18n.text("stats_forecast_basis")
+                        .replace("{days}", &forecast.basis_days.to_string())
+                ),
+                Style::default().fg(MUTED),
+            ),
+        ]),
+        Line::from(vec![
+            label("stats_month_to_date"),
+            value(projection(&forecast.month_to_date)),
+            Span::styled("  →  ", Style::default().fg(MUTED)),
+            label("stats_month_end"),
+            Span::styled(
+                projection(&forecast.month_end),
+                Style::default().fg(RED).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            label("stats_next_30_days"),
+            value(projection(&forecast.next_30_days)),
+            Span::raw("   "),
+            label("stats_daily_average"),
+            value(projection(&forecast.daily_average)),
+        ]),
+    ]
+}
+
 fn draw_models(
     frame: &mut Frame<'_>,
     area: Rect,
-    report: &hsin_core::UsageStatsReport,
+    report: &UsageStatsReport,
     scroll: u16,
     i18n: &I18n,
 ) {
@@ -355,15 +777,15 @@ fn draw_filter(
     i18n: &I18n,
     hits: &mut HitMap,
 ) {
-    let popup = centered_fixed(
-        area,
-        58,
-        if matches!(filter, StatsFilter::Time { selected: 4, .. }) {
-            11
-        } else {
-            10
-        },
-    );
+    let custom =
+        matches!(filter, StatsFilter::Time { selected, .. } if *selected == STATS_TIME_CUSTOM);
+    let height = match filter {
+        StatsFilter::Time { .. } => {
+            u16::try_from(TIME_LABELS.len()).unwrap_or(6) + 2 + if custom { 4 } else { 0 }
+        }
+        _ => 10,
+    };
+    let popup = centered_fixed(area, 58, height);
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Block::default()
@@ -383,91 +805,13 @@ fn draw_filter(
         width: popup.width.saturating_sub(2),
         height: popup.height.saturating_sub(2),
     };
+    let mut items = Vec::new();
     match filter {
-        StatsFilter::Time {
-            selected,
-            custom_field,
-            cursor,
-        } => {
-            let labels = [
-                i18n.text("stats_today"),
-                i18n.text("stats_last_7"),
-                i18n.text("stats_last_30"),
-                i18n.text("stats_last_90"),
-                i18n.text("stats_custom"),
-            ];
-            let mut x = inner.x;
-            for (index, label) in labels.iter().enumerate() {
-                let width = u16::try_from(display_width(label) + 2).unwrap_or(u16::MAX);
-                hits.push(
-                    Rect {
-                        x,
-                        y: inner.y,
-                        width: width.min(inner.right().saturating_sub(x)),
-                        height: 1,
-                    },
-                    Hit::Row {
-                        index,
-                        selected: *selected,
-                        activate: ENTER,
-                    },
-                );
-                x = x.saturating_add(width + 1);
-            }
-            let line = Line::from(
-                labels
-                    .iter()
-                    .enumerate()
-                    .flat_map(|(index, label)| {
-                        [
-                            Span::styled(
-                                format!(" {label} "),
-                                if index == *selected {
-                                    Style::default()
-                                        .fg(WHITE)
-                                        .bg(RED)
-                                        .add_modifier(Modifier::BOLD)
-                                } else {
-                                    Style::default().fg(MUTED)
-                                },
-                            ),
-                            Span::raw(" "),
-                        ]
-                    })
-                    .collect::<Vec<_>>(),
-            );
-            frame.render_widget(Paragraph::new(line), Rect { height: 1, ..inner });
-            if *selected == 4 {
-                let fields = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                    .split(Rect {
-                        y: inner.y + 2,
-                        height: 3,
-                        ..inner
-                    });
-                draw_input_field(
-                    frame,
-                    fields[0],
-                    i18n.text("stats_from"),
-                    &screen.from,
-                    Some("YYYY-MM-DD"),
-                    (*custom_field == 0).then_some(*cursor),
-                    true,
-                );
-                draw_input_field(
-                    frame,
-                    fields[1],
-                    i18n.text("stats_to"),
-                    &screen.to,
-                    Some("YYYY-MM-DD"),
-                    (*custom_field == 1).then_some(*cursor),
-                    true,
-                );
-            }
+        StatsFilter::Time { .. } => {
+            items.extend(TIME_LABELS.iter().map(|key| ListItem::new(i18n.text(key))));
         }
-        StatsFilter::Provider { selected } => {
-            let mut items = vec![ListItem::new(i18n.text("stats_all"))];
+        StatsFilter::Provider { .. } => {
+            items.push(ListItem::new(i18n.text("stats_all")));
             if let Some(report) = &screen.report {
                 items.extend(report.filters.providers.iter().map(|provider| {
                     ListItem::new(format!(
@@ -477,30 +821,109 @@ fn draw_filter(
                     ))
                 }));
             }
-            let item_count = items.len();
-            let mut state = ListState::default().with_selected(Some(*selected));
-            frame.render_stateful_widget(
-                List::new(items).highlight_style(Style::default().fg(WHITE).bg(RED)),
-                inner,
-                &mut state,
-            );
-            hits.list(inner, &state, (0..item_count).map(|_| 1), ENTER);
         }
-        StatsFilter::Model { selected } => {
-            let mut items = vec![ListItem::new(i18n.text("stats_all"))];
+        StatsFilter::Model { .. } => {
+            items.push(ListItem::new(i18n.text("stats_all")));
             if let Some(report) = &screen.report {
                 items.extend(report.filters.models.iter().cloned().map(ListItem::new));
             }
-            let item_count = items.len();
-            let mut state = ListState::default().with_selected(Some(*selected));
-            frame.render_stateful_widget(
-                List::new(items).highlight_style(Style::default().fg(WHITE).bg(RED)),
-                inner,
-                &mut state,
-            );
-            hits.list(inner, &state, (0..item_count).map(|_| 1), ENTER);
         }
     }
+    let selected = match filter {
+        StatsFilter::Time { selected, .. }
+        | StatsFilter::Provider { selected }
+        | StatsFilter::Model { selected } => *selected,
+    };
+    let item_count = items.len();
+    let list_area = Rect {
+        height: if custom {
+            u16::try_from(item_count)
+                .unwrap_or(u16::MAX)
+                .min(inner.height)
+        } else {
+            inner.height
+        },
+        ..inner
+    };
+    let mut state = ListState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(
+        List::new(items).highlight_style(Style::default().fg(WHITE).bg(RED)),
+        list_area,
+        &mut state,
+    );
+    hits.list(list_area, &state, (0..item_count).map(|_| 1), ENTER);
+    if let StatsFilter::Time {
+        custom_field,
+        cursor,
+        ..
+    } = filter
+        && custom
+    {
+        let fields = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(Rect {
+                y: list_area.bottom() + 1,
+                height: 3,
+                ..inner
+            });
+        draw_input_field(
+            frame,
+            fields[0],
+            i18n.text("stats_from"),
+            &screen.from,
+            Some("YYYY-MM-DD"),
+            (*custom_field == 0).then_some(*cursor),
+            true,
+        );
+        draw_input_field(
+            frame,
+            fields[1],
+            i18n.text("stats_to"),
+            &screen.to,
+            Some("YYYY-MM-DD"),
+            (*custom_field == 1).then_some(*cursor),
+            true,
+        );
+    }
+}
+
+fn calendar_days(calendar: &[UsageCalendarDay]) -> BTreeMap<NaiveDate, &UsageCalendarDay> {
+    calendar
+        .iter()
+        .filter_map(|day| {
+            NaiveDate::parse_from_str(&day.date, "%Y-%m-%d")
+                .ok()
+                .map(|date| (date, day))
+        })
+        .collect()
+}
+
+/// Quartiles of the active days, so the colours follow the user's own spread rather than one
+/// outlier day.
+fn heat_thresholds(values: impl Iterator<Item = u64>) -> [u64; 3] {
+    let mut active = values.filter(|value| *value > 0).collect::<Vec<_>>();
+    if active.is_empty() {
+        return [0; 3];
+    }
+    active.sort_unstable();
+    let last = active.len() - 1;
+    [1, 2, 3].map(|quarter| active[last * quarter / 4])
+}
+
+fn heat_level(tokens: u64, thresholds: &[u64; 3]) -> usize {
+    if tokens == 0 {
+        0
+    } else {
+        1 + thresholds
+            .iter()
+            .filter(|threshold| tokens > **threshold)
+            .count()
+    }
+}
+
+fn display_width_u16(value: &str) -> u16 {
+    u16::try_from(display_width(value)).unwrap_or(u16::MAX)
 }
 
 fn tab(label: &str, selected: bool) -> Span<'static> {
@@ -517,16 +940,14 @@ fn tab(label: &str, selected: bool) -> Span<'static> {
     )
 }
 
-fn metric(label: &str, value: u64) -> Span<'static> {
-    Span::styled(
-        format!("{label} {}", compact(value)),
-        Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
-    )
-}
-
 fn model_line(model: &hsin_core::UsageModelBreakdown, i18n: &I18n) -> Line<'static> {
+    let cost = if model.cost.is_empty() {
+        String::new()
+    } else {
+        format!(" · ≈{}", format_cost(&model.cost))
+    };
     Line::from(format!(
-        "{}  {} · {} {} · {} {} · {} {}",
+        "{}  {} · {} {} · {} {} · {} {}{cost}",
         model.model,
         compact(model.tokens.total_tokens()),
         i18n.text("stats_input"),
@@ -538,32 +959,18 @@ fn model_line(model: &hsin_core::UsageModelBreakdown, i18n: &I18n) -> Line<'stat
     ))
 }
 
-fn compact(value: u64) -> String {
-    if value >= 1_000_000_000 {
-        format!(
-            "{}.{}b",
-            value / 1_000_000_000,
-            value % 1_000_000_000 / 100_000_000
-        )
-    } else if value >= 1_000_000 {
-        format!("{}.{}m", value / 1_000_000, value % 1_000_000 / 100_000)
-    } else if value >= 1_000 {
-        format!("{}.{}k", value / 1_000, value % 1_000 / 100)
-    } else {
-        value.to_string()
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn local_date(timestamp: i64) -> Option<NaiveDate> {
-    DateTime::<Utc>::from_timestamp(timestamp, 0)
-        .map(|value| value.with_timezone(&Local).date_naive())
-}
-
-fn heat_color(value: u64, max: u64) -> ratatui::style::Color {
-    if value == 0 || max == 0 {
-        MUTED
-    } else {
-        let intensity = (80 + 175 * value / max).min(255) as u8;
-        ratatui::style::Color::Rgb(intensity, 50, 55)
+    #[test]
+    fn heat_levels_follow_quartiles_of_active_days() {
+        let thresholds = heat_thresholds([0, 10, 20, 30, 40, 1_000].into_iter());
+        assert_eq!(thresholds, [20, 30, 40]);
+        assert_eq!(heat_level(0, &thresholds), 0);
+        assert_eq!(heat_level(10, &thresholds), 1);
+        assert_eq!(heat_level(25, &thresholds), 2);
+        assert_eq!(heat_level(1_000, &thresholds), 4);
+        assert_eq!(heat_thresholds([0, 0].into_iter()), [0; 3]);
     }
 }

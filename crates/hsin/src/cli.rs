@@ -39,6 +39,11 @@ pub enum Command {
     Status,
     /// Show Codex or Claude Code token statistics.
     Stats(StatsArgs),
+    /// Manage the model prices used to estimate token cost.
+    Pricing {
+        #[command(subcommand)]
+        command: PricingCommand,
+    },
     /// Run diagnostics.
     Doctor,
     /// Update hsin to the latest release.
@@ -88,6 +93,48 @@ pub struct StatsArgs {
     /// Include only this exact model name.
     #[arg(long)]
     pub model: Option<String>,
+    /// Include everything recorded; overrides --from and --to.
+    #[arg(long, conflicts_with_all = ["from", "to"])]
+    pub all: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PricingCommand {
+    /// List built-in, fetched and custom price rules.
+    List,
+    /// Add a custom price rule, or replace one with --id. Prices are per million tokens.
+    Set {
+        /// Model ID, or a prefix ending in `*`.
+        pattern: String,
+        /// Price of one million input tokens.
+        #[arg(long)]
+        input: f64,
+        /// Price of one million output tokens.
+        #[arg(long)]
+        output: f64,
+        /// Price of one million cache-write tokens; defaults to the input price.
+        #[arg(long)]
+        cache_write: Option<f64>,
+        /// Price of one million cache-read tokens; defaults to the input price.
+        #[arg(long)]
+        cache_read: Option<f64>,
+        /// ISO 4217 currency code.
+        #[arg(long, default_value = "USD")]
+        currency: String,
+        /// Apply the rule only to this Provider ID.
+        #[arg(long)]
+        provider: Option<String>,
+        /// Custom rule to replace.
+        #[arg(long)]
+        id: Option<String>,
+    },
+    /// Remove a custom price rule.
+    Remove {
+        /// ID of the custom rule.
+        id: String,
+    },
+    /// Fetch the public `LiteLLM` price list.
+    Refresh,
 }
 
 #[derive(Debug, Subcommand)]

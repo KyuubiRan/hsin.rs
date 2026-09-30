@@ -9,4 +9,6 @@
 - The proxy may bind to loopback, a specific interface, or a wildcard address. Every request validates a per-client capability token before replacing inbound authentication with the upstream credential; the fixed `HSIN_MANAGED_KEY` compatibility value is accepted only from loopback peers.
 - Request bodies, authorization headers, provider secrets, recovery keys and raw IPC parameters are excluded from tracing.
 - Token statistics store only client/source, a Provider name/ID/revision snapshot, model, normalized Token counters, timestamp, attribution, and hashed deduplication material. They never store prompts, responses, authorization data, raw session IDs, or project/session file paths. Session cursors persist only a hash of the normalized path.
+- Daily and hourly rollups of those counters are kept after the 90-day request detail expires; they carry the same fields minus timestamps finer than an hour and the deduplication material.
+- The model price list is fetched from the public LiteLLM table on GitHub only when the user asks (`u` on the pricing page or `hsin pricing refresh`), through the configured upstream proxy, with no credentials attached. The body is capped at 8 MiB and only numeric chat-model prices are kept.
 - If the system keyring is unavailable, the daemon enters a locked state instead of falling back to plaintext storage.

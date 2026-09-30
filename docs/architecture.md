@@ -42,3 +42,20 @@ Collection begins when a schema-9 daemon first starts, with existing complete
 lines marked as read. File cursors contain only a normalized-path hash, byte
 offset, modification metadata, and a tail fingerprint. Events older than the
 local-calendar 90-day boundary are removed.
+
+Every insert marks the local days it touches in `usage_rollup_dirty`, in the
+same transaction. Before a sync finishes or a query runs, those days are rebuilt
+into `usage_hourly` (per day, hour, Provider revision, and model). Rollups
+outlive the raw events, so reports read only from them: an all-time query
+(`from` = 0) starts at the first recorded day, and a report also carries a
+371-day activity calendar, streaks, the peak hour, and a forecast. The forecast
+averages the last 28 complete days, blending the overall daily mean half and
+half with the same-weekday mean, and projects the month end and the next 30
+days; it follows the Provider and model filters but not the queried range.
+
+Costs are estimates from `model_prices` plus a built-in table: a
+Provider-scoped rule beats a general one, a user rule beats a fetched one which
+beats a built-in one, and an exact model beats the longest matching prefix.
+Model names are compared lowercase without a `vendor/` prefix, a `[1m]` suffix,
+or a release date. Each currency is summed on its own; tokens no rule matches
+are reported as unpriced.

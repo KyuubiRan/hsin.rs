@@ -126,8 +126,12 @@ select text in terminals that support it. Every action is also scriptable:
 ```bash
 hsin status                                   # daemon, proxy and client state
 hsin stats codex                              # last 30 days of Codex token usage
+hsin stats codex --all                        # everything recorded, with a forecast
 hsin stats claude --from 2026-09-01 --to 2026-09-14
 hsin stats codex --provider <id> --model gpt-5 --json
+hsin pricing list                             # price rules used for cost estimates
+hsin pricing set 'local-*' --input 2 --output 8 --currency CNY
+hsin pricing refresh                          # fetch the public LiteLLM price list
 hsin doctor                                   # configuration, security and service checks
 hsin update                                   # update to the latest release
 
@@ -186,9 +190,18 @@ Press `s` on a Codex or Claude Code TUI page to open token statistics. Hsin
 combines exact usage observed by its local proxy with usage metadata from new
 Codex and Claude Code session-log entries, so official-login and direct-mode
 requests are included too. Collection begins after the upgraded daemon first
-starts: old sessions are not backfilled, and normalized usage events are kept
-for 90 days. Provider attribution from local session logs is inferred from
+starts: old sessions are not backfilled. Request detail is kept for 90 days and
+hourly totals indefinitely, so the overview opens on all time: an activity
+heatmap of the last year (hover or click a day), streaks, the favorite model,
+the peak hour, an estimated cost per currency, and a forecast for the month end
+and the next 30 days. Press `d` to cycle all time, 7 and 30 days, or `t` for
+other ranges. Provider attribution from local session logs is inferred from
 Hsin's route history and is marked with `~`.
+
+Costs use built-in list prices, the public LiteLLM price list when you fetch it
+(`u` on Settings → Model pricing, or `hsin pricing refresh`), and your own
+rules, which always win and can be limited to one provider. Amounts are
+estimates at today's prices and are never converted between currencies.
 
 Set `HSIN_HOME` to run isolated instances; each one keeps its own storage, IPC
 endpoint, keyring entries and service identity. `CODEX_HOME` and

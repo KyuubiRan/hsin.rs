@@ -8,11 +8,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDate, Timelike, Utc};
 use hsin_core::{
-    ClientKind, ConnectionMode, UsageAttribution, UsageAttributionCounts, UsageDailyBucket,
-    UsageDataSource, UsageFilterOptions, UsageModelBreakdown, UsageProviderBreakdown,
-    UsageProviderOption, UsageStatsQuery, UsageStatsReport, UsageSyncResult, UsageTokenSummary,
+    ClientKind, ConnectionMode, ModelPrice, USAGE_CALENDAR_DAYS, USAGE_MODEL_SERIES_DAYS,
+    UsageAttribution, UsageAttributionCounts, UsageCalendarDay, UsageCost, UsageDailyBucket,
+    UsageDataSource, UsageFilterOptions, UsageForecast, UsageModelBreakdown, UsageOverview,
+    UsageProjection, UsageProviderBreakdown, UsageProviderOption, UsageStatsQuery,
+    UsageStatsReport, UsageSyncResult, UsageTokenSummary, add_usage_cost, best_model_price,
 };
 use parking_lot::Mutex;
 use rusqlite::{OptionalExtension, params};
@@ -25,6 +27,14 @@ const STARTED_AT_KEY: &str = "usage_started_at";
 const LAST_SYNCED_AT_KEY: &str = "usage_last_synced_at";
 const SYNC_STATUS_KEY: &str = "usage_sync_status";
 const LAST_CLEANUP_AT_KEY: &str = "usage_last_cleanup_at";
+const ROLLUP_VERSION_KEY: &str = "usage_rollup_version";
+const ROLLUP_VERSION: &str = "1";
+/// The longest daily series a query returns, so no range can outgrow an IPC frame.
+const MAX_QUERY_DAYS: i64 = 3660;
+/// Complete days a forecast looks back over.
+const FORECAST_BASIS_DAYS: i64 = 28;
+/// Fewer complete days than this and there is no forecast: the average would be noise.
+const FORECAST_MIN_DAYS: usize = 3;
 const MAX_SESSION_LINE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PROXY_OBSERVATION_BYTES: usize = 1024 * 1024;
 const RETENTION_DAYS: i64 = 90;
@@ -64,6 +74,51 @@ struct StoredEvent {
 }
 
 type UsageRoute = (Option<String>, String, u64, ConnectionMode);
+
+/// One stored hour of rolled-up usage for one provider revision and model.
+#[derive(Debug, Clone)]
+struct RollupRow {
+    day: NaiveDate,
+    hour: u8,
+    provider_id: Option<String>,
+    provider_name: String,
+    provider_revision: u64,
+    model: String,
+    tokens: UsageTokenSummary,
+    /// Requests attributed exactly, inferred, and unattributed.
+    attribution: [u64; 3],
+}
+
+#[derive(Debug, Default)]
+struct RollupGroup {
+    provider_id: Option<String>,
+    tokens: UsageTokenSummary,
+    attribution: [u64; 3],
+}
+
+/// Resolves each provider and model to its price once per query.
+struct PriceCache<'a> {
+    prices: &'a [ModelPrice],
+    resolved: HashMap<(Option<String>, String), Option<&'a ModelPrice>>,
+}
+
+impl<'a> PriceCache<'a> {
+    fn new(prices: &'a [ModelPrice]) -> Self {
+        Self {
+            prices,
+            resolved: HashMap::new(),
+        }
+    }
+
+    fn cost(&mut self, row: &RollupRow) -> Option<(String, f64)> {
+        let prices = self.prices;
+        let price = *self
+            .resolved
+            .entry((row.provider_id.clone(), row.model.clone()))
+            .or_insert_with(|| best_model_price(prices, row.provider_id.as_deref(), &row.model));
+        price.map(|price| (price.currency.clone(), price.cost(&row.tokens)))
+    }
+}
 
 pub(crate) struct UsageCollector {
     db: Arc<Database>,
@@ -143,7 +198,7 @@ impl UsageCollector {
             }
         }
         self.cleanup_if_due(now, true)?;
-        Ok(())
+        self.backfill_rollups(now)
     }
 
     pub(crate) fn record_current_route(&self, client: ClientKind) -> Result<()> {
@@ -228,6 +283,7 @@ impl UsageCollector {
             now,
         )?;
         self.cleanup_if_due(now, false)?;
+        self.refresh_rollups()?;
         Ok(result)
     }
 
@@ -352,17 +408,25 @@ impl UsageCollector {
         )
     }
 
+    /// Stores one event and marks the days it can have changed for the next rollup refresh, in one
+    /// transaction so a rollup never misses an event.
     pub(crate) fn insert_event(&self, event: &UsageEvent) -> Result<bool> {
-        let connection = self.db.connection.lock();
+        let mut connection = self.db.connection.lock();
+        let transaction = connection.transaction()?;
+        let mut days = BTreeSet::from([local_date(event.event_at)]);
         if event.source == UsageDataSource::Proxy
             && let Some(correlation) = &event.correlation_key
         {
-            connection.execute(
+            let removed = transaction.execute(
                 "DELETE FROM usage_events WHERE id=(SELECT id FROM usage_events WHERE client=?1 AND source='session' AND correlation_key=?2 AND abs(event_at-?3)<=120 ORDER BY abs(event_at-?3) LIMIT 1)",
                 params![event.client.to_string(), correlation, event.event_at],
             )?;
+            if removed > 0 {
+                days.insert(local_date(event.event_at - 120));
+                days.insert(local_date(event.event_at + 120));
+            }
         }
-        let changed = connection.execute(
+        let changed = transaction.execute(
             "INSERT INTO usage_events(client,source,provider_id,provider_name,provider_revision,model,event_at,input_tokens,cache_write_tokens,cache_read_tokens,output_tokens,reasoning_output_tokens,attribution,dedup_key,correlation_key,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) ON CONFLICT(dedup_key) DO UPDATE SET source=CASE WHEN excluded.source='proxy' THEN excluded.source ELSE source END,provider_id=CASE WHEN excluded.source='proxy' THEN excluded.provider_id ELSE provider_id END,provider_name=CASE WHEN excluded.source='proxy' THEN excluded.provider_name ELSE provider_name END,provider_revision=CASE WHEN excluded.source='proxy' THEN excluded.provider_revision ELSE provider_revision END,attribution=CASE WHEN excluded.source='proxy' THEN excluded.attribution ELSE attribution END,output_tokens=max(output_tokens,excluded.output_tokens),reasoning_output_tokens=max(reasoning_output_tokens,excluded.reasoning_output_tokens)",
             params![
                 event.client.to_string(), event.source.as_str(), event.provider_id,
@@ -373,7 +437,169 @@ impl UsageCollector {
                 event.dedup_key, event.correlation_key, unix_time(),
             ],
         )?;
+        for day in days {
+            transaction.execute(
+                "INSERT OR IGNORE INTO usage_rollup_dirty(client,day) VALUES(?1,?2)",
+                params![event.client.to_string(), day],
+            )?;
+        }
+        transaction.commit()?;
         Ok(changed > 0)
+    }
+
+    /// Rebuilds the hourly rollups of every day an insert touched since the last call. Days whose
+    /// raw events have aged out are left as they are: their rollups are the only record left.
+    pub(crate) fn refresh_rollups(&self) -> Result<()> {
+        let dirty = {
+            let connection = self.db.connection.lock();
+            let mut statement = connection.prepare("SELECT client,day FROM usage_rollup_dirty")?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let oldest = local_date(retention_cutoff());
+        for (client, day) in dirty {
+            let bounds = (day >= oldest).then(|| local_day_bounds(&day)).flatten();
+            let mut connection = self.db.connection.lock();
+            let transaction = connection.transaction()?;
+            if let Some((start, end)) = bounds {
+                let events = {
+                    let mut statement = transaction.prepare(
+                        "SELECT provider_id,provider_name,provider_revision,model,event_at,input_tokens,cache_write_tokens,cache_read_tokens,output_tokens,reasoning_output_tokens,attribution FROM usage_events WHERE client=?1 AND event_at>=?2 AND event_at<?3",
+                    )?;
+                    let rows =
+                        statement.query_map(params![client, start, end], stored_event_from_row)?;
+                    rows.collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                let mut groups = BTreeMap::<(u8, String, String, u64, String), RollupGroup>::new();
+                for event in events {
+                    let group = groups
+                        .entry((
+                            local_hour(event.event_at),
+                            event.provider_id.clone().unwrap_or_default(),
+                            event.provider_name.clone(),
+                            event.provider_revision,
+                            event.model.clone(),
+                        ))
+                        .or_insert_with(|| RollupGroup {
+                            provider_id: event.provider_id.clone(),
+                            ..RollupGroup::default()
+                        });
+                    add_tokens(&mut group.tokens, &event.tokens);
+                    group.attribution[match event.attribution {
+                        UsageAttribution::Exact => 0,
+                        UsageAttribution::Inferred => 1,
+                        UsageAttribution::Unattributed => 2,
+                    }] += 1;
+                }
+                transaction.execute(
+                    "DELETE FROM usage_hourly WHERE client=?1 AND day=?2",
+                    params![client, day],
+                )?;
+                for ((hour, provider_key, provider_name, provider_revision, model), group) in groups
+                {
+                    transaction.execute(
+                        "INSERT INTO usage_hourly(client,day,hour,provider_key,provider_id,provider_name,provider_revision,model,input_tokens,cache_write_tokens,cache_read_tokens,output_tokens,reasoning_output_tokens,request_count,exact_count,inferred_count,unattributed_count) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                        params![
+                            client, day, hour, provider_key, group.provider_id, provider_name,
+                            provider_revision, model, group.tokens.input_tokens,
+                            group.tokens.cache_write_tokens, group.tokens.cache_read_tokens,
+                            group.tokens.output_tokens, group.tokens.reasoning_output_tokens,
+                            group.tokens.request_count, group.attribution[0],
+                            group.attribution[1], group.attribution[2],
+                        ],
+                    )?;
+                }
+            }
+            transaction.execute(
+                "DELETE FROM usage_rollup_dirty WHERE client=?1 AND day=?2",
+                params![client, day],
+            )?;
+            transaction.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Rolls up events recorded before rollups existed, once.
+    fn backfill_rollups(&self, now: i64) -> Result<()> {
+        if self.meta(ROLLUP_VERSION_KEY)?.as_deref() == Some(ROLLUP_VERSION) {
+            return Ok(());
+        }
+        {
+            let mut connection = self.db.connection.lock();
+            let transaction = connection.transaction()?;
+            let days = {
+                let mut statement =
+                    transaction.prepare("SELECT client,event_at FROM usage_events")?;
+                let rows = statement.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?;
+                rows.map(|row| row.map(|(client, at)| (client, local_date(at))))
+                    .collect::<std::result::Result<BTreeSet<_>, _>>()?
+            };
+            for (client, day) in days {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO usage_rollup_dirty(client,day) VALUES(?1,?2)",
+                    params![client, day],
+                )?;
+            }
+            transaction.commit()?;
+        }
+        self.refresh_rollups()?;
+        self.set_meta(ROLLUP_VERSION_KEY, ROLLUP_VERSION, now)
+    }
+
+    fn rollups(
+        &self,
+        client: ClientKind,
+        from: NaiveDate,
+        to: NaiveDate,
+    ) -> Result<Vec<RollupRow>> {
+        let connection = self.db.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT day,hour,provider_id,provider_name,provider_revision,model,input_tokens,cache_write_tokens,cache_read_tokens,output_tokens,reasoning_output_tokens,request_count,exact_count,inferred_count,unattributed_count FROM usage_hourly WHERE client=?1 AND day>=?2 AND day<=?3 ORDER BY day,hour",
+        )?;
+        let rows = statement.query_map(
+            params![client.to_string(), date_key(from), date_key(to)],
+            |row| {
+                let day: String = row.get(0)?;
+                Ok(RollupRow {
+                    day: NaiveDate::parse_from_str(&day, "%Y-%m-%d").map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
+                    hour: row.get(1)?,
+                    provider_id: row.get(2)?,
+                    provider_name: row.get(3)?,
+                    provider_revision: row.get(4)?,
+                    model: row.get(5)?,
+                    tokens: UsageTokenSummary {
+                        input_tokens: row.get(6)?,
+                        cache_write_tokens: row.get(7)?,
+                        cache_read_tokens: row.get(8)?,
+                        output_tokens: row.get(9)?,
+                        reasoning_output_tokens: row.get(10)?,
+                        request_count: row.get(11)?,
+                    },
+                    attribution: [row.get(12)?, row.get(13)?, row.get(14)?],
+                })
+            },
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    fn first_rollup_day(&self, client: ClientKind) -> Result<Option<NaiveDate>> {
+        let day: Option<String> = self.db.connection.lock().query_row(
+            "SELECT min(day) FROM usage_hourly WHERE client=?1",
+            [client.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(day.and_then(|day| NaiveDate::parse_from_str(&day, "%Y-%m-%d").ok()))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -383,89 +609,8 @@ impl UsageCollector {
                 "usage query start must be earlier than its end".into(),
             ));
         }
-        let connection = self.db.connection.lock();
-        let mut statement = connection.prepare(
-            "SELECT provider_id,provider_name,provider_revision,model,event_at,input_tokens,cache_write_tokens,cache_read_tokens,output_tokens,reasoning_output_tokens,attribution FROM usage_events WHERE client=?1 AND event_at>=?2 AND event_at<?3 ORDER BY event_at",
-        )?;
-        let rows = statement.query_map(
-            params![query.client.to_string(), query.from, query.to],
-            stored_event_from_row,
-        )?;
-        let all = rows.collect::<std::result::Result<Vec<_>, _>>()?;
-        drop(statement);
-        drop(connection);
-
-        let filters = filter_options(&all);
-        let events = all.iter().filter(|event| {
-            query
-                .provider_id
-                .as_ref()
-                .is_none_or(|id| event.provider_id.as_ref() == Some(id))
-                && query
-                    .model
-                    .as_ref()
-                    .is_none_or(|model| &event.model == model)
-        });
-        let mut summary = UsageTokenSummary::default();
-        let mut daily = BTreeMap::<String, UsageTokenSummary>::new();
-        let mut providers =
-            HashMap::<(Option<String>, String, u64), (bool, UsageTokenSummary)>::new();
-        let mut models =
-            HashMap::<String, (UsageTokenSummary, BTreeMap<String, UsageTokenSummary>)>::new();
-        let mut attribution = UsageAttributionCounts::default();
-        for event in events {
-            add_tokens(&mut summary, &event.tokens);
-            let date = local_date(event.event_at);
-            add_tokens(daily.entry(date.clone()).or_default(), &event.tokens);
-            let provider = providers
-                .entry((
-                    event.provider_id.clone(),
-                    event.provider_name.clone(),
-                    event.provider_revision,
-                ))
-                .or_default();
-            provider.0 |= event.attribution == UsageAttribution::Inferred;
-            add_tokens(&mut provider.1, &event.tokens);
-            let model = models.entry(event.model.clone()).or_default();
-            add_tokens(&mut model.0, &event.tokens);
-            add_tokens(model.1.entry(date).or_default(), &event.tokens);
-            match event.attribution {
-                UsageAttribution::Exact => attribution.exact += 1,
-                UsageAttribution::Inferred => attribution.inferred += 1,
-                UsageAttribution::Unattributed => attribution.unattributed += 1,
-            }
-        }
-        let mut provider_rows = providers
-            .into_iter()
-            .map(
-                |((provider_id, provider_name, provider_revision), (inferred, tokens))| {
-                    UsageProviderBreakdown {
-                        provider_id,
-                        provider_name,
-                        provider_revision,
-                        inferred,
-                        tokens,
-                    }
-                },
-            )
-            .collect::<Vec<_>>();
-        provider_rows.sort_by_key(|row| std::cmp::Reverse(row.tokens.total_tokens()));
-        let dates = date_range(query.from.max(retention_cutoff()), query.to);
-        let mut model_rows = models
-            .into_iter()
-            .map(|(model, (tokens, daily))| UsageModelBreakdown {
-                model,
-                tokens,
-                daily: dates
-                    .iter()
-                    .map(|date| UsageDailyBucket {
-                        date: date.clone(),
-                        tokens: daily.get(date).cloned().unwrap_or_default(),
-                    })
-                    .collect(),
-            })
-            .collect::<Vec<_>>();
-        model_rows.sort_by_key(|row| std::cmp::Reverse(row.tokens.total_tokens()));
+        self.refresh_rollups()?;
+        let today = Local::now().date_naive();
         let collected_since = self
             .meta(STARTED_AT_KEY)?
             .and_then(|value| value.parse().ok())
@@ -473,6 +618,166 @@ impl UsageCollector {
         let last_synced_at = self
             .meta(LAST_SYNCED_AT_KEY)?
             .and_then(|value| value.parse().ok());
+        // Days before the first recorded one carry nothing, so the series starts there; that is
+        // also what makes an all-time query (`from` = 0) a bounded one.
+        let data_start = self
+            .first_rollup_day(query.client)?
+            .into_iter()
+            .chain(local_naive_date(collected_since))
+            .min()
+            .unwrap_or(today)
+            .min(today);
+        let from = local_naive_date(query.from).map_or(data_start, |from| from.max(data_start));
+        let to = local_naive_date(query.to.saturating_sub(1)).unwrap_or(today);
+        let to = to.min(from + chrono::Duration::days(MAX_QUERY_DAYS));
+        let all = if from <= to {
+            self.rollups(query.client, from, to)?
+        } else {
+            Vec::new()
+        };
+        let price_rules = crate::pricing::all_prices(&self.db)?;
+        let mut costs = PriceCache::new(&price_rules);
+
+        let filters = filter_options(&all);
+        let matches = |row: &&RollupRow| {
+            query
+                .provider_id
+                .as_ref()
+                .is_none_or(|id| row.provider_id.as_ref() == Some(id))
+                && query.model.as_ref().is_none_or(|model| &row.model == model)
+        };
+        let mut summary = UsageTokenSummary::default();
+        let mut cost = Vec::new();
+        let mut unpriced_tokens = 0_u64;
+        let mut daily = BTreeMap::<NaiveDate, UsageTokenSummary>::new();
+        let mut hours = [0_u64; 24];
+        let mut providers = HashMap::<
+            (Option<String>, String, u64),
+            (bool, UsageTokenSummary, Vec<UsageCost>),
+        >::new();
+        let mut models = HashMap::<
+            String,
+            (
+                UsageTokenSummary,
+                BTreeMap<NaiveDate, UsageTokenSummary>,
+                Vec<UsageCost>,
+            ),
+        >::new();
+        let mut attribution = UsageAttributionCounts::default();
+        for row in all.iter().filter(matches) {
+            add_tokens(&mut summary, &row.tokens);
+            add_tokens(daily.entry(row.day).or_default(), &row.tokens);
+            hours[usize::from(row.hour.min(23))] += row.tokens.total_tokens();
+            let priced = costs.cost(row);
+            match &priced {
+                Some((currency, amount)) => add_usage_cost(&mut cost, currency, *amount),
+                None => unpriced_tokens += row.tokens.total_tokens(),
+            }
+            let provider = providers
+                .entry((
+                    row.provider_id.clone(),
+                    row.provider_name.clone(),
+                    row.provider_revision,
+                ))
+                .or_default();
+            provider.0 |= row.attribution[1] > 0;
+            add_tokens(&mut provider.1, &row.tokens);
+            let model = models.entry(row.model.clone()).or_default();
+            add_tokens(&mut model.0, &row.tokens);
+            add_tokens(model.1.entry(row.day).or_default(), &row.tokens);
+            if let Some((currency, amount)) = priced {
+                add_usage_cost(&mut provider.2, &currency, amount);
+                add_usage_cost(&mut model.2, &currency, amount);
+            }
+            attribution.exact += row.attribution[0];
+            attribution.inferred += row.attribution[1];
+            attribution.unattributed += row.attribution[2];
+        }
+        let dates = date_range(from, to);
+        let series_dates = &dates[dates.len().saturating_sub(USAGE_MODEL_SERIES_DAYS)..];
+        let favorite_model = models
+            .iter()
+            .max_by(|left, right| {
+                (left.1.0.output_tokens, left.1.0.total_tokens(), right.0).cmp(&(
+                    right.1.0.output_tokens,
+                    right.1.0.total_tokens(),
+                    left.0,
+                ))
+            })
+            .map(|(model, _)| model.clone());
+        let mut provider_rows = providers
+            .into_iter()
+            .map(
+                |((provider_id, provider_name, provider_revision), (inferred, tokens, cost))| {
+                    UsageProviderBreakdown {
+                        provider_id,
+                        provider_name,
+                        provider_revision,
+                        inferred,
+                        tokens,
+                        cost,
+                    }
+                },
+            )
+            .collect::<Vec<_>>();
+        provider_rows.sort_by_key(|row| std::cmp::Reverse(row.tokens.total_tokens()));
+        let mut model_rows = models
+            .into_iter()
+            .map(|(model, (tokens, daily, cost))| UsageModelBreakdown {
+                model,
+                tokens,
+                daily: series_dates
+                    .iter()
+                    .map(|date| UsageDailyBucket {
+                        date: date_key(*date),
+                        tokens: daily.get(date).cloned().unwrap_or_default(),
+                    })
+                    .collect(),
+                cost,
+            })
+            .collect::<Vec<_>>();
+        model_rows.sort_by_key(|row| std::cmp::Reverse(row.tokens.total_tokens()));
+
+        let calendar_from =
+            today - chrono::Duration::days(i64::try_from(USAGE_CALENDAR_DAYS).unwrap_or(371) - 1);
+        let mut calendar_days = BTreeMap::<NaiveDate, (UsageTokenSummary, Vec<UsageCost>)>::new();
+        for row in self
+            .rollups(query.client, calendar_from, today)?
+            .iter()
+            .filter(matches)
+        {
+            let day = calendar_days.entry(row.day).or_default();
+            add_tokens(&mut day.0, &row.tokens);
+            if let Some((currency, amount)) = costs.cost(row) {
+                add_usage_cost(&mut day.1, &currency, amount);
+            }
+        }
+        let calendar = date_range(calendar_from, today)
+            .into_iter()
+            .map(|date| {
+                let (tokens, cost) = calendar_days.get(&date).cloned().unwrap_or_default();
+                UsageCalendarDay {
+                    date: date_key(date),
+                    total_tokens: tokens.total_tokens(),
+                    request_count: tokens.request_count,
+                    cost,
+                }
+            })
+            .collect::<Vec<_>>();
+        let overview = overview(
+            &dates,
+            &daily,
+            &hours,
+            &calendar_days,
+            today,
+            favorite_model,
+        );
+        let forecast = forecast(
+            today,
+            local_naive_date(collected_since).unwrap_or(today),
+            &calendar_days,
+        );
+
         let total_tokens = summary.total_tokens();
         let hit_tokens = summary.cache_read_tokens;
         let non_hit_tokens = summary.non_hit_tokens();
@@ -485,10 +790,10 @@ impl UsageCollector {
             non_hit_tokens,
             cache_hit_rate,
             daily: dates
-                .into_iter()
+                .iter()
                 .map(|date| UsageDailyBucket {
-                    tokens: daily.get(&date).cloned().unwrap_or_default(),
-                    date,
+                    date: date_key(*date),
+                    tokens: daily.get(date).cloned().unwrap_or_default(),
                 })
                 .collect(),
             providers: provider_rows,
@@ -497,6 +802,11 @@ impl UsageCollector {
             filters,
             collected_since,
             last_synced_at,
+            cost,
+            unpriced_tokens,
+            overview,
+            calendar,
+            forecast,
         })
     }
 
@@ -984,23 +1294,22 @@ fn stored_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredEven
     })
 }
 
-fn filter_options(events: &[StoredEvent]) -> UsageFilterOptions {
+fn filter_options(rows: &[RollupRow]) -> UsageFilterOptions {
     let mut providers = HashMap::<String, UsageProviderOption>::new();
     let mut models = BTreeSet::<String>::new();
-    for event in events {
-        if let Some(id) = &event.provider_id {
+    for row in rows {
+        let inferred = row.attribution[1] > 0;
+        if let Some(id) = &row.provider_id {
             providers
                 .entry(id.clone())
-                .and_modify(|option| {
-                    option.inferred |= event.attribution == UsageAttribution::Inferred;
-                })
+                .and_modify(|option| option.inferred |= inferred)
                 .or_insert_with(|| UsageProviderOption {
                     id: id.clone(),
-                    name: event.provider_name.clone(),
-                    inferred: event.attribution == UsageAttribution::Inferred,
+                    name: row.provider_name.clone(),
+                    inferred,
                 });
         }
-        models.insert(event.model.clone());
+        models.insert(row.model.clone());
     }
     let mut providers = providers.into_values().collect::<Vec<_>>();
     providers.sort_by_key(|provider| provider.name.to_lowercase());
@@ -1050,30 +1359,207 @@ fn token_correlation(client: ClientKind, model: &str, tokens: &UsageTokenSummary
     ))
 }
 
-fn date_range(from: i64, to: i64) -> Vec<String> {
-    let Some(mut date) = DateTime::<Utc>::from_timestamp(from, 0)
+/// Every date from `from` to `to`, both included.
+fn date_range(from: NaiveDate, to: NaiveDate) -> Vec<NaiveDate> {
+    from.iter_days().take_while(|date| *date <= to).collect()
+}
+
+fn date_key(date: NaiveDate) -> String {
+    date.format("%Y-%m-%d").to_string()
+}
+
+fn local_naive_date(timestamp: i64) -> Option<NaiveDate> {
+    DateTime::<Utc>::from_timestamp(timestamp, 0)
         .map(|value| value.with_timezone(&Local).date_naive())
-    else {
-        return Vec::new();
-    };
-    let Some(end) = DateTime::<Utc>::from_timestamp(to.saturating_sub(1), 0)
-        .map(|value| value.with_timezone(&Local).date_naive())
-    else {
-        return Vec::new();
-    };
-    let mut dates = Vec::new();
-    while date <= end && dates.len() < 92 {
-        dates.push(date.format("%Y-%m-%d").to_string());
-        date += chrono::Duration::days(1);
-    }
-    dates
 }
 
 fn local_date(timestamp: i64) -> String {
-    DateTime::<Utc>::from_timestamp(timestamp, 0).map_or_else(
-        || "unknown".into(),
-        |value| value.with_timezone(&Local).format("%Y-%m-%d").to_string(),
-    )
+    local_naive_date(timestamp).map_or_else(|| "unknown".into(), date_key)
+}
+
+fn local_hour(timestamp: i64) -> u8 {
+    DateTime::<Utc>::from_timestamp(timestamp, 0).map_or(0, |value| {
+        u8::try_from(value.with_timezone(&Local).hour()).unwrap_or(0)
+    })
+}
+
+fn local_midnight(date: NaiveDate) -> Option<i64> {
+    date.and_hms_opt(0, 0, 0)
+        .and_then(|value| value.and_local_timezone(Local).earliest())
+        .map(|value| value.timestamp())
+}
+
+/// The `[start, end)` timestamps of a local calendar day.
+fn local_day_bounds(day: &str) -> Option<(i64, i64)> {
+    let date = NaiveDate::parse_from_str(day, "%Y-%m-%d").ok()?;
+    Some((local_midnight(date)?, local_midnight(date.succ_opt()?)?))
+}
+
+/// Highlights of the queried days; the current streak looks back from today through the
+/// calendar instead, so a range that ended earlier does not freeze it.
+fn overview(
+    dates: &[NaiveDate],
+    daily: &BTreeMap<NaiveDate, UsageTokenSummary>,
+    hours: &[u64; 24],
+    calendar: &BTreeMap<NaiveDate, (UsageTokenSummary, Vec<UsageCost>)>,
+    today: NaiveDate,
+    favorite_model: Option<String>,
+) -> UsageOverview {
+    let active = |tokens: Option<&UsageTokenSummary>| {
+        tokens.is_some_and(|tokens| tokens.request_count > 0 || tokens.total_tokens() > 0)
+    };
+    let mut longest_streak = 0;
+    let mut run = 0;
+    for date in dates {
+        if active(daily.get(date)) {
+            run += 1;
+            longest_streak = longest_streak.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    let calendar_active = |date: &NaiveDate| active(calendar.get(date).map(|(tokens, _)| tokens));
+    let mut day = if calendar_active(&today) {
+        Some(today)
+    } else {
+        today.pred_opt()
+    };
+    let mut current_streak = 0;
+    while let Some(date) = day.filter(calendar_active) {
+        current_streak += 1;
+        day = date.pred_opt();
+    }
+    let most_active_day = daily
+        .iter()
+        .filter(|(_, tokens)| tokens.total_tokens() > 0)
+        .max_by_key(|(date, tokens)| (tokens.total_tokens(), std::cmp::Reverse(**date)))
+        .map(|(date, tokens)| UsageDailyBucket {
+            date: date_key(*date),
+            tokens: tokens.clone(),
+        });
+    let peak_hour = (0..24_u8)
+        .filter(|hour| hours[usize::from(*hour)] > 0)
+        .max_by_key(|hour| (hours[usize::from(*hour)], std::cmp::Reverse(*hour)));
+    UsageOverview {
+        favorite_model,
+        active_days: daily.values().filter(|tokens| active(Some(tokens))).count() as u64,
+        current_streak,
+        longest_streak,
+        most_active_day,
+        peak_hour,
+    }
+}
+
+/// Projects daily usage forward from the last [`FORECAST_BASIS_DAYS`] complete days, blending
+/// the overall daily mean half and half with the mean of the same weekday, so a weekday-heavy
+/// habit shows up in the projection without one odd day dominating it.
+#[allow(clippy::cast_precision_loss)]
+fn forecast(
+    today: NaiveDate,
+    collected_since: NaiveDate,
+    days: &BTreeMap<NaiveDate, (UsageTokenSummary, Vec<UsageCost>)>,
+) -> Option<UsageForecast> {
+    let yesterday = today.pred_opt()?;
+    let basis_start = (today - chrono::Duration::days(FORECAST_BASIS_DAYS)).max(collected_since);
+    let basis = date_range(basis_start, yesterday);
+    if basis.len() < FORECAST_MIN_DAYS {
+        return None;
+    }
+    let tokens_on = |date: &NaiveDate| {
+        days.get(date)
+            .map_or(0, |(tokens, _)| tokens.total_tokens())
+    };
+    let mut basis_tokens = 0_u64;
+    let mut basis_cost = Vec::new();
+    let mut weekday_totals = [(0_u64, 0_u32); 7];
+    for date in &basis {
+        let tokens = tokens_on(date);
+        basis_tokens += tokens;
+        let weekday = &mut weekday_totals[date.weekday().num_days_from_monday() as usize];
+        weekday.0 += tokens;
+        weekday.1 += 1;
+        if let Some((_, cost)) = days.get(date) {
+            for entry in cost {
+                add_usage_cost(&mut basis_cost, &entry.currency, entry.amount);
+            }
+        }
+    }
+    let mean = basis_tokens as f64 / basis.len() as f64;
+    let expected = |date: NaiveDate| {
+        let (total, count) = weekday_totals[date.weekday().num_days_from_monday() as usize];
+        let weekday_mean = if count == 0 {
+            mean
+        } else {
+            total as f64 / f64::from(count)
+        };
+        0.5 * mean + 0.5 * weekday_mean
+    };
+    let price_tokens = |tokens: f64| -> Vec<UsageCost> {
+        if basis_tokens == 0 {
+            return Vec::new();
+        }
+        basis_cost
+            .iter()
+            .map(|cost| UsageCost {
+                currency: cost.currency.clone(),
+                amount: cost.amount / basis_tokens as f64 * tokens,
+            })
+            .collect()
+    };
+
+    let month_start = today.with_day(1)?;
+    let mut month_to_date = UsageProjection::default();
+    for date in date_range(month_start, today) {
+        if let Some((tokens, cost)) = days.get(&date) {
+            month_to_date.tokens += tokens.total_tokens();
+            for entry in cost {
+                add_usage_cost(&mut month_to_date.cost, &entry.currency, entry.amount);
+            }
+        }
+    }
+    let today_actual = tokens_on(&today) as f64;
+    let month_end_date = (if today.month() == 12 {
+        NaiveDate::from_ymd_opt(today.year() + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(today.year(), today.month() + 1, 1)
+    })?
+    .pred_opt()?;
+    let tomorrow = today.succ_opt()?;
+    let remaining_month = (expected(today) - today_actual).max(0.0)
+        + date_range(tomorrow, month_end_date)
+            .into_iter()
+            .map(expected)
+            .sum::<f64>();
+    let mut month_end = UsageProjection {
+        tokens: month_to_date.tokens + token_count(remaining_month),
+        cost: month_to_date.cost.clone(),
+    };
+    for entry in price_tokens(remaining_month) {
+        add_usage_cost(&mut month_end.cost, &entry.currency, entry.amount);
+    }
+    let next_30 = date_range(tomorrow, today + chrono::Duration::days(30))
+        .into_iter()
+        .map(expected)
+        .sum::<f64>();
+    Some(UsageForecast {
+        basis_days: u32::try_from(basis.len()).unwrap_or(u32::MAX),
+        daily_average: UsageProjection {
+            tokens: token_count(mean),
+            cost: price_tokens(mean),
+        },
+        month_to_date,
+        month_end,
+        next_30_days: UsageProjection {
+            tokens: token_count(next_30),
+            cost: price_tokens(next_30),
+        },
+    })
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn token_count(value: f64) -> u64 {
+    // Projections are non-negative sums of token counts, far inside u64.
+    value.max(0.0).round() as u64
 }
 
 fn retention_cutoff() -> i64 {
@@ -1517,5 +2003,226 @@ mod tests {
         drop(collector);
         drop(db);
         fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    fn tokens(input: u64, output: u64) -> UsageTokenSummary {
+        UsageTokenSummary {
+            input_tokens: input,
+            output_tokens: output,
+            request_count: 1,
+            ..UsageTokenSummary::default()
+        }
+    }
+
+    fn proxy_event(key: &str, model: &str, event_at: i64, tokens: UsageTokenSummary) -> UsageEvent {
+        UsageEvent {
+            client: ClientKind::Codex,
+            source: UsageDataSource::Proxy,
+            provider_id: Some("provider-1".into()),
+            provider_name: "Provider".into(),
+            provider_revision: 1,
+            model: model.into(),
+            event_at,
+            tokens,
+            attribution: UsageAttribution::Exact,
+            dedup_key: key.into(),
+            correlation_key: None,
+        }
+    }
+
+    fn all_time(client: ClientKind) -> UsageStatsQuery {
+        UsageStatsQuery {
+            client,
+            from: 0,
+            to: unix_time() + 60,
+            provider_id: None,
+            model: None,
+        }
+    }
+
+    #[test]
+    fn rollups_match_raw_events_and_survive_raw_cleanup() {
+        let (root, db, collector) = test_collector();
+        collector.initialize().expect("initialize");
+        let now = unix_time();
+        collector
+            .insert_event(&proxy_event("a", "gpt-5.5", now, tokens(1_000, 10)))
+            .expect("first");
+        collector
+            .insert_event(&proxy_event("b", "gpt-5.5", now, tokens(3_000, 30)))
+            .expect("second");
+        let before = collector.query(all_time(ClientKind::Codex)).expect("query");
+        assert_eq!(before.summary.request_count, 2);
+        assert_eq!(before.summary.total_tokens(), 4_040);
+        assert_eq!(before.attribution.exact, 2);
+
+        db.connection
+            .lock()
+            .execute("DELETE FROM usage_events", [])
+            .expect("simulate expiry");
+        let after = collector.query(all_time(ClientKind::Codex)).expect("query");
+        assert_eq!(after.summary, before.summary);
+        assert_eq!(after.overview.current_streak, 1);
+        drop(collector);
+        drop(db);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn all_time_reaches_past_the_raw_retention_window() {
+        let (root, db, collector) = test_collector();
+        collector.initialize().expect("initialize");
+        let old = Local::now().date_naive() - chrono::Duration::days(200);
+        db.connection
+            .lock()
+            .execute(
+                "INSERT INTO usage_hourly(client,day,hour,provider_key,provider_id,provider_name,provider_revision,model,input_tokens,output_tokens,request_count,exact_count) VALUES('codex',?1,9,'p','p','Provider',1,'gpt-5.5',500,5,1,1)",
+                [date_key(old)],
+            )
+            .expect("aged rollup");
+        let report = collector.query(all_time(ClientKind::Codex)).expect("query");
+        assert!(report.daily.len() > 92, "{} days", report.daily.len());
+        assert_eq!(
+            report.daily.first().map(|day| day.date.clone()),
+            Some(date_key(old))
+        );
+        assert_eq!(report.summary.total_tokens(), 505);
+        assert_eq!(report.overview.peak_hour, Some(9));
+        assert_eq!(report.overview.active_days, 1);
+        assert_eq!(report.calendar.len(), USAGE_CALENDAR_DAYS);
+        assert!(report.models[0].daily.len() <= USAGE_MODEL_SERIES_DAYS);
+        drop(collector);
+        drop(db);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn cost_is_summed_per_currency_and_unpriced_tokens_are_counted() {
+        let (root, db, collector) = test_collector();
+        collector.initialize().expect("initialize");
+        crate::pricing::set_user_price(
+            &db,
+            &hsin_core::ModelPriceInput {
+                id: None,
+                model_pattern: "local-*".into(),
+                provider_id: None,
+                currency: "CNY".into(),
+                input: 2.0,
+                cache_write: None,
+                cache_read: None,
+                output: 8.0,
+            },
+            0,
+        )
+        .expect("user price");
+        let now = unix_time();
+        for (key, model) in [("a", "gpt-5.5"), ("b", "local-model"), ("c", "mystery")] {
+            collector
+                .insert_event(&proxy_event(key, model, now, tokens(1_000_000, 100_000)))
+                .expect("event");
+        }
+        let report = collector.query(all_time(ClientKind::Codex)).expect("query");
+        let amount = |currency: &str| {
+            report
+                .cost
+                .iter()
+                .find(|cost| cost.currency == currency)
+                .map(|cost| cost.amount)
+        };
+        assert!((amount("USD").unwrap() - (5.0 + 3.0)).abs() < 1e-9);
+        assert!((amount("CNY").unwrap() - (2.0 + 0.8)).abs() < 1e-9);
+        assert_eq!(report.unpriced_tokens, 1_100_000);
+        let local = report
+            .models
+            .iter()
+            .find(|model| model.model == "local-model")
+            .expect("local model");
+        assert_eq!(local.cost.len(), 1);
+        drop(collector);
+        drop(db);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    fn day(
+        date: NaiveDate,
+        total: u64,
+        usd: f64,
+    ) -> (NaiveDate, (UsageTokenSummary, Vec<UsageCost>)) {
+        (
+            date,
+            (
+                tokens(total, 0),
+                vec![UsageCost {
+                    currency: "USD".into(),
+                    amount: usd,
+                }],
+            ),
+        )
+    }
+
+    #[test]
+    fn forecast_needs_history_and_weights_weekdays() {
+        // Wednesday 2026-09-16.
+        let today = NaiveDate::from_ymd_opt(2026, 9, 16).unwrap();
+        let short = BTreeMap::from([day(today.pred_opt().unwrap(), 100, 1.0)]);
+        assert!(forecast(today, today - chrono::Duration::days(1), &short).is_none());
+
+        // Four weeks of 100 tokens a day, except 400 on every Monday.
+        let days = (1..=28)
+            .map(|offset| {
+                let date = today - chrono::Duration::days(offset);
+                let total: u32 = if date.weekday() == chrono::Weekday::Mon {
+                    400
+                } else {
+                    100
+                };
+                day(date, u64::from(total), f64::from(total) / 100.0)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let forecast = forecast(today, today - chrono::Duration::days(365), &days).unwrap();
+        assert_eq!(forecast.basis_days, 28);
+        // (24 * 100 + 4 * 400) / 28.
+        let mean = 4_000.0 / 28.0;
+        assert_eq!(forecast.daily_average.tokens, token_count(mean));
+        assert!((forecast.daily_average.cost[0].amount - mean / 100.0).abs() < 1e-9);
+        // September 1-15 are in the basis; today has no usage yet.
+        let mtd = days
+            .iter()
+            .filter(|(date, _)| date.month() == 9)
+            .map(|(_, (tokens, _))| tokens.total_tokens())
+            .sum::<u64>();
+        assert_eq!(forecast.month_to_date.tokens, mtd);
+        // Sept 16-30 spans two Mondays (21, 28) that are weighted up.
+        let monday = 0.5 * mean + 0.5 * 400.0;
+        let other = 0.5 * mean + 0.5 * 100.0;
+        assert_eq!(
+            forecast.month_end.tokens,
+            mtd + token_count(2.0 * monday + 13.0 * other)
+        );
+        assert!(forecast.next_30_days.tokens > forecast.month_end.tokens - mtd);
+    }
+
+    #[test]
+    fn overview_tracks_streaks_and_the_busiest_day() {
+        let today = NaiveDate::from_ymd_opt(2026, 9, 16).unwrap();
+        let dates = date_range(today - chrono::Duration::days(6), today);
+        let daily = [0, 1, 2, 4, 5]
+            .into_iter()
+            .map(|index| (dates[index], tokens(10 * (index as u64 + 1), 0)))
+            .collect::<BTreeMap<_, _>>();
+        let calendar = daily
+            .iter()
+            .map(|(date, tokens)| (*date, (tokens.clone(), Vec::new())))
+            .collect::<BTreeMap<_, _>>();
+        let mut hours = [0_u64; 24];
+        hours[14] = 9;
+        hours[3] = 9;
+        let overview = overview(&dates, &daily, &hours, &calendar, today, None);
+        assert_eq!(overview.active_days, 5);
+        assert_eq!(overview.longest_streak, 3);
+        // Today (index 6) is idle, so the streak runs back from yesterday.
+        assert_eq!(overview.current_streak, 2);
+        assert_eq!(overview.most_active_day.unwrap().date, date_key(dates[5]));
+        assert_eq!(overview.peak_hour, Some(3));
     }
 }
