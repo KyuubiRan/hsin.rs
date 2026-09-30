@@ -688,6 +688,23 @@ impl UsageCollector {
         };
         // Different accounts, session providers and plans have different allowances, and a user
         // can move between them, so each gets its own series of readings.
+        // Older clients do not name the account. When a provider and plan have exactly one known
+        // account, their unnamed readings are that account's; otherwise they stay apart.
+        let mut accounts = HashMap::<(String, Option<String>), BTreeSet<String>>::new();
+        for row in rows.iter().filter(|row| !row.account.is_empty()) {
+            accounts
+                .entry((row.source.clone(), row.plan_type.clone()))
+                .or_default()
+                .insert(row.account.clone());
+        }
+        let mut rows = rows;
+        for row in rows.iter_mut().filter(|row| row.account.is_empty()) {
+            if let Some(known) = accounts.get(&(row.source.clone(), row.plan_type.clone()))
+                && let [account] = &known.iter().collect::<Vec<_>>()[..]
+            {
+                row.account.clone_from(*account);
+            }
+        }
         let mut groups = BTreeMap::<QuotaGroupKey, Vec<QuotaRow>>::new();
         for row in rows {
             groups
@@ -3047,6 +3064,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn plans_accounts_and_providers_are_estimated_apart() {
         let (root, db, collector) = test_collector();
         collector.initialize().expect("initialize");
@@ -3106,6 +3124,17 @@ mod tests {
                 usage(10, 1_000_000, Some(("pro", 2.0, pro))),
             ],
         );
+        // An older client did not name the account; with one known Pro Lite account, it is that one.
+        write(
+            "lite-unnamed.jsonl",
+            vec![
+                serde_json::json!({"type":"session_meta","timestamp":at(9_000),"payload":{"model_provider":"openai"}})
+                    .to_string(),
+                codex_turn("gpt-6.1-sol"),
+                usage(8_000, 0, Some(("prolite", 50.0, lite - 7 * 86_400))),
+                usage(7_900, 300_000, Some(("prolite", 53.0, lite - 7 * 86_400))),
+            ],
+        );
         // A relay session at the same time reports no quota and must not dilute either plan.
         write(
             "relay.jsonl",
@@ -3131,8 +3160,11 @@ mod tests {
         assert_eq!(past.plan_type.as_deref(), Some("prolite"));
         assert!(!past.current);
         assert!(past.remaining.is_none());
+        assert_eq!(past.account, current.account);
+        // 200k over two points and 300k over three pool to 500k over five.
+        assert_eq!(past.basis_cycles, 2);
         assert_eq!(past.capacity.as_ref().unwrap().tokens, 10_000_000);
-        assert_eq!(past.cycles.len(), 1);
+        assert_eq!(past.cycles.len(), 2);
         assert_eq!(past.cycles[0].tokens, 200_000);
         assert!((past.cycles[0].to_percent - 12.0).abs() < f64::EPSILON);
         drop(collector);
