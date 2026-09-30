@@ -454,5 +454,15 @@
   "cli.pricing.set.arg.id": "要替换的自定义规则",
   "cli.pricing.remove.about": "删除一条自定义价格规则",
   "cli.pricing.remove.arg.id": "自定义规则的 ID",
-  "cli.pricing.refresh.about": "拉取公开的 LiteLLM 价格表"
+  "cli.pricing.refresh.about": "拉取公开的 LiteLLM 价格表",
+  "stats_quota": "套餐额度",
+  "stats_quota_weekly": "周窗口",
+  "stats_quota_hours": "{hours} 小时窗口",
+  "stats_quota_used": "已用",
+  "stats_quota_resets": "重置于",
+  "stats_quota_capacity": "总额度",
+  "stats_quota_remaining": "剩余",
+  "stats_quota_monthly": "每月",
+  "stats_quota_pending": "额度计量还没变化满 1%，继续使用后即可估算总额度。",
+  "stats_quota_note": "根据最近 {cycles} 个周期共 {percent}% 的额度变化，按 API 标价反推；官方未公布套餐的 Token 上限。"
 }

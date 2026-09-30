@@ -1501,6 +1501,45 @@ pub struct UsageProjection {
     pub cost: Vec<UsageCost>,
 }
 
+/// A plan allowance back-calculated from usage: the tokens and API list-price cost spent while
+/// the plan's quota meter moved, scaled to the full 100%.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageQuotaCapacity {
+    pub tokens: u64,
+    /// The range the whole-percent meter leaves open; `tokens_high` is `None` while the meter has
+    /// moved too little to bound it.
+    pub tokens_low: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_high: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cost: Vec<UsageCost>,
+}
+
+/// One quota window of a subscription plan, as the client last reported it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageQuotaEstimate {
+    pub limit_id: String,
+    /// `primary` or `secondary`, as the client labels its windows.
+    pub window: String,
+    pub window_minutes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_type: Option<String>,
+    /// Share of the window already used, `0..=100`; zero once the window has reset.
+    pub used_percent: f64,
+    pub resets_at: i64,
+    pub observed_at: i64,
+    /// Meter movement the estimate rests on, summed over the cycles used.
+    pub basis_percent: f64,
+    pub basis_cycles: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<UsageQuotaCapacity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining: Option<UsageProjection>,
+    /// The allowance over a calendar month, for windows of a day or longer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monthly: Option<UsageProjection>,
+}
+
 /// A projection from recent daily usage. It follows the query's provider and model filters but
 /// always looks forward from today, whatever range the query covers.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1562,6 +1601,10 @@ pub struct UsageStatsReport {
     pub calendar: Vec<UsageCalendarDay>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forecast: Option<UsageForecast>,
+    /// Subscription quota windows the client reports, newest reading first. Independent of the
+    /// query's range and filters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quota: Vec<UsageQuotaEstimate>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

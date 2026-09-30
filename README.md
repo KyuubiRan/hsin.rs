@@ -198,6 +198,13 @@ and the next 30 days. Press `d` to cycle all time, 7 and 30 days, or `t` for
 other ranges. Provider attribution from local session logs is inferred from
 Hsin's route history and is marked with `~`.
 
+For a Codex subscription, the overview also estimates the plan's allowance the
+way quota calculators do: Codex logs its quota meter with every request, so the
+tokens spent while the meter moved, scaled to 100%, give the weekly allowance in
+tokens and in API list-price dollars, with the range the whole-percent meter
+leaves open, the remainder of the current window, and the equivalent per
+calendar month. It is an estimate; OpenAI does not publish token limits.
+
 Costs use built-in list prices, the public LiteLLM price list when you fetch it
 (`u` on Settings → Model pricing, or `hsin pricing refresh`), and your own
 rules, which always win and can be limited to one provider. Amounts are

@@ -158,6 +158,61 @@ async fn run_stats(args: crate::cli::StatsArgs, client: &DaemonClient, json: boo
     Ok(())
 }
 
+fn print_quota(quota: &hsin_core::UsageQuotaEstimate) {
+    let resets =
+        chrono::DateTime::from_timestamp(quota.resets_at, 0).map_or_else(String::new, |value| {
+            value
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        });
+    println!(
+        "\nPlan quota ({}, {} {} min window): {:.0}% used, resets {resets}",
+        quota.plan_type.as_deref().unwrap_or("unknown plan"),
+        quota.window,
+        quota.window_minutes,
+        quota.used_percent
+    );
+    let Some(capacity) = &quota.capacity else {
+        println!("  Allowance: not enough meter movement yet");
+        return;
+    };
+    let cost = |costs: &[hsin_core::UsageCost]| {
+        if costs.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", format_cost(costs))
+        }
+    };
+    println!(
+        "  Allowance: ~{} tokens ({}–{}){}",
+        capacity.tokens,
+        capacity.tokens_low,
+        capacity
+            .tokens_high
+            .map_or_else(|| "?".to_owned(), |high| high.to_string()),
+        cost(&capacity.cost)
+    );
+    if let Some(remaining) = &quota.remaining {
+        println!(
+            "  Remaining: ~{} tokens{}",
+            remaining.tokens,
+            cost(&remaining.cost)
+        );
+    }
+    if let Some(monthly) = &quota.monthly {
+        println!(
+            "  Per month: ~{} tokens{}",
+            monthly.tokens,
+            cost(&monthly.cost)
+        );
+    }
+    println!(
+        "  From {:.0}% of meter movement over {} cycle(s), at API list prices",
+        quota.basis_percent, quota.basis_cycles
+    );
+}
+
 /// The overview, forecast and per-provider and per-model totals of a stats report.
 fn print_highlights(report: &UsageStatsReport) {
     let overview = &report.overview;
@@ -177,6 +232,9 @@ fn print_highlights(report: &UsageStatsReport) {
     }
     if let Some(hour) = overview.peak_hour {
         println!("Peak hour: {hour:02}:00");
+    }
+    for quota in &report.quota {
+        print_quota(quota);
     }
     match &report.forecast {
         Some(forecast) => {

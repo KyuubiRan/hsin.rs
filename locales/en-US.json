@@ -454,5 +454,15 @@
   "cli.pricing.set.arg.id": "Custom rule to replace",
   "cli.pricing.remove.about": "Remove a custom price rule",
   "cli.pricing.remove.arg.id": "ID of the custom rule",
-  "cli.pricing.refresh.about": "Fetch the public LiteLLM price list"
+  "cli.pricing.refresh.about": "Fetch the public LiteLLM price list",
+  "stats_quota": "Plan quota",
+  "stats_quota_weekly": "weekly window",
+  "stats_quota_hours": "{hours}-hour window",
+  "stats_quota_used": "used",
+  "stats_quota_resets": "resets",
+  "stats_quota_capacity": "Allowance",
+  "stats_quota_remaining": "Remaining",
+  "stats_quota_monthly": "Per month",
+  "stats_quota_pending": "The meter has not moved a full point yet; keep using the plan to estimate its allowance.",
+  "stats_quota_note": "Back-calculated from {percent}% of meter movement over {cycles} cycle(s) at API list prices; the plan's token limit is not published."
 }

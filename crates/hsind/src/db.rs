@@ -16,7 +16,7 @@ use crate::{
     },
 };
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 const PROVIDER_COLUMNS: &str = "p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,EXISTS(SELECT 1 FROM provider_secrets configured WHERE configured.provider_id=p.id),p.claude_model_mapping,p.codex_config_name,p.scope,p.codex_image_enabled,p.codex_image_models,p.codex_image_preferred_model,p.network_proxy,EXISTS(SELECT 1 FROM protected_values proxy_secret WHERE proxy_secret.key='provider_proxy_password:' || p.id),p.codex_tuning";
 
@@ -668,7 +668,7 @@ fn migrate(connection: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS usage_events(id INTEGER PRIMARY KEY AUTOINCREMENT,client TEXT NOT NULL CHECK(client IN ('codex','claude')),source TEXT NOT NULL CHECK(source IN ('proxy','session')),provider_id TEXT,provider_name TEXT NOT NULL,provider_revision INTEGER NOT NULL DEFAULT 0,model TEXT NOT NULL,event_at INTEGER NOT NULL,input_tokens INTEGER NOT NULL DEFAULT 0,cache_write_tokens INTEGER NOT NULL DEFAULT 0,cache_read_tokens INTEGER NOT NULL DEFAULT 0,output_tokens INTEGER NOT NULL DEFAULT 0,reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,attribution TEXT NOT NULL CHECK(attribution IN ('exact','inferred','unattributed')),dedup_key TEXT NOT NULL UNIQUE,correlation_key TEXT,created_at INTEGER NOT NULL);
          CREATE INDEX IF NOT EXISTS usage_events_query_idx ON usage_events(client,event_at,provider_id,model);
          CREATE INDEX IF NOT EXISTS usage_events_correlation_idx ON usage_events(client,correlation_key,event_at);
-         CREATE TABLE IF NOT EXISTS usage_sync_cursors(path_hash TEXT PRIMARY KEY,client TEXT NOT NULL CHECK(client IN ('codex','claude')),modified_at INTEGER NOT NULL,file_size INTEGER NOT NULL,byte_offset INTEGER NOT NULL,tail_fingerprint TEXT NOT NULL,updated_at INTEGER NOT NULL);
+         CREATE TABLE IF NOT EXISTS usage_sync_cursors(path_hash TEXT PRIMARY KEY,client TEXT NOT NULL CHECK(client IN ('codex','claude')),modified_at INTEGER NOT NULL,file_size INTEGER NOT NULL,byte_offset INTEGER NOT NULL,tail_fingerprint TEXT NOT NULL,updated_at INTEGER NOT NULL,parser_state TEXT NOT NULL DEFAULT '');
          CREATE TABLE IF NOT EXISTS usage_routes(id INTEGER PRIMARY KEY AUTOINCREMENT,client TEXT NOT NULL CHECK(client IN ('codex','claude')),effective_at INTEGER NOT NULL,provider_id TEXT,provider_name TEXT NOT NULL,provider_revision INTEGER NOT NULL DEFAULT 0,mode TEXT NOT NULL CHECK(mode IN ('direct','proxy')),UNIQUE(client,effective_at));
          CREATE INDEX IF NOT EXISTS usage_routes_lookup_idx ON usage_routes(client,effective_at DESC);
          CREATE TABLE IF NOT EXISTS usage_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL,updated_at INTEGER NOT NULL);
@@ -678,7 +678,9 @@ fn migrate(connection: &Connection) -> Result<()> {
          INSERT OR IGNORE INTO client_state(client,mode,config_status,updated_at) VALUES('codex','direct','unmanaged',0),('claude','direct','unmanaged',0);
          INSERT OR IGNORE INTO codex_image_state(id,active_provider_id,updated_at) VALUES(1,NULL,0);
          INSERT OR IGNORE INTO settings(key,value,updated_at) VALUES('language','system',0),('proxy_host','127.0.0.1',0),('proxy_port','9999',0),('proxy_enabled','false',0),('upstream_proxy','{"mode":"direct","manual":{"protocol":"http","host":"127.0.0.1","port":7890,"username":"","password_configured":false}}',0);
-         PRAGMA user_version=11;
+         CREATE TABLE IF NOT EXISTS usage_quota_readings(reading_key TEXT NOT NULL,quota_window TEXT NOT NULL CHECK(quota_window IN ('primary','secondary')),client TEXT NOT NULL,observed_at INTEGER NOT NULL,limit_id TEXT NOT NULL,window_minutes INTEGER NOT NULL,resets_at INTEGER NOT NULL,used_percent REAL NOT NULL,plan_type TEXT,model TEXT NOT NULL,input_tokens INTEGER NOT NULL DEFAULT 0,cache_write_tokens INTEGER NOT NULL DEFAULT 0,cache_read_tokens INTEGER NOT NULL DEFAULT 0,output_tokens INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(reading_key,quota_window));
+         CREATE INDEX IF NOT EXISTS usage_quota_readings_idx ON usage_quota_readings(client,observed_at);
+         PRAGMA user_version=12;
          COMMIT;"#
         )?;
     } else {
@@ -794,6 +796,19 @@ fn migrate(connection: &Connection) -> Result<()> {
                  CREATE TABLE usage_rollup_dirty(client TEXT NOT NULL,day TEXT NOT NULL,PRIMARY KEY(client,day));
                  CREATE TABLE model_prices(id TEXT PRIMARY KEY,model_pattern TEXT NOT NULL,provider_id TEXT,currency TEXT NOT NULL,input_price REAL NOT NULL,cache_write_price REAL,cache_read_price REAL,output_price REAL NOT NULL,source TEXT NOT NULL CHECK(source IN ('remote','user')),updated_at INTEGER NOT NULL);
                  PRAGMA user_version=11;
+                 COMMIT;",
+            )?;
+            version = 11;
+        }
+        // Parser state lets a sync that resumes mid-file keep the model and cumulative counters
+        // it had; quota readings back the plan allowance estimate.
+        if version == 11 {
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE usage_sync_cursors ADD COLUMN parser_state TEXT NOT NULL DEFAULT '';
+                 CREATE TABLE usage_quota_readings(reading_key TEXT NOT NULL,quota_window TEXT NOT NULL CHECK(quota_window IN ('primary','secondary')),client TEXT NOT NULL,observed_at INTEGER NOT NULL,limit_id TEXT NOT NULL,window_minutes INTEGER NOT NULL,resets_at INTEGER NOT NULL,used_percent REAL NOT NULL,plan_type TEXT,model TEXT NOT NULL,input_tokens INTEGER NOT NULL DEFAULT 0,cache_write_tokens INTEGER NOT NULL DEFAULT 0,cache_read_tokens INTEGER NOT NULL DEFAULT 0,output_tokens INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(reading_key,quota_window));
+                 CREATE INDEX usage_quota_readings_idx ON usage_quota_readings(client,observed_at);
+                 PRAGMA user_version=12;
                  COMMIT;",
             )?;
         }
@@ -1041,6 +1056,8 @@ mod tests {
                  DROP TABLE usage_hourly;
                  DROP TABLE usage_rollup_dirty;
                  DROP TABLE model_prices;
+                 DROP TABLE usage_quota_readings;
+                 ALTER TABLE usage_sync_cursors DROP COLUMN parser_state;
                  PRAGMA user_version=9;",
             )
             .unwrap();
@@ -1078,6 +1095,7 @@ mod tests {
             "usage_hourly",
             "usage_rollup_dirty",
             "model_prices",
+            "usage_quota_readings",
         ] {
             let exists: bool = db
                 .connection

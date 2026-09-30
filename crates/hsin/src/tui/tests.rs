@@ -4089,6 +4089,31 @@ fn usage_report() -> UsageStatsReport {
                 cost: vec![usd(7.5)],
             },
         }),
+        quota: vec![hsin_core::UsageQuotaEstimate {
+            limit_id: "codex".into(),
+            window: "primary".into(),
+            window_minutes: 10_080,
+            plan_type: Some("pro".into()),
+            used_percent: 4.0,
+            resets_at: 1_791_335_429,
+            observed_at: 1_791_300_000,
+            basis_percent: 4.0,
+            basis_cycles: 1,
+            capacity: Some(hsin_core::UsageQuotaCapacity {
+                tokens: 2_000_000_000,
+                tokens_low: 1_600_000_000,
+                tokens_high: Some(2_600_000_000),
+                cost: vec![usd(1_250.0)],
+            }),
+            remaining: Some(hsin_core::UsageProjection {
+                tokens: 1_920_000_000,
+                cost: vec![usd(1_200.0)],
+            }),
+            monthly: Some(hsin_core::UsageProjection {
+                tokens: 8_571_428_571,
+                cost: vec![usd(5_357.0)],
+            }),
+        }],
     }
 }
 
@@ -4218,6 +4243,10 @@ fn heatmap_days_and_range_chips_respond_to_the_mouse() {
     assert!(rendered.contains("250 tokens"));
     assert!(rendered.contains("Forecast"));
     assert!(rendered.contains("Month end"));
+    assert!(rendered.contains("Plan quota · pro"));
+    assert!(rendered.contains("≈2.0b · ≈$1250"));
+    assert!(rendered.contains("(1.6b–2.6b)"));
+    assert!(rendered.contains("Per month"));
     assert!(rendered.contains("$4.00"));
 
     let week = hit_area(&state, |hit| *hit == super::mouse::Hit::StatsRange(1));

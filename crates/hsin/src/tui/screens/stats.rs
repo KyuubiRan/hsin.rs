@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{Datelike, Duration, Local, NaiveDate};
-use hsin_core::{UsageCalendarDay, UsageProjection, UsageStatsReport};
+use hsin_core::{UsageCalendarDay, UsageProjection, UsageQuotaEstimate, UsageStatsReport};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -532,6 +532,10 @@ fn draw_summary(
             Style::default().fg(MUTED),
         )));
     }
+    for estimate in report.quota.iter().take(2) {
+        lines.push(Line::from(""));
+        lines.extend(quota_lines(estimate, i18n));
+    }
     lines.push(Line::from(""));
     lines.extend(forecast_lines(report, i18n));
     let mut details = vec![
@@ -622,6 +626,92 @@ fn metric(label: &str, value: u64) -> Span<'static> {
         format!("{label} {}", compact(value)),
         Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
     )
+}
+
+/// A subscription window and the allowance back-calculated for it.
+fn quota_lines(estimate: &UsageQuotaEstimate, i18n: &I18n) -> Vec<Line<'static>> {
+    let muted = Style::default().fg(MUTED);
+    let bold = Style::default().fg(WHITE).add_modifier(Modifier::BOLD);
+    let window = quota_window_label(estimate.window_minutes, i18n);
+    let resets =
+        chrono::DateTime::from_timestamp(estimate.resets_at, 0).map_or_else(String::new, |value| {
+            value
+                .with_timezone(&Local)
+                .format("%m-%d %H:%M")
+                .to_string()
+        });
+    let mut header = vec![Span::styled(i18n.text("stats_quota").to_owned(), bold)];
+    if let Some(plan) = &estimate.plan_type {
+        header.push(Span::styled(format!(" · {plan}"), bold));
+    }
+    header.push(Span::styled(
+        format!(
+            "  {window} · {:.0}% {} · {} {resets}",
+            estimate.used_percent,
+            i18n.text("stats_quota_used"),
+            i18n.text("stats_quota_resets"),
+        ),
+        muted,
+    ));
+    let mut lines = vec![Line::from(header)];
+    let Some(capacity) = &estimate.capacity else {
+        lines.push(Line::from(Span::styled(
+            i18n.text("stats_quota_pending").to_owned(),
+            muted,
+        )));
+        return lines;
+    };
+    let amount = |tokens: u64, cost: &[hsin_core::UsageCost]| {
+        if cost.is_empty() {
+            format!("≈{}", compact(tokens))
+        } else {
+            format!("≈{} · ≈{}", compact(tokens), format_cost(cost))
+        }
+    };
+    let range = format!(
+        "  ({}–{})",
+        compact(capacity.tokens_low),
+        capacity.tokens_high.map_or_else(|| "?".to_owned(), compact)
+    );
+    let label = |key: &str| Span::styled(format!("{}  ", i18n.text(key)), muted);
+    lines.push(Line::from(vec![
+        label("stats_quota_capacity"),
+        Span::styled(amount(capacity.tokens, &capacity.cost), bold),
+        Span::styled(range, muted),
+    ]));
+    if let Some(remaining) = &estimate.remaining {
+        lines.push(Line::from(vec![
+            label("stats_quota_remaining"),
+            Span::styled(amount(remaining.tokens, &remaining.cost), bold),
+        ]));
+    }
+    if let Some(monthly) = &estimate.monthly {
+        lines.push(Line::from(vec![
+            label("stats_quota_monthly"),
+            Span::styled(
+                amount(monthly.tokens, &monthly.cost),
+                Style::default().fg(RED).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        i18n.text("stats_quota_note")
+            .replace("{percent}", &format!("{:.0}", estimate.basis_percent))
+            .replace("{cycles}", &estimate.basis_cycles.to_string()),
+        muted,
+    )));
+    lines
+}
+
+fn quota_window_label(minutes: u32, i18n: &I18n) -> String {
+    if minutes == 7 * 24 * 60 {
+        i18n.text("stats_quota_weekly").to_owned()
+    } else if minutes.is_multiple_of(60) {
+        i18n.text("stats_quota_hours")
+            .replace("{hours}", &(minutes / 60).to_string())
+    } else {
+        format!("{minutes} min")
+    }
 }
 
 fn forecast_lines(report: &UsageStatsReport, i18n: &I18n) -> Vec<Line<'static>> {

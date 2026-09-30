@@ -53,6 +53,15 @@ averages the last 28 complete days, blending the overall daily mean half and
 half with the same-weekday mean, and projects the month end and the next 30
 days; it follows the Provider and model filters but not the queried range.
 
+Codex `token_count` records also carry the plan's quota windows (`used_percent`,
+window length, reset time, plan type). Each is stored in `usage_quota_readings`
+with the tokens of the same record, for 35 days. A window's allowance is
+Σ tokens × 100 / Σ meter movement over its recent reset cycles, excluding each
+cycle's first reading; each cycle adds one point of uncertainty to the reported
+range. Session cursors keep the Codex parser state (current model and
+cumulative counters) so a sync that resumes mid-file still knows the model; a
+one-time pass relabels events an earlier version filed under `unknown`.
+
 Costs are estimates from `model_prices` plus a built-in table: a
 Provider-scoped rule beats a general one, a user rule beats a fetched one which
 beats a built-in one, and an exact model beats the longest matching prefix.

@@ -48,8 +48,8 @@ type BuiltinPrice = (
 /// When the built-in table was last checked against the vendors' price pages.
 const BUILTIN_AS_OF: i64 = 1_790_726_400; // 2026-09-30T00:00:00Z
 
-/// Standard first-party list prices. `DeepSeek` bills half these rates off-peak; the peak rate is
-/// kept so estimates err high.
+/// Standard first-party list prices. `DeepSeek` bills half these rates off-peak, and `OpenAI` bills
+/// requests over 272K input tokens at a long-context rate; the standard peak rate is kept.
 const BUILTIN_PRICES: &[BuiltinPrice] = &[
     (
         "claude-fable-5-1",
@@ -81,6 +81,10 @@ const BUILTIN_PRICES: &[BuiltinPrice] = &[
     ("deepseek-v4-pro*", "USD", 1.32, None, Some(0.044), 3.96),
     ("deepseek-v4-flash*", "USD", 0.3, None, Some(0.006), 1.2),
     ("deepseek-flash*", "USD", 0.3, None, Some(0.006), 1.2),
+    ("gpt-6-astra*", "USD", 10.0, Some(12.5), Some(1.0), 50.0),
+    ("gpt-6.1-sol*", "USD", 2.0, Some(2.5), Some(0.1), 10.0),
+    ("gpt-6-sol*", "USD", 2.0, Some(2.5), Some(0.1), 10.0),
+    ("gpt-6-luna*", "USD", 0.1, Some(0.125), Some(0.01), 0.5),
     ("gpt-5.6-sol*", "USD", 4.0, None, Some(0.4), 20.0),
     ("gpt-5.6-terra*", "USD", 2.0, None, Some(0.2), 12.0),
     ("gpt-5.6-luna*", "USD", 0.2, None, Some(0.02), 1.2),

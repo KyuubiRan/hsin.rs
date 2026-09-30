@@ -13,11 +13,13 @@ use hsin_core::{
     ClientKind, ConnectionMode, ModelPrice, USAGE_CALENDAR_DAYS, USAGE_MODEL_SERIES_DAYS,
     UsageAttribution, UsageAttributionCounts, UsageCalendarDay, UsageCost, UsageDailyBucket,
     UsageDataSource, UsageFilterOptions, UsageForecast, UsageModelBreakdown, UsageOverview,
-    UsageProjection, UsageProviderBreakdown, UsageProviderOption, UsageStatsQuery,
-    UsageStatsReport, UsageSyncResult, UsageTokenSummary, add_usage_cost, best_model_price,
+    UsageProjection, UsageProviderBreakdown, UsageProviderOption, UsageQuotaCapacity,
+    UsageQuotaEstimate, UsageStatsQuery, UsageStatsReport, UsageSyncResult, UsageTokenSummary,
+    add_usage_cost, best_model_price,
 };
 use parking_lot::Mutex;
 use rusqlite::{OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -29,6 +31,13 @@ const SYNC_STATUS_KEY: &str = "usage_sync_status";
 const LAST_CLEANUP_AT_KEY: &str = "usage_last_cleanup_at";
 const ROLLUP_VERSION_KEY: &str = "usage_rollup_version";
 const ROLLUP_VERSION: &str = "1";
+const CODEX_REPAIR_KEY: &str = "usage_codex_repair_version";
+const CODEX_REPAIR_VERSION: &str = "1";
+/// How far back quota readings are kept and repaired: a few weekly cycles.
+const QUOTA_HISTORY_DAYS: i64 = 35;
+/// Readings whose reset times differ by more than this belong to different cycles.
+const QUOTA_CYCLE_TOLERANCE_SECONDS: i64 = 600;
+const UNKNOWN_MODEL: &str = "unknown";
 /// The longest daily series a query returns, so no range can outgrow an IPC frame.
 const MAX_QUERY_DAYS: i64 = 3660;
 /// Complete days a forecast looks back over.
@@ -60,6 +69,55 @@ struct Cursor {
     file_size: u64,
     byte_offset: u64,
     tail_fingerprint: String,
+    /// What the parser knew at `byte_offset`, so a resumed read keeps the current model.
+    parser_state: String,
+}
+
+/// Codex writes the model once per turn and usage per request, so the parser carries both
+/// across lines — and, through the cursor, across syncs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CodexState {
+    model: String,
+    cumulative: Option<UsageTokenSummary>,
+}
+
+impl Default for CodexState {
+    fn default() -> Self {
+        Self {
+            model: UNKNOWN_MODEL.into(),
+            cumulative: None,
+        }
+    }
+}
+
+impl CodexState {
+    fn restore(saved: &str) -> Self {
+        serde_json::from_str(saved).unwrap_or_default()
+    }
+}
+
+/// One quota window as a Codex `token_count` line reports it.
+#[derive(Debug, Clone, PartialEq)]
+struct QuotaReading {
+    window: &'static str,
+    limit_id: String,
+    window_minutes: i64,
+    resets_at: i64,
+    used_percent: f64,
+    plan_type: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct QuotaRow {
+    window: String,
+    limit_id: String,
+    window_minutes: i64,
+    resets_at: i64,
+    used_percent: f64,
+    plan_type: Option<String>,
+    model: String,
+    observed_at: i64,
+    tokens: UsageTokenSummary,
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +238,11 @@ impl UsageCollector {
                 self.record_route(client, now)?;
             }
             for (client, path, metadata, offset, fingerprint) in existing {
+                let parser_state = if client == ClientKind::Codex {
+                    serde_json::to_string(&codex_state_at(&path, offset).unwrap_or_default())?
+                } else {
+                    String::new()
+                };
                 self.save_cursor(
                     &path_hash(&path),
                     client,
@@ -188,6 +251,7 @@ impl UsageCollector {
                         file_size: metadata.len(),
                         byte_offset: offset,
                         tail_fingerprint: fingerprint,
+                        parser_state,
                     },
                     now,
                 )?;
@@ -198,7 +262,8 @@ impl UsageCollector {
             }
         }
         self.cleanup_if_due(now, true)?;
-        self.backfill_rollups(now)
+        self.backfill_rollups(now)?;
+        self.repair_codex_sessions(now)
     }
 
     pub(crate) fn record_current_route(&self, client: ClientKind) -> Result<()> {
@@ -300,6 +365,7 @@ impl UsageCollector {
         files
     }
 
+    #[allow(clippy::too_many_lines)]
     fn sync_file(
         &self,
         client: ClientKind,
@@ -314,6 +380,7 @@ impl UsageCollector {
             file_size: 0,
             byte_offset: 0,
             tail_fingerprint: String::new(),
+            parser_state: String::new(),
         });
         if metadata.len() < cursor.byte_offset
             || (cursor.byte_offset > 0
@@ -330,8 +397,12 @@ impl UsageCollector {
         let mut reader = BufReader::new(file);
         reader.seek(SeekFrom::Start(cursor.byte_offset))?;
         let mut offset = cursor.byte_offset;
-        let mut codex_model = String::from("unknown");
-        let mut codex_cumulative: Option<UsageTokenSummary> = None;
+        let mut codex = if cursor.byte_offset > 0 {
+            CodexState::restore(&cursor.parser_state)
+        } else {
+            CodexState::default()
+        };
+        let quota_horizon = unix_time() - QUOTA_HISTORY_DAYS * 86_400;
         loop {
             let line_start = offset;
             let mut bytes = Vec::new();
@@ -357,7 +428,15 @@ impl UsageCollector {
             let parsed = match client {
                 ClientKind::Claude => parse_claude_session(&value),
                 ClientKind::Codex => {
-                    parse_codex_session(&value, &mut codex_model, &mut codex_cumulative)
+                    let parsed = parse_codex_session(&value, &mut codex);
+                    self.record_quota_readings(
+                        &value,
+                        &quota_reading_key(&hash, line_start),
+                        parsed.as_ref(),
+                        &codex.model,
+                        quota_horizon,
+                    )?;
+                    parsed
                 }
             };
             let Some(mut parsed) = parsed else {
@@ -379,15 +458,7 @@ impl UsageCollector {
                 };
             }
             if parsed.dedup_key.is_empty() {
-                parsed.dedup_key = parsed.correlation_key.as_ref().map_or_else(
-                    || digest(&format!("session:{client}:{hash}:{line_start}")),
-                    |correlation| {
-                        digest(&format!(
-                            "session:{client}:{correlation}:{}",
-                            parsed.event_at
-                        ))
-                    },
-                );
+                parsed.dedup_key = session_event_key(&parsed, &hash, line_start);
             }
             if self.insert_event(&parsed)? {
                 result.imported = result.imported.saturating_add(1);
@@ -403,9 +474,208 @@ impl UsageCollector {
                 file_size: metadata.len(),
                 byte_offset: offset,
                 tail_fingerprint: tail_fingerprint(path, offset)?,
+                parser_state: if client == ClientKind::Codex {
+                    serde_json::to_string(&codex)?
+                } else {
+                    String::new()
+                },
             },
             unix_time(),
         )
+    }
+
+    /// Stores the quota windows a Codex line reports, with the usage the same line carries, so the
+    /// estimate can relate meter movement to tokens.
+    fn record_quota_readings(
+        &self,
+        value: &Value,
+        key: &str,
+        event: Option<&UsageEvent>,
+        model: &str,
+        horizon: i64,
+    ) -> Result<()> {
+        let Some(observed_at) = timestamp(value) else {
+            return Ok(());
+        };
+        let readings = codex_quota_readings(value, observed_at);
+        if readings.is_empty() || observed_at < horizon {
+            return Ok(());
+        }
+        let tokens = event.map(|event| event.tokens.clone()).unwrap_or_default();
+        let connection = self.db.connection.lock();
+        for reading in readings {
+            connection.execute(
+                "INSERT OR IGNORE INTO usage_quota_readings(reading_key,quota_window,client,observed_at,limit_id,window_minutes,resets_at,used_percent,plan_type,model,input_tokens,cache_write_tokens,cache_read_tokens,output_tokens) VALUES(?1,?2,'codex',?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                params![
+                    key, reading.window, observed_at, reading.limit_id, reading.window_minutes,
+                    reading.resets_at, reading.used_percent, reading.plan_type, model,
+                    tokens.input_tokens, tokens.cache_write_tokens, tokens.cache_read_tokens,
+                    tokens.output_tokens,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Before parser state was kept across syncs, a sync that resumed mid-file lost the current
+    /// model and filed the rest of the session under `unknown`. This rereads recent Codex sessions
+    /// once, relabels those events, fills in the cursors' parser state, and collects the quota
+    /// readings of the files it passes.
+    fn repair_codex_sessions(&self, now: i64) -> Result<()> {
+        if self.meta(CODEX_REPAIR_KEY)?.as_deref() == Some(CODEX_REPAIR_VERSION) {
+            return Ok(());
+        }
+        let horizon = now - QUOTA_HISTORY_DAYS * 86_400;
+        for (client, path) in self.session_files() {
+            let recent =
+                fs::metadata(&path).is_ok_and(|metadata| modified_seconds(&metadata) >= horizon);
+            if client == ClientKind::Codex && recent {
+                // One unreadable file must not keep the others unrepaired.
+                let _ = self.repair_codex_file(&path, horizon, now);
+            }
+        }
+        self.refresh_rollups()?;
+        self.set_meta(CODEX_REPAIR_KEY, CODEX_REPAIR_VERSION, now)
+    }
+
+    fn repair_codex_file(&self, path: &Path, horizon: i64, now: i64) -> Result<()> {
+        let hash = path_hash(path);
+        let cursor = self.cursor(&hash)?;
+        let mut state = CodexState::default();
+        let mut state_at_cursor = None;
+        let mut offset = 0_u64;
+        let mut reader = BufReader::new(File::open(path)?);
+        loop {
+            if cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.byte_offset == offset)
+            {
+                state_at_cursor = Some(state.clone());
+            }
+            let line_start = offset;
+            let mut bytes = Vec::new();
+            let read = reader.read_until(b'\n', &mut bytes)?;
+            if read == 0 || !bytes.ends_with(b"\n") {
+                break;
+            }
+            offset = offset.saturating_add(read as u64);
+            let Some(value) = codex_line(&bytes) else {
+                continue;
+            };
+            let event = parse_codex_session(&value, &mut state);
+            self.record_quota_readings(
+                &value,
+                &quota_reading_key(&hash, line_start),
+                event.as_ref(),
+                &state.model,
+                horizon,
+            )?;
+            if let Some(event) = event
+                && event.model != UNKNOWN_MODEL
+            {
+                self.relabel_unknown_event(&event, &hash, line_start)?;
+            }
+        }
+        if let (Some(mut cursor), Some(state)) = (cursor, state_at_cursor) {
+            cursor.parser_state = serde_json::to_string(&state)?;
+            self.save_cursor(&hash, ClientKind::Codex, &cursor, now)?;
+        }
+        Ok(())
+    }
+
+    /// Moves an event stored under the `unknown` model to its real one. When the real one is
+    /// already stored, the `unknown` copy is a duplicate and goes.
+    fn relabel_unknown_event(&self, event: &UsageEvent, hash: &str, line_start: u64) -> Result<()> {
+        let unknown = UsageEvent {
+            model: UNKNOWN_MODEL.into(),
+            correlation_key: Some(token_correlation(
+                ClientKind::Codex,
+                UNKNOWN_MODEL,
+                &event.tokens,
+            )),
+            ..event.clone()
+        };
+        let unknown_key = session_event_key(&unknown, hash, line_start);
+        let correct_key = session_event_key(event, hash, line_start);
+        let mut connection = self.db.connection.lock();
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM usage_events WHERE dedup_key=?1)",
+            [&unknown_key],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(());
+        }
+        let transaction = connection.transaction()?;
+        let moved = transaction.execute(
+            "UPDATE OR IGNORE usage_events SET model=?1,correlation_key=?2,dedup_key=?3 WHERE dedup_key=?4",
+            params![event.model, event.correlation_key, correct_key, unknown_key],
+        )?;
+        if moved == 0 {
+            transaction.execute(
+                "DELETE FROM usage_events WHERE dedup_key=?1",
+                [&unknown_key],
+            )?;
+        }
+        transaction.execute(
+            "INSERT OR IGNORE INTO usage_rollup_dirty(client,day) VALUES('codex',?1)",
+            [local_date(event.event_at)],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Back-calculates each quota window's allowance from the readings of its recent cycles.
+    fn quota_estimates(
+        &self,
+        client: ClientKind,
+        prices: &[ModelPrice],
+        now: i64,
+    ) -> Result<Vec<UsageQuotaEstimate>> {
+        let rows = {
+            let connection = self.db.connection.lock();
+            let mut statement = connection.prepare(
+                "SELECT quota_window,limit_id,window_minutes,resets_at,used_percent,plan_type,model,observed_at,input_tokens,cache_write_tokens,cache_read_tokens,output_tokens FROM usage_quota_readings WHERE client=?1 AND observed_at>=?2 ORDER BY observed_at,rowid",
+            )?;
+            let rows = statement.query_map(
+                params![client.to_string(), now - QUOTA_HISTORY_DAYS * 86_400],
+                |row| {
+                    Ok(QuotaRow {
+                        window: row.get(0)?,
+                        limit_id: row.get(1)?,
+                        window_minutes: row.get(2)?,
+                        resets_at: row.get(3)?,
+                        used_percent: row.get(4)?,
+                        plan_type: row.get(5)?,
+                        model: row.get(6)?,
+                        observed_at: row.get(7)?,
+                        tokens: UsageTokenSummary {
+                            input_tokens: row.get(8)?,
+                            cache_write_tokens: row.get(9)?,
+                            cache_read_tokens: row.get(10)?,
+                            output_tokens: row.get(11)?,
+                            reasoning_output_tokens: 0,
+                            request_count: 1,
+                        },
+                    })
+                },
+            )?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let mut groups = BTreeMap::<(String, String, i64), Vec<QuotaRow>>::new();
+        for row in rows {
+            groups
+                .entry((row.limit_id.clone(), row.window.clone(), row.window_minutes))
+                .or_default()
+                .push(row);
+        }
+        let today = Local::now().date_naive();
+        let mut estimates = groups
+            .values()
+            .filter_map(|rows| estimate_quota(rows, prices, now, today))
+            .collect::<Vec<_>>();
+        estimates.sort_by_key(|estimate| std::cmp::Reverse(estimate.observed_at));
+        Ok(estimates)
     }
 
     /// Stores one event and marks the days it can have changed for the next rollup refresh, in one
@@ -610,6 +880,7 @@ impl UsageCollector {
             ));
         }
         self.refresh_rollups()?;
+        let query_client = query.client;
         let today = Local::now().date_naive();
         let collected_since = self
             .meta(STARTED_AT_KEY)?
@@ -807,6 +1078,7 @@ impl UsageCollector {
             overview,
             calendar,
             forecast,
+            quota: self.quota_estimates(query_client, &price_rules, unix_time())?,
         })
     }
 
@@ -815,9 +1087,9 @@ impl UsageCollector {
             .connection
             .lock()
             .query_row(
-                "SELECT modified_at,file_size,byte_offset,tail_fingerprint FROM usage_sync_cursors WHERE path_hash=?1",
+                "SELECT modified_at,file_size,byte_offset,tail_fingerprint,parser_state FROM usage_sync_cursors WHERE path_hash=?1",
                 [hash],
-                |row| Ok(Cursor { modified_at: row.get(0)?, file_size: row.get(1)?, byte_offset: row.get(2)?, tail_fingerprint: row.get(3)? }),
+                |row| Ok(Cursor { modified_at: row.get(0)?, file_size: row.get(1)?, byte_offset: row.get(2)?, tail_fingerprint: row.get(3)?, parser_state: row.get(4)? }),
             )
             .optional()
             .map_err(Into::into)
@@ -825,8 +1097,8 @@ impl UsageCollector {
 
     fn save_cursor(&self, hash: &str, client: ClientKind, cursor: &Cursor, now: i64) -> Result<()> {
         self.db.connection.lock().execute(
-            "INSERT INTO usage_sync_cursors(path_hash,client,modified_at,file_size,byte_offset,tail_fingerprint,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(path_hash) DO UPDATE SET client=excluded.client,modified_at=excluded.modified_at,file_size=excluded.file_size,byte_offset=excluded.byte_offset,tail_fingerprint=excluded.tail_fingerprint,updated_at=excluded.updated_at",
-            params![hash, client.to_string(), cursor.modified_at, cursor.file_size, cursor.byte_offset, cursor.tail_fingerprint, now],
+            "INSERT INTO usage_sync_cursors(path_hash,client,modified_at,file_size,byte_offset,tail_fingerprint,updated_at,parser_state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(path_hash) DO UPDATE SET client=excluded.client,modified_at=excluded.modified_at,file_size=excluded.file_size,byte_offset=excluded.byte_offset,tail_fingerprint=excluded.tail_fingerprint,updated_at=excluded.updated_at,parser_state=excluded.parser_state",
+            params![hash, client.to_string(), cursor.modified_at, cursor.file_size, cursor.byte_offset, cursor.tail_fingerprint, now, cursor.parser_state],
         )?;
         Ok(())
     }
@@ -1138,11 +1410,11 @@ fn parse_claude_session(value: &Value) -> Option<UsageEvent> {
     })
 }
 
-fn parse_codex_session(
-    value: &Value,
-    current_model: &mut String,
-    cumulative: &mut Option<UsageTokenSummary>,
-) -> Option<UsageEvent> {
+fn parse_codex_session(value: &Value, state: &mut CodexState) -> Option<UsageEvent> {
+    let CodexState {
+        model: current_model,
+        cumulative,
+    } = state;
     if value.get("type").and_then(Value::as_str) == Some("turn_context")
         && let Some(model) = value.pointer("/payload/model").and_then(Value::as_str)
     {
@@ -1198,6 +1470,219 @@ fn parse_codex_session(
         dedup_key: String::new(),
         correlation_key: Some(correlation),
     })
+}
+
+/// The quota windows of a Codex `token_count` line. Older clients give `resets_in_seconds`
+/// instead of an absolute `resets_at`.
+fn codex_quota_readings(value: &Value, observed_at: i64) -> Vec<QuotaReading> {
+    if value.pointer("/payload/type").and_then(Value::as_str) != Some("token_count") {
+        return Vec::new();
+    }
+    let Some(limits) = value
+        .pointer("/payload/rate_limits")
+        .filter(|value| value.is_object())
+    else {
+        return Vec::new();
+    };
+    let limit_id = limits
+        .get("limit_id")
+        .and_then(Value::as_str)
+        .unwrap_or("codex")
+        .to_owned();
+    let plan_type = limits
+        .get("plan_type")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    ["primary", "secondary"]
+        .into_iter()
+        .filter_map(|window| {
+            let limit = limits.get(window).filter(|value| value.is_object())?;
+            let used_percent = limit.get("used_percent").and_then(Value::as_f64)?;
+            let window_minutes = limit.get("window_minutes").and_then(Value::as_i64)?;
+            let resets_at = limit.get("resets_at").and_then(Value::as_i64).or_else(|| {
+                limit
+                    .get("resets_in_seconds")
+                    .and_then(Value::as_i64)
+                    .map(|seconds| observed_at + seconds)
+            })?;
+            (used_percent.is_finite()
+                && (0.0..=100.0).contains(&used_percent)
+                && window_minutes > 0)
+                .then(|| QuotaReading {
+                    window,
+                    limit_id: limit_id.clone(),
+                    window_minutes,
+                    resets_at,
+                    used_percent,
+                    plan_type: plan_type.clone(),
+                })
+        })
+        .collect()
+}
+
+/// Parses only the Codex lines the usage parser reads; the rest can be megabytes of transcript.
+fn codex_line(bytes: &[u8]) -> Option<Value> {
+    if bytes.len() > MAX_SESSION_LINE_BYTES {
+        return None;
+    }
+    let relevant = |needle: &[u8]| bytes.windows(needle.len()).any(|window| window == needle);
+    if !relevant(b"turn_context") && !relevant(b"token_count") {
+        return None;
+    }
+    serde_json::from_slice(bytes).ok()
+}
+
+/// The Codex parser state after the complete lines before `offset`.
+fn codex_state_at(path: &Path, offset: u64) -> Result<CodexState> {
+    let mut state = CodexState::default();
+    let mut reader = BufReader::new(File::open(path)?).take(offset);
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        if reader.read_until(b'\n', &mut bytes)? == 0 {
+            break;
+        }
+        if let Some(value) = codex_line(&bytes) {
+            parse_codex_session(&value, &mut state);
+        }
+    }
+    Ok(state)
+}
+
+fn session_event_key(event: &UsageEvent, hash: &str, line_start: u64) -> String {
+    let client = event.client;
+    event.correlation_key.as_ref().map_or_else(
+        || digest(&format!("session:{client}:{hash}:{line_start}")),
+        |correlation| {
+            digest(&format!(
+                "session:{client}:{correlation}:{}",
+                event.event_at
+            ))
+        },
+    )
+}
+
+fn quota_reading_key(hash: &str, line_start: u64) -> String {
+    digest(&format!("quota:{hash}:{line_start}"))
+}
+
+/// Tokens and cost spent while the meter moved, per cycle, pooled over the recent cycles:
+/// allowance ≈ Σ tokens × 100 / Σ meter movement. Meter readings are whole percents, so each
+/// cycle's movement is uncertain by one point either way, which the range reports.
+#[allow(clippy::cast_precision_loss)]
+fn estimate_quota(
+    rows: &[QuotaRow],
+    prices: &[ModelPrice],
+    now: i64,
+    today: NaiveDate,
+) -> Option<UsageQuotaEstimate> {
+    let latest = rows.last()?;
+    let mut cycles: Vec<&[QuotaRow]> = Vec::new();
+    let mut start = 0;
+    for index in 1..rows.len() {
+        let previous = &rows[index - 1];
+        let row = &rows[index];
+        if (row.resets_at - previous.resets_at).abs() > QUOTA_CYCLE_TOLERANCE_SECONDS
+            || row.used_percent + 0.5 < previous.used_percent
+        {
+            cycles.push(&rows[start..index]);
+            start = index;
+        }
+    }
+    cycles.push(&rows[start..]);
+
+    let mut resolved = HashMap::<&str, Option<&ModelPrice>>::new();
+    let mut tokens = 0_u64;
+    let mut cost = Vec::new();
+    let mut movement = 0.0_f64;
+    let mut used_cycles = 0_u32;
+    for cycle in cycles {
+        let (Some(first), Some(last)) = (cycle.first(), cycle.last()) else {
+            continue;
+        };
+        let moved = last.used_percent - first.used_percent;
+        if moved < 1.0 {
+            continue;
+        }
+        movement += moved;
+        used_cycles += 1;
+        for row in &cycle[1..] {
+            tokens += row.tokens.total_tokens();
+            let price = *resolved
+                .entry(row.model.as_str())
+                .or_insert_with(|| best_model_price(prices, None, &row.model));
+            if let Some(price) = price {
+                add_usage_cost(&mut cost, &price.currency, price.cost(&row.tokens));
+            }
+        }
+    }
+    let used_percent = if now >= latest.resets_at {
+        0.0
+    } else {
+        latest.used_percent
+    };
+    let scale = |value: f64, percent: f64| value * 100.0 / percent;
+    let capacity = (movement >= 1.0).then(|| {
+        let slack = f64::from(used_cycles);
+        UsageQuotaCapacity {
+            tokens: token_count(scale(tokens as f64, movement)),
+            tokens_low: token_count(scale(tokens as f64, movement + slack)),
+            tokens_high: (movement > slack)
+                .then(|| token_count(scale(tokens as f64, movement - slack))),
+            cost: cost
+                .iter()
+                .map(|entry| UsageCost {
+                    currency: entry.currency.clone(),
+                    amount: scale(entry.amount, movement),
+                })
+                .collect(),
+        }
+    });
+    let portion = |capacity: &UsageQuotaCapacity, factor: f64| UsageProjection {
+        tokens: token_count(capacity.tokens as f64 * factor),
+        cost: capacity
+            .cost
+            .iter()
+            .map(|entry| UsageCost {
+                currency: entry.currency.clone(),
+                amount: entry.amount * factor,
+            })
+            .collect(),
+    };
+    let remaining = capacity
+        .as_ref()
+        .map(|capacity| portion(capacity, (100.0 - used_percent).max(0.0) / 100.0));
+    let monthly = capacity
+        .as_ref()
+        .filter(|_| latest.window_minutes >= 24 * 60)
+        .map(|capacity| {
+            let minutes = f64::from(days_in_month(today)) * 24.0 * 60.0;
+            portion(capacity, minutes / latest.window_minutes as f64)
+        });
+    Some(UsageQuotaEstimate {
+        limit_id: latest.limit_id.clone(),
+        window: latest.window.clone(),
+        window_minutes: u32::try_from(latest.window_minutes).unwrap_or(u32::MAX),
+        plan_type: latest.plan_type.clone(),
+        used_percent,
+        resets_at: latest.resets_at,
+        observed_at: latest.observed_at,
+        basis_percent: movement,
+        basis_cycles: used_cycles,
+        capacity,
+        remaining,
+        monthly,
+    })
+}
+
+fn days_in_month(date: NaiveDate) -> u32 {
+    let next = if date.month() == 12 {
+        NaiveDate::from_ymd_opt(date.year() + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(date.year(), date.month() + 1, 1)
+    };
+    next.and_then(|next| next.pred_opt())
+        .map_or(30, |last| last.day())
 }
 
 pub(crate) fn openai_tokens(usage: &Value) -> UsageTokenSummary {
@@ -2224,5 +2709,194 @@ mod tests {
         assert_eq!(overview.current_streak, 2);
         assert_eq!(overview.most_active_day.unwrap().date, date_key(dates[5]));
         assert_eq!(overview.peak_hour, Some(3));
+    }
+
+    fn codex_turn(model: &str) -> String {
+        serde_json::json!({"type":"turn_context","timestamp":Utc::now().to_rfc3339(),"payload":{"model":model}})
+            .to_string()
+    }
+
+    fn codex_usage(input: u64, used_percent: Option<f64>, resets_at: i64) -> String {
+        let mut payload = serde_json::json!({
+            "type": "token_count",
+            "info": {"last_token_usage": {"input_tokens": input, "output_tokens": 0}}
+        });
+        if let Some(used_percent) = used_percent {
+            payload["rate_limits"] = serde_json::json!({
+                "limit_id": "codex",
+                "plan_type": "pro",
+                "primary": {"used_percent": used_percent, "window_minutes": 10080, "resets_at": resets_at},
+                "secondary": null
+            });
+        }
+        serde_json::json!({"type":"event_msg","timestamp":Utc::now().to_rfc3339(),"payload":payload})
+            .to_string()
+    }
+
+    fn codex_models(collector: &UsageCollector) -> Vec<(String, u64)> {
+        collector
+            .query(all_time(ClientKind::Codex))
+            .expect("query")
+            .models
+            .into_iter()
+            .map(|model| (model.model, model.tokens.request_count))
+            .collect()
+    }
+
+    #[test]
+    fn codex_model_survives_a_sync_that_resumes_mid_file() {
+        let (root, db, collector) = test_collector();
+        collector.initialize().expect("initialize");
+        let log = root.join("codex/sessions/resumed.jsonl");
+        fs::write(
+            &log,
+            format!(
+                "{}\n{}\n",
+                codex_turn("gpt-6.1-sol"),
+                codex_usage(10, None, 0)
+            ),
+        )
+        .expect("first turn");
+        collector.sync().expect("first sync");
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .expect("append");
+        writeln!(file, "{}", codex_usage(20, None, 0)).expect("second usage");
+        drop(file);
+        collector.sync().expect("resumed sync");
+        assert_eq!(codex_models(&collector), [("gpt-6.1-sol".to_owned(), 2)]);
+        drop(collector);
+        drop(db);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn repair_relabels_events_an_earlier_sync_filed_under_unknown() {
+        let (root, db, collector) = test_collector();
+        collector.initialize().expect("initialize");
+        let log = root.join("codex/sessions/old.jsonl");
+        let turn = codex_turn("gpt-6-astra");
+        let usage = codex_usage(30, None, 0);
+        fs::write(&log, format!("{turn}\n{usage}\n")).expect("log");
+        // What a resumed sync used to store: the same line, under `unknown`.
+        let mut parser = CodexState::default();
+        let mut stale = parse_codex_session(&serde_json::from_str(&usage).unwrap(), &mut parser)
+            .expect("usage event");
+        let line_start = turn.len() as u64 + 1;
+        stale.dedup_key = session_event_key(&stale, &path_hash(&log), line_start);
+        collector.insert_event(&stale).expect("stale event");
+        assert_eq!(codex_models(&collector), [(UNKNOWN_MODEL.to_owned(), 1)]);
+
+        db.connection
+            .lock()
+            .execute("DELETE FROM usage_meta WHERE key=?1", [CODEX_REPAIR_KEY])
+            .expect("rearm repair");
+        collector
+            .repair_codex_sessions(unix_time())
+            .expect("repair");
+        assert_eq!(codex_models(&collector), [("gpt-6-astra".to_owned(), 1)]);
+        drop(collector);
+        drop(db);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn quota_readings_back_calculate_the_weekly_allowance() {
+        let (root, db, collector) = test_collector();
+        collector.initialize().expect("initialize");
+        let resets_at = unix_time() + 3 * 86_400;
+        fs::write(
+            root.join("codex/sessions/quota.jsonl"),
+            [
+                codex_turn("gpt-6.1-sol"),
+                codex_usage(1_000_000, Some(10.0), resets_at),
+                codex_usage(500_000, Some(11.0), resets_at),
+                codex_usage(500_000, Some(12.0), resets_at),
+            ]
+            .map(|line| line + "\n")
+            .concat(),
+        )
+        .expect("log");
+        collector.sync().expect("sync");
+        let report = collector.query(all_time(ClientKind::Codex)).expect("query");
+        let [quota] = &report.quota[..] else {
+            panic!("one weekly window: {:?}", report.quota);
+        };
+        assert_eq!(quota.plan_type.as_deref(), Some("pro"));
+        assert_eq!(quota.window_minutes, 10_080);
+        assert!((quota.used_percent - 12.0).abs() < f64::EPSILON);
+        let capacity = quota.capacity.as_ref().expect("capacity");
+        // Two points of movement bought one million tokens.
+        assert_eq!(capacity.tokens, 50_000_000);
+        assert_eq!(capacity.tokens_low, 33_333_333);
+        assert_eq!(capacity.tokens_high, Some(100_000_000));
+        // One million GPT-6.1 Sol input tokens list at $2.
+        assert!((capacity.cost[0].amount - 100.0).abs() < 1e-6);
+        assert_eq!(quota.remaining.as_ref().unwrap().tokens, 44_000_000);
+        let days = f64::from(days_in_month(Local::now().date_naive()));
+        assert_eq!(
+            quota.monthly.as_ref().unwrap().tokens,
+            token_count(50_000_000.0 * days / 7.0)
+        );
+        drop(collector);
+        drop(db);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn quota_readings_accept_relative_resets_and_both_windows() {
+        let value = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "primary": {"used_percent": 40.0, "window_minutes": 300, "resets_in_seconds": 600},
+                    "secondary": {"used_percent": 5.0, "window_minutes": 10080, "resets_at": 99},
+                    "plan_type": "plus"
+                }
+            }
+        });
+        let readings = codex_quota_readings(&value, 1_000);
+        assert_eq!(readings.len(), 2);
+        assert_eq!(readings[0].resets_at, 1_600);
+        assert_eq!(readings[0].limit_id, "codex");
+        assert_eq!(readings[1].window, "secondary");
+        assert_eq!(readings[1].plan_type.as_deref(), Some("plus"));
+        let unmetered = serde_json::json!({"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":null}}});
+        assert!(codex_quota_readings(&unmetered, 0).is_empty());
+    }
+
+    #[test]
+    fn a_meter_that_barely_moved_gives_no_estimate() {
+        let row = |used_percent: f64, input: u64| QuotaRow {
+            window: "primary".into(),
+            limit_id: "codex".into(),
+            window_minutes: 300,
+            resets_at: 10_000,
+            used_percent,
+            plan_type: None,
+            model: "gpt-6.1-sol".into(),
+            observed_at: 0,
+            tokens: tokens(input, 0),
+        };
+        let today = Local::now().date_naive();
+        let flat = estimate_quota(&[row(3.0, 0), row(3.0, 500)], &[], 0, today).unwrap();
+        assert!(flat.capacity.is_none());
+        // A reset starts a new cycle instead of reading as negative movement.
+        let reset = estimate_quota(
+            &[row(90.0, 0), row(92.0, 100), row(1.0, 0), row(3.0, 100)],
+            &[],
+            0,
+            today,
+        )
+        .unwrap();
+        assert!((reset.basis_percent - 4.0).abs() < f64::EPSILON);
+        assert_eq!(reset.basis_cycles, 2);
+        assert!(
+            reset.monthly.is_none(),
+            "a five-hour window has no monthly figure"
+        );
+        assert_eq!(reset.capacity.unwrap().tokens, 5_000);
     }
 }
