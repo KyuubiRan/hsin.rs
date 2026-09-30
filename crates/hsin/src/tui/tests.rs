@@ -4693,7 +4693,7 @@ fn chart_style_toggles_saves_and_follows_the_daemon() {
     let bars = render(&mut state, 120, 44);
     assert!(bars.contains("Input (cache hit)"));
     assert!(bars.contains("Input (cache miss)"));
-    assert!(!bars.contains("(log)"));
+    assert!(!bars.contains("log"));
 
     state.reduce(key(KeyCode::Char('v')));
     assert_eq!(state.stats_chart_style, hsin_core::StatsChartStyle::Line);
@@ -4702,7 +4702,7 @@ fn chart_style_toggles_saves_and_follows_the_daemon() {
         Some(Effect::SetStatsChartStyle(hsin_core::StatsChartStyle::Line))
     ));
     let lines = render(&mut state, 120, 44);
-    assert!(lines.contains("(log)"));
+    assert!(lines.contains("log"));
     assert!(lines.contains("Output"));
 
     // The saved style comes back with the settings, whatever the screen last showed.

@@ -204,7 +204,7 @@ fn draw_day_popup(
             Constraint::Length(3),
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Length(6),
+            Constraint::Length(8),
             Constraint::Length(1),
             Constraint::Min(2),
         ])
@@ -988,7 +988,10 @@ fn draw_models(
         return None;
     }
     let chart_count = report.models.len().min(4);
-    let chart_height = (area.height / 2).max(6);
+    // The charts take what the model list below them leaves: a line per charted model, one for
+    // the rest, and a blank line.
+    let list_rows = u16::try_from(chart_count).unwrap_or(4) + u16::from(report.models.len() > 4);
+    let chart_height = area.height.saturating_sub(list_rows + 1).max(6);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(chart_height), Constraint::Min(4)])
