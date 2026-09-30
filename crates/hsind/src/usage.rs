@@ -288,6 +288,11 @@ impl UsageCollector {
             }
         }
         self.cleanup_if_due(now, true)?;
+        // Claude five-hour readings an earlier version stored.
+        self.db.connection.lock().execute(
+            "DELETE FROM usage_quota_readings WHERE client='claude' AND quota_window='primary'",
+            [],
+        )?;
         self.backfill_rollups(now)
     }
 
@@ -1743,9 +1748,10 @@ struct ClaudeQuotaWindow {
     share: f64,
 }
 
-/// The plan usage Claude Code cached in its global config: the five-hour session window and the
-/// weekly window, the account, and the plan. The weekly window is shared with chat and other apps;
-/// its breakdown gives Claude Code's share.
+/// The plan usage Claude Code cached in its global config: the weekly window, the account, and the
+/// plan. The weekly window is shared with chat and other apps; its breakdown gives Claude Code's
+/// share. The five-hour session window resets too often, and is refreshed too rarely, to estimate
+/// an allowance from, so it is not read.
 fn claude_quota_reading(config: &Value) -> Option<ClaudeQuotaReading> {
     let cached = config.get("cachedUsageUtilization")?;
     let observed_at = cached.get("fetchedAtMs").and_then(Value::as_i64)? / 1000;
@@ -1778,30 +1784,27 @@ fn claude_quota_reading(config: &Value) -> Option<ClaudeQuotaReading> {
         .and_then(|row| row.get("percent"))
         .and_then(Value::as_f64)
         .map_or(1.0, |percent| (percent / 100.0).clamp(0.0, 1.0));
-    let windows = [
-        ("five_hour", "primary", 300, 1.0),
-        ("seven_day", "secondary", 7 * 24 * 60, share),
-    ]
-    .into_iter()
-    .filter_map(|(name, window, window_minutes, share)| {
-        let limit = utilization.get(name).filter(|value| value.is_object())?;
-        let used_percent = limit.get("utilization").and_then(Value::as_f64)?;
-        let resets_at = limit
-            .get("resets_at")
-            .and_then(Value::as_str)
-            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())?
-            .timestamp();
-        (used_percent.is_finite() && (0.0..=100.0).contains(&used_percent)).then_some(
-            ClaudeQuotaWindow {
-                window,
-                window_minutes,
-                resets_at,
-                used_percent,
-                share,
-            },
-        )
-    })
-    .collect::<Vec<_>>();
+    let windows = [("seven_day", "secondary", 7 * 24 * 60, share)]
+        .into_iter()
+        .filter_map(|(name, window, window_minutes, share)| {
+            let limit = utilization.get(name).filter(|value| value.is_object())?;
+            let used_percent = limit.get("utilization").and_then(Value::as_f64)?;
+            let resets_at = limit
+                .get("resets_at")
+                .and_then(Value::as_str)
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())?
+                .timestamp();
+            (used_percent.is_finite() && (0.0..=100.0).contains(&used_percent)).then_some(
+                ClaudeQuotaWindow {
+                    window,
+                    window_minutes,
+                    resets_at,
+                    used_percent,
+                    share,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
     (!windows.is_empty()).then(|| ClaudeQuotaReading {
         account: digest(&format!("claude-account:{account_id}"))[..8].to_owned(),
         plan_type,
@@ -3417,12 +3420,12 @@ mod tests {
         assert_eq!(reading.plan_type.as_deref(), Some("claude_pro"));
         assert_eq!(reading.account.len(), 8);
         assert!(!reading.account.contains("account"));
-        assert_eq!(reading.windows.len(), 2);
-        assert_eq!(reading.windows[0].window_minutes, 300);
-        assert!((reading.windows[0].share - 1.0).abs() < f64::EPSILON);
-        assert_eq!(reading.windows[1].window, "secondary");
-        assert!((reading.windows[1].share - 0.8).abs() < f64::EPSILON);
-        assert!((reading.windows[1].used_percent - 49.0).abs() < f64::EPSILON);
+        let [weekly] = &reading.windows[..] else {
+            panic!("only the weekly window is read");
+        };
+        assert_eq!(weekly.window_minutes, 10_080);
+        assert!((weekly.share - 0.8).abs() < f64::EPSILON);
+        assert!((weekly.used_percent - 49.0).abs() < f64::EPSILON);
         assert!(claude_quota_reading(&serde_json::json!({"oauthAccount": {}})).is_none());
     }
 
@@ -3482,15 +3485,7 @@ mod tests {
         assert_eq!(weekly.capacity.as_ref().unwrap().tokens, 50_000_000);
         // Sonnet 5 input lists at $2 per million.
         assert!((weekly.capacity.as_ref().unwrap().cost[0].amount - 100.0).abs() < 1e-6);
-        let session = quota
-            .iter()
-            .find(|estimate| estimate.window_minutes == 300)
-            .expect("session window");
-        assert!(
-            session.capacity.is_none(),
-            "the five-hour meter did not move"
-        );
-        assert_eq!(session.plan_key, weekly.plan_key);
+        assert_eq!(quota.len(), 1, "no five-hour window: {quota:?}");
         drop(collector);
         drop(db);
         fs::remove_dir_all(root).expect("cleanup");

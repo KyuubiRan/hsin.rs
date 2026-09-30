@@ -66,8 +66,9 @@ account, provider, plan and window is estimated on its own: a user can move
 between plans and accounts, and relay sessions carry no quota readings at all.
 Windows missing from the newest readings are reported as no longer in use.
 
-Claude Code caches its plan usage (five-hour and weekly windows, reset times,
-and Claude Code's share of the weekly window) in its global config. Every
+Claude Code caches its plan usage (weekly window, reset time, and Claude
+Code's share of it) in its global config; its five-hour window resets too often
+to estimate from and is not read. Every
 refresh is a reading, credited with the official-login Claude requests since
 the previous reading of the same window; relay requests are left out, and the
 weekly movement is scaled by Claude Code's share because chat and other apps
