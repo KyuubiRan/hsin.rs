@@ -82,6 +82,7 @@ impl Target {
             }
             Err(error) => return Err(error.into()),
         }
+        #[cfg(unix)]
         set_private_file(&lock)?;
         self.verify_path()?;
         let record_path = self.path.join(RECORD_NAME);
@@ -270,6 +271,7 @@ impl Guard {
             ));
         }
         let mut output = AtomicWriteFile::open(&record_path)?;
+        #[cfg(unix)]
         set_private_file(output.as_file())?;
         output.write_all(&bytes)?;
         let (_, latest_hash) = read_document(&record_path)?;
@@ -378,11 +380,6 @@ fn reject_symlink(path: &Path) -> Result<()> {
 fn set_private_file(file: &File) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_private_file(_file: &File) -> Result<()> {
     Ok(())
 }
 
