@@ -68,6 +68,8 @@ pub struct ConfigTarget {
     /// active mapping or restores the snapshot once while leaving a mapping.
     #[serde(default)]
     pub claude_model_env_before: Option<ClaudeModelEnvSnapshot>,
+    #[serde(default)]
+    pub ownership_lease: Option<AuthBackupLease>,
 }
 
 const fn default_true() -> bool {
@@ -187,6 +189,15 @@ pub struct CodexAuthSnapshot {
     pub file_existed: bool,
     pub auth_mode: Option<String>,
     pub openai_api_key: Option<String>,
+    #[serde(default)]
+    pub lease: Option<AuthBackupLease>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
+pub struct AuthBackupLease {
+    pub instance_id: String,
+    pub target_id: String,
+    pub generation: u64,
 }
 
 /// Resolve a client's configuration path.
@@ -466,6 +477,7 @@ pub fn capture_codex_auth(path: &Path) -> Result<CodexAuthSnapshot> {
         file_existed,
         auth_mode: optional_string(&value, "auth_mode", "Codex auth")?,
         openai_api_key: optional_string(&value, "OPENAI_API_KEY", "Codex auth")?,
+        lease: None,
     })
 }
 
@@ -520,6 +532,194 @@ pub fn codex_auth_is_managed(text: &str, api_key: &str) -> Result<bool> {
     Ok(
         optional_string(&value, "auth_mode", "Codex auth")?.as_deref() == Some("apikey")
             && optional_string(&value, "OPENAI_API_KEY", "Codex auth")?.as_deref() == Some(api_key),
+    )
+}
+
+/// Hash only the fields whose ownership was actually acquired. OAuth tokens and
+/// native settings remain outside this projection, so refreshes do not revoke a lease.
+pub fn ownership_fingerprints(
+    client: ClientKind,
+    path: &Path,
+    scope: &crate::ownership::ManagedScope,
+) -> Result<crate::ownership::Fingerprints> {
+    let text = if path.exists() {
+        fs::read_to_string(path)?
+    } else {
+        String::new()
+    };
+    let projection = match client {
+        ClientKind::Codex => {
+            let document = parse_toml(&text)
+                .map_err(|_| DaemonError::Config("invalid Codex configuration".into()))?;
+            let mut owned = BTreeMap::new();
+            owned.insert(
+                "model_provider".to_owned(),
+                document.get("model_provider").map(toml_projection),
+            );
+            owned.insert(
+                "hsin".to_owned(),
+                document
+                    .get("model_providers")
+                    .and_then(|item| item.get("hsin"))
+                    .map(toml_projection),
+            );
+            for key in &scope.codex_keys {
+                owned.insert(key.clone(), document.get(key).map(toml_projection));
+            }
+            serde_json::to_value(owned)?
+        }
+        ClientKind::Claude => {
+            let value = parse_json_object(&text, "Claude configuration")?;
+            let mut owned = BTreeMap::new();
+            owned.insert(
+                "apiKeyHelper".to_owned(),
+                value.get("apiKeyHelper").cloned(),
+            );
+            for key in [
+                "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+            ]
+            .iter()
+            .copied()
+            .chain(scope.claude_model_keys.iter().map(String::as_str))
+            {
+                owned.insert(
+                    key.to_owned(),
+                    value.get("env").and_then(|env| env.get(key)).cloned(),
+                );
+            }
+            serde_json::to_value(owned)?
+        }
+    };
+    let config = hash(&Zeroizing::new(serde_json::to_vec(&projection)?));
+    let auth = if client == ClientKind::Codex && scope.codex_auth {
+        let auth_path = codex_auth_path(path)?;
+        let text = if auth_path.exists() {
+            fs::read_to_string(auth_path)?
+        } else {
+            String::new()
+        };
+        let value = parse_json_object(&text, "Codex auth")?;
+        let fields = [
+            value.get("auth_mode").cloned(),
+            value.get("OPENAI_API_KEY").cloned(),
+        ];
+        Some(hash(&Zeroizing::new(serde_json::to_vec(&fields)?)))
+    } else {
+        None
+    };
+    Ok(crate::ownership::Fingerprints { config, auth })
+}
+
+fn toml_projection(item: &Item) -> serde_json::Value {
+    use serde_json::Value as Json;
+    if let Some(table) = item.as_table_like() {
+        return Json::Object(
+            table
+                .iter()
+                .map(|(key, item)| (key.to_owned(), toml_projection(item)))
+                .collect(),
+        );
+    }
+    let Some(value) = item.as_value() else {
+        return Json::Null;
+    };
+    if let Some(value) = value.as_str() {
+        return Json::String(value.to_owned());
+    }
+    if let Some(value) = value.as_integer() {
+        return Json::from(value);
+    }
+    if let Some(value) = value.as_bool() {
+        return Json::from(value);
+    }
+    if let Some(value) = value.as_float() {
+        return Json::from(value);
+    }
+    if let Some(array) = value.as_array() {
+        return Json::Array(
+            array
+                .iter()
+                .map(|value| toml_projection(&Item::Value(value.clone())))
+                .collect(),
+        );
+    }
+    Json::String(value.to_string())
+}
+
+pub fn has_legacy_hsin_configuration(client: ClientKind, path: &Path) -> Result<bool> {
+    let text = if path.exists() {
+        fs::read_to_string(path)?
+    } else {
+        String::new()
+    };
+    match client {
+        ClientKind::Codex => {
+            let document = parse_toml(&text)
+                .map_err(|_| DaemonError::Config("invalid Codex configuration".into()))?;
+            if document.get("model_provider").and_then(Item::as_str) == Some("hsin")
+                || document
+                    .get("model_providers")
+                    .and_then(|item| item.get("hsin"))
+                    .is_some()
+            {
+                return Ok(true);
+            }
+            let auth_path = codex_auth_path(path)?;
+            let auth = if auth_path.exists() {
+                fs::read_to_string(auth_path)?
+            } else {
+                String::new()
+            };
+            let value = parse_json_object(&auth, "Codex auth")?;
+            Ok(value
+                .get("OPENAI_API_KEY")
+                .and_then(serde_json::Value::as_str)
+                == Some(HSIN_MANAGED_KEY))
+        }
+        ClientKind::Claude => {
+            let value = parse_json_object(&text, "Claude configuration")?;
+            Ok(value
+                .get("apiKeyHelper")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|helper| helper.contains("hsin"))
+                || ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"]
+                    .iter()
+                    .any(|key| {
+                        value
+                            .get("env")
+                            .and_then(|env| env.get(key))
+                            .and_then(serde_json::Value::as_str)
+                            == Some(HSIN_MANAGED_KEY)
+                    }))
+        }
+    }
+}
+
+/// A manual return to native authentication can establish a fresh baseline.
+/// Never infer that from an API key left by another managing instance.
+pub fn is_native_recovery_baseline(client: ClientKind, path: &Path) -> Result<bool> {
+    if has_legacy_hsin_configuration(client, path)? || !detect_current(path, client)?.official {
+        return Ok(false);
+    }
+    if client == ClientKind::Claude {
+        return Ok(true);
+    }
+    let auth_path = codex_auth_path(path)?;
+    if !auth_path.exists() {
+        return Ok(false);
+    }
+    let text = Zeroizing::new(fs::read_to_string(auth_path)?);
+    let value = parse_json_object(&text, "Codex auth")?;
+    Ok(
+        value.get("auth_mode").and_then(serde_json::Value::as_str) == Some("chatgpt")
+            && value
+                .get("tokens")
+                .is_some_and(serde_json::Value::is_object)
+            && value
+                .get("OPENAI_API_KEY")
+                .is_none_or(serde_json::Value::is_null),
     )
 }
 
@@ -1686,6 +1886,7 @@ mod tests {
             claude_model_names_update: None,
             codex_auth_before_hash: None,
             claude_model_env_before: None,
+            ownership_lease: None,
         }
     }
 
@@ -2218,6 +2419,7 @@ mod tests {
         );
 
         let empty_snapshot = CodexAuthSnapshot {
+            lease: None,
             auth_path: "/tmp/auth.json".into(),
             file_existed: true,
             auth_mode: None,
@@ -2485,6 +2687,7 @@ mod tests {
     fn codex_auth_patch_and_restore_preserve_unowned_fields() {
         let original = "{\r\n  // keep\r\n  \"auth_mode\": \"chatgpt\",\r\n  \"OPENAI_API_KEY\": \"old-secret\",\r\n  \"tokens\": { \"access_token\": \"keep-token\" },\r\n  \"account_id\": \"keep-account\"\r\n}\r\n";
         let snapshot = CodexAuthSnapshot {
+            lease: None,
             auth_path: "/tmp/auth.json".into(),
             file_existed: true,
             auth_mode: Some("chatgpt".into()),

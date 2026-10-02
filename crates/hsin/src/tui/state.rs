@@ -9,13 +9,13 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use hsin_core::{
     AuthScheme, ClaudeModelMapping, ClaudeModelMappingUpdate, ClientAuthSettings, ClientKind,
     ClientSettings, CodexConfigNameUpdate, CodexImageConfig, CodexReasoningEffort,
-    CodexTuningSettings, ConnectionMode, DEFAULT_CODEX_CONFIG_NAME, HSIN_CODEX_CONFIG_NAME,
-    LANGUAGE_EN_US, LANGUAGE_SYSTEM, LANGUAGE_ZH_CN, ModelDiscoverParams, ModelDiscovery,
-    ModelPrice, ModelPriceInput, ModelPriceList, ModelPriceSource, ModelSlot, ModelUpdate,
-    OPENAI_CODEX_CONFIG_NAME, Provider, ProviderProxyConfig, ProviderProxyMode, ProviderScope,
-    ProxyProtocol, SecretInput, Settings, UpstreamProxyConfig, UpstreamProxyMode, UsageStatsQuery,
-    UsageStatsReport, convert_provider_base_url, normalize_generated_provider_name,
-    provider_name_from_url,
+    CodexTuningSettings, ConfigConflictDetails, ConnectionMode, DEFAULT_CODEX_CONFIG_NAME,
+    HSIN_CODEX_CONFIG_NAME, LANGUAGE_EN_US, LANGUAGE_SYSTEM, LANGUAGE_ZH_CN, ModelDiscoverParams,
+    ModelDiscovery, ModelPrice, ModelPriceInput, ModelPriceList, ModelPriceSource, ModelSlot,
+    ModelUpdate, OPENAI_CODEX_CONFIG_NAME, Provider, ProviderProxyConfig, ProviderProxyMode,
+    ProviderScope, ProxyProtocol, SecretInput, Settings, UpstreamProxyConfig, UpstreamProxyMode,
+    UsageStatsQuery, UsageStatsReport, convert_provider_base_url,
+    normalize_generated_provider_name, provider_name_from_url,
 };
 use ratatui::layout::Position;
 use zeroize::Zeroizing;
@@ -37,6 +37,14 @@ pub(super) enum Action {
     },
     Notice(&'static str),
     Failed(String),
+    ConfigConflict {
+        operation: Effect,
+        details: ConfigConflictDetails,
+    },
+    ConfigurationFailed {
+        operation: Effect,
+        message: String,
+    },
     ModelsDiscovered {
         form: FormSubmission,
         discovery: ModelDiscovery,
@@ -90,6 +98,11 @@ pub(super) struct State {
     pub(super) notice: Option<String>,
     pub(super) input: InputMode,
     pub(super) pending_effect: Option<Effect>,
+    pub(super) config_takeover: Option<ConfigTakeoverDialog>,
+    /// Prompt once after the first successful status load; cancellation must survive refreshes.
+    pub(super) startup_config_checked: bool,
+    /// The model/mapping page that submitted a provider, retained until the mutation completes.
+    pub(super) config_origin: Option<InputMode>,
     /// Filter committed with enter; survives leaving [`InputMode::Search`].
     pub(super) search: String,
     /// Where the cursor sat in each client left behind, so returning to one resumes there instead
@@ -122,10 +135,32 @@ impl Default for State {
             notice: None,
             input: InputMode::Normal,
             pending_effect: None,
+            config_takeover: None,
+            startup_config_checked: false,
+            config_origin: None,
             search: String::new(),
             parked: HashMap::new(),
             hits: HitMap::default(),
         }
+    }
+}
+
+pub(super) struct ConfigTakeoverDialog {
+    pub(super) operation: Option<Box<Effect>>,
+    pub(super) details: ConfigConflictDetails,
+    pub(super) startup: bool,
+    /// Cancel is selected first; held Enter cannot silently approve a takeover.
+    pub(super) selected: usize,
+}
+
+impl ConfigTakeoverDialog {
+    pub(super) fn available(&self) -> bool {
+        !self.details.targets.is_empty()
+            && self
+                .details
+                .targets
+                .iter()
+                .all(|target| target.takeover_available)
     }
 }
 
@@ -495,6 +530,7 @@ pub(super) struct ProviderClipboard {
     pub(super) secret: Zeroizing<String>,
 }
 
+#[derive(Clone)]
 pub(super) struct FormSubmission {
     pub(super) id: Option<String>,
     pub(super) revision: Option<u64>,
@@ -775,6 +811,8 @@ impl State {
                 settings,
             } => self.apply_loaded(providers, status, settings),
             Action::Notice(key) => {
+                self.config_takeover = None;
+                self.config_origin = None;
                 self.notice = Some(format!("@{key}"));
                 self.loading = false;
             }
@@ -816,6 +854,35 @@ impl State {
                 }
                 self.notice = Some(message);
                 self.loading = false;
+            }
+            Action::ConfigConflict { operation, details } => {
+                for target in &details.targets {
+                    match target.client {
+                        ClientKind::Codex => {
+                            self.status.codex_config_status =
+                                Some(hsin_core::ConfigStatus::Conflict);
+                            self.status.codex_config_ownership = Some(target.clone());
+                        }
+                        ClientKind::Claude => {
+                            self.status.claude_config_status =
+                                Some(hsin_core::ConfigStatus::Conflict);
+                            self.status.claude_config_ownership = Some(target.clone());
+                        }
+                    }
+                }
+                self.config_takeover = Some(ConfigTakeoverDialog {
+                    startup: matches!(operation, Effect::Refresh),
+                    operation: Some(Box::new(operation)),
+                    details,
+                    selected: 0,
+                });
+                self.notice = None;
+                self.loading = false;
+            }
+            Action::ConfigurationFailed { operation, message } => {
+                self.config_takeover = None;
+                self.restore_configuration_operation(operation);
+                return self.reduce(Action::Failed(message));
             }
             Action::ModelsDiscovered {
                 mut form,
@@ -915,6 +982,8 @@ impl State {
         settings: Settings,
     ) {
         self.providers = providers;
+        self.config_takeover = None;
+        self.config_origin = None;
         self.status = status;
         self.language = settings.language;
         self.proxy_enabled = settings.proxy_enabled;
@@ -978,6 +1047,29 @@ impl State {
         self.clamp_selection();
         if let Some(index) = self.active_index() {
             self.selected = index;
+        }
+        self.prompt_startup_config_takeover();
+    }
+
+    fn prompt_startup_config_takeover(&mut self) {
+        if self.startup_config_checked {
+            return;
+        }
+        self.startup_config_checked = true;
+        let targets: Vec<_> = [ClientKind::Codex, ClientKind::Claude]
+            .into_iter()
+            .filter_map(|client| self.status.config_ownership(client))
+            .filter(|target| target.owner.is_some() && !target.owner_is_self)
+            .cloned()
+            .collect();
+        if !targets.is_empty() {
+            self.config_takeover = Some(ConfigTakeoverDialog {
+                operation: Some(Box::new(Effect::Refresh)),
+                details: ConfigConflictDetails { targets },
+                startup: true,
+                selected: 0,
+            });
+            self.notice = None;
         }
     }
 
@@ -1054,6 +1146,9 @@ impl State {
 
     #[allow(clippy::too_many_lines)]
     fn reduce_key(&mut self, key: KeyEvent) -> Transition {
+        if self.config_takeover.is_some() {
+            return self.reduce_config_takeover_key(key);
+        }
         if matches!(&self.input, InputMode::Form(form) if form.discovering_models) {
             return Transition::Continue;
         }
@@ -1404,7 +1499,7 @@ impl State {
                         Effect::Add(submission)
                     });
                     self.loading = true;
-                    self.input = InputMode::Normal;
+                    self.config_origin = Some(std::mem::take(&mut self.input));
                 }
                 _ => {
                     edit_mapping_row(mapping, key);
@@ -1448,7 +1543,7 @@ impl State {
                                 Effect::Add(submission)
                             });
                             self.loading = true;
-                            self.input = InputMode::Normal;
+                            self.config_origin = Some(std::mem::take(&mut self.input));
                         }
                     }
                     _ => {}
@@ -1478,7 +1573,7 @@ impl State {
                                 Effect::Add(submission)
                             });
                             self.loading = true;
-                            self.input = InputMode::Normal;
+                            self.config_origin = Some(std::mem::take(&mut self.input));
                         }
                     }
                     _ => {
@@ -1553,7 +1648,7 @@ impl State {
                             Effect::Add(submission)
                         });
                         self.loading = true;
-                        self.input = InputMode::Normal;
+                        self.config_origin = Some(std::mem::take(&mut self.input));
                     }
                     _ => {}
                 },
@@ -2512,6 +2607,75 @@ impl State {
         self.notice = None;
     }
 
+    fn reduce_config_takeover_key(&mut self, key: KeyEvent) -> Transition {
+        let Some(dialog) = &mut self.config_takeover else {
+            return Transition::Continue;
+        };
+        if dialog.operation.is_none() || key.kind == crossterm::event::KeyEventKind::Repeat {
+            return Transition::Continue;
+        }
+        match key.code {
+            KeyCode::Left | KeyCode::Up => dialog.selected = 0,
+            KeyCode::Right | KeyCode::Down | KeyCode::Tab if dialog.available() => {
+                dialog.selected = 1 - dialog.selected;
+            }
+            KeyCode::Esc | KeyCode::Char('q') => self.cancel_config_takeover(),
+            KeyCode::Enter if dialog.selected == 0 => self.cancel_config_takeover(),
+            KeyCode::Enter if dialog.available() => {
+                let request = crate::rpc::config_takeover_params(&dialog.details.targets);
+                let operation = dialog
+                    .operation
+                    .take()
+                    .expect("pending configuration operation");
+                self.pending_effect = Some(Effect::Takeover { request, operation });
+                self.loading = true;
+            }
+            _ => {}
+        }
+        Transition::Continue
+    }
+
+    fn cancel_config_takeover(&mut self) {
+        if let Some(dialog) = self.config_takeover.take()
+            && let Some(operation) = dialog.operation
+        {
+            self.restore_configuration_operation(*operation);
+        }
+        self.loading = false;
+        self.notice = None;
+    }
+
+    fn restore_configuration_operation(&mut self, operation: Effect) {
+        if let Effect::Add(form) | Effect::Edit(form) = operation
+            && (self.config_origin.is_some() || !form.skip_primary_model)
+        {
+            self.client = form.client;
+            self.input = match self.config_origin.take() {
+                Some(InputMode::Models(mut picker)) => {
+                    picker.form = form;
+                    InputMode::Models(picker)
+                }
+                Some(InputMode::ImageModels(mut picker)) => {
+                    picker.form = form;
+                    InputMode::ImageModels(picker)
+                }
+                Some(InputMode::ModelMapping(mut mapping)) => {
+                    mapping.form = form;
+                    InputMode::ModelMapping(mapping)
+                }
+                _ => InputMode::Form(form_from_submission(form)),
+            };
+        }
+        if let InputMode::Settings(SettingsScreen {
+            page: SettingsPage::UpstreamProxy { dirty, saving, .. },
+            ..
+        }) = &mut self.input
+        {
+            *saving = false;
+            *dirty = true;
+        }
+    }
+
     fn queue_without_mode_change(&mut self, effect: Effect) {
         self.pending_effect = Some(effect);
         self.loading = true;
@@ -3261,6 +3425,43 @@ fn provider_form(provider: Provider) -> ProviderForm {
     }
 }
 
+fn form_from_submission(submission: FormSubmission) -> ProviderForm {
+    let mut form = new_provider_form(submission.client, submission.scope);
+    form.id = submission.id;
+    form.revision = submission.revision;
+    form.name = submission.name;
+    form.description = submission.description;
+    form.base_url = submission.base_url;
+    form.auth_scheme = submission.auth_scheme;
+    form.secret = submission.secret;
+    form.codex_config_name = match submission.codex_config_name {
+        CodexConfigNameUpdate::Set(value) => value,
+        CodexConfigNameUpdate::Preserve => DEFAULT_CODEX_CONFIG_NAME.into(),
+    };
+    form.claude_model_mapping = match submission.claude_model_mapping {
+        ClaudeModelMappingUpdate::Set(value) => Some(value),
+        ClaudeModelMappingUpdate::Clear | ClaudeModelMappingUpdate::Preserve => None,
+    };
+    form.codex_image = submission.codex_image;
+    form.codex_tuning = submission.codex_tuning;
+    form.context_max = form
+        .codex_tuning
+        .context
+        .max_tokens
+        .map_or_else(String::new, |value| value.to_string());
+    form.context_compact = form
+        .codex_tuning
+        .context
+        .compact_tokens
+        .map_or_else(String::new, |value| value.to_string());
+    form.proxy_port = submission.network_proxy.manual.port.to_string();
+    form.network_proxy = submission.network_proxy;
+    form.proxy_password = submission.proxy_password;
+    form.proxy_password_clear = submission.proxy_password_clear;
+    form.cursor = caret_end(&form.base_url);
+    form
+}
+
 fn image_edit_submission(provider: &Provider, enabled: bool) -> FormSubmission {
     let mut codex_image = provider.codex_image.clone();
     codex_image.enabled = enabled;
@@ -3412,7 +3613,7 @@ fn prepare_upstream_proxy_effect(
     };
     Ok(Effect::SetUpstreamProxy {
         config: config.clone(),
-        password: password_update,
+        password: password_update.into(),
     })
 }
 

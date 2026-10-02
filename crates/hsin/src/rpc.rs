@@ -1,9 +1,12 @@
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, anyhow};
 use hsin_core::{
-    ClientKind, ConnectionMode, DaemonStatus, ErrorCode, Provider, ProviderListParams,
-    SecurityStatus,
+    ClientKind, ConfigOwnershipStatus, ConfigStatus, ConfigTakeoverParams, ConfigTakeoverTarget,
+    ConnectionMode, DaemonStatus, ErrorCode, Provider, ProviderListParams, SecurityStatus,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -35,6 +38,14 @@ pub struct StatusSnapshot {
     /// Defaults to held so a daemon that cannot report it raises no false alarm.
     #[serde(default = "assume_held")]
     pub recovery_key_exported: bool,
+    #[serde(default)]
+    pub codex_config_status: Option<ConfigStatus>,
+    #[serde(default)]
+    pub claude_config_status: Option<ConfigStatus>,
+    #[serde(default)]
+    pub codex_config_ownership: Option<ConfigOwnershipStatus>,
+    #[serde(default)]
+    pub claude_config_ownership: Option<ConfigOwnershipStatus>,
 }
 
 impl Default for StatusSnapshot {
@@ -49,7 +60,68 @@ impl Default for StatusSnapshot {
             proxy_enabled: false,
             security_locked: false,
             recovery_key_exported: true,
+            codex_config_status: None,
+            claude_config_status: None,
+            codex_config_ownership: None,
+            claude_config_ownership: None,
         }
+    }
+}
+
+impl StatusSnapshot {
+    pub fn config_status(&self, client: ClientKind) -> Option<ConfigStatus> {
+        if self
+            .config_ownership(client)
+            .is_some_and(|ownership| ownership.owner.is_some() && !ownership.owner_is_self)
+        {
+            return Some(ConfigStatus::Conflict);
+        }
+        match client {
+            ClientKind::Codex => self.codex_config_status,
+            ClientKind::Claude => self.claude_config_status,
+        }
+    }
+
+    pub fn config_ownership(&self, client: ClientKind) -> Option<&ConfigOwnershipStatus> {
+        match client {
+            ClientKind::Codex => self.codex_config_ownership.as_ref(),
+            ClientKind::Claude => self.claude_config_ownership.as_ref(),
+        }
+    }
+
+    pub fn configuration_applied(&self, client: ClientKind) -> bool {
+        self.config_status(client)
+            .is_none_or(|status| status == ConfigStatus::Synchronized)
+            && self
+                .config_ownership(client)
+                .is_none_or(|ownership| ownership.owner.is_none() || ownership.owner_is_self)
+    }
+}
+
+pub fn config_takeover_params(targets: &[ConfigOwnershipStatus]) -> ConfigTakeoverParams {
+    static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    ConfigTakeoverParams {
+        request_id: format!(
+            "{}-{time}-{}",
+            std::process::id(),
+            NEXT_REQUEST.fetch_add(1, Ordering::Relaxed)
+        ),
+        targets: targets
+            .iter()
+            .map(|ownership| ConfigTakeoverTarget {
+                client: ownership.client,
+                target_id: ownership.target_id.clone(),
+                expected_owner_id: ownership
+                    .owner
+                    .as_ref()
+                    .map(|owner| owner.instance_id.clone()),
+                expected_generation: ownership.generation,
+            })
+            .collect(),
     }
 }
 
@@ -122,7 +194,7 @@ impl DaemonClient {
         let client = Self::wait_until_ready(None).await?;
         anyhow::ensure!(
             client.required_capabilities_supported,
-            "installed hsind does not support Codex tuning settings"
+            "installed hsind does not support required configuration capabilities"
         );
         Ok(client)
     }
@@ -204,6 +276,7 @@ fn has_required_capabilities(capabilities: &[String]) -> bool {
     [
         hsin_ipc::capability::CONTEXT_PRESETS,
         hsin_ipc::capability::PLAN_MODE_REASONING,
+        hsin_ipc::capability::CONFIG_OWNERSHIP,
     ]
     .iter()
     .all(|required| capabilities.iter().any(|capability| capability == required))
@@ -248,9 +321,13 @@ fn decode_status(value: &Value) -> Result<StatusSnapshot> {
             if client.client == ClientKind::Codex {
                 status.codex_active_provider = client.active_provider_id;
                 status.codex_mode = client.mode;
+                status.codex_config_status = Some(client.config_status);
+                status.codex_config_ownership = client.config_ownership;
             } else {
                 status.claude_active_provider = client.active_provider_id;
                 status.claude_mode = client.mode;
+                status.claude_config_status = Some(client.config_status);
+                status.claude_config_ownership = client.config_ownership;
             }
         }
         return Ok(status);
@@ -297,12 +374,29 @@ fn decode_client_state(
         .transpose()
         .context("decode connection mode")?
         .unwrap_or(ConnectionMode::Direct);
+    let config_status = value
+        .get("config_status")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .context("decode configuration state")?;
+    let ownership = value
+        .get("config_ownership")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .context("decode configuration ownership")?;
     if codex {
         status.codex_active_provider = active;
         status.codex_mode = mode;
+        status.codex_config_status = config_status;
+        status.codex_config_ownership = ownership;
     } else {
         status.claude_active_provider = active;
         status.claude_mode = mode;
+        status.claude_config_status = config_status;
+        status.claude_config_ownership = ownership;
     }
     Ok(())
 }
@@ -310,6 +404,51 @@ fn decode_client_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_retains_configuration_conflict_and_binds_takeover_to_the_snapshot() {
+        let status = decode_status(&json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "locked": false,
+            "proxy_listening": false,
+            "proxy_address": "127.0.0.1:9999",
+            "clients": [{
+                "client": "codex",
+                "active_provider_id": "local-provider",
+                "mode": "direct",
+                "config_status": "conflict",
+                "config_ownership": {
+                    "client": "codex",
+                    "target_id": "canonical-target",
+                    "config_path": "/tmp/codex/config.toml",
+                    "generation": 42,
+                    "owner": {
+                        "instance_id": "other-instance",
+                        "instance_home": "/tmp/hsin-other",
+                        "instance_label": "Release",
+                        "daemon_version": env!("CARGO_PKG_VERSION")
+                    },
+                    "owner_is_self": false,
+                    "takeover_available": true
+                }
+            }]
+        }))
+        .expect("decode daemon status");
+        assert_eq!(status.codex_config_status, Some(ConfigStatus::Conflict));
+        assert!(!status.configuration_applied(ClientKind::Codex));
+        assert_eq!(
+            status.codex_active_provider.as_deref(),
+            Some("local-provider")
+        );
+        let request = config_takeover_params(&[status.codex_config_ownership.expect("owner")]);
+        assert_eq!(
+            request.targets[0].expected_owner_id.as_deref(),
+            Some("other-instance")
+        );
+        assert_eq!(request.targets[0].expected_generation, 42);
+        assert_eq!(request.targets[0].target_id, "canonical-target");
+        assert!(!request.request_id.is_empty());
+    }
 
     #[test]
     fn daemon_without_current_codex_tuning_is_reinstalled_even_at_same_version() {
@@ -320,6 +459,11 @@ mod tests {
             hsin_ipc::capability::CONTEXT_PRESETS.into(),
         ]));
         assert!(has_required_capabilities(&[
+            hsin_ipc::capability::CONTEXT_PRESETS.into(),
+            hsin_ipc::capability::PLAN_MODE_REASONING.into(),
+            hsin_ipc::capability::CONFIG_OWNERSHIP.into(),
+        ]));
+        assert!(!has_required_capabilities(&[
             hsin_ipc::capability::CONTEXT_PRESETS.into(),
             hsin_ipc::capability::PLAN_MODE_REASONING.into(),
         ]));

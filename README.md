@@ -116,6 +116,27 @@ Debug builds use a `hsin-debug` data home, so a development daemon never shares
 storage, keyring entries, the IPC endpoint, or the service identity with an
 installed release build.
 
+The client directories remain shared by default, so debug builds can exercise
+the real Codex and Claude Code configuration. Only one hsin instance may manage
+a client directory at a time. A conflicting write is rejected before changing
+configuration or provider state. On entering the TUI, configuration owned by
+another instance opens a takeover prompt with Cancel selected by default.
+Cancelling keeps the interface available and does not prompt again on refresh.
+Startup takeover transfers control without switching your selected provider;
+conflicting actions later ask whether to take over and continue. Safe takeover
+first restores the previous instance's preserved settings and authentication,
+then transfers ownership. That instance will not reapply the relinquished client
+on restart.
+If the previous instance cannot safely restore its state, takeover is refused.
+
+When upgrading an older instance, an existing hsin configuration may have no
+ownership record yet. Safe takeover is blocked until the previous managing
+instance switches the client to Official and restores its native configuration,
+or the client is signed in again to establish a native baseline. An old local
+authentication backup alone is not proof that it belongs to the current shared
+configuration. If an owner is offline, start it; if its key store is locked,
+unlock it; if it lacks the handoff protocol, upgrade it before retrying.
+
 ## Usage
 
 Run `hsin` with no arguments for the terminal UI. The mouse works alongside the
@@ -142,6 +163,8 @@ hsin provider list
 hsin provider switch codex <provider-id>
 
 hsin mode set codex proxy                     # direct or proxy
+hsin config takeover codex                    # explicitly take over shared configuration
+hsin config takeover codex claude             # take over both clients when necessary
 hsin settings get
 hsin security export-recovery-key             # keep this before you need it
 
@@ -152,6 +175,11 @@ hsin daemon status                            # also start, stop, restart, updat
 process arguments or shell history. Add `--json` to any command for
 machine-readable output, and `--language system|en-US|zh-CN` (or
 `HSIN_LANGUAGE`) to override the interface language.
+
+After a CLI takeover, rerun the original command. The CLI does not retain API
+keys for retry or automatically take over configuration. `hsin status` reports
+the configuration state and current managing instance for each client; another
+instance's selected provider is not displayed as applied to the shared client.
 
 Codex providers default their configuration name to `OpenAI`, enabling Codex's
 remote-compaction path. The TUI switch can disable it by writing `hsin`, and the

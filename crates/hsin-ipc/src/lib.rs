@@ -54,6 +54,8 @@ pub mod method {
     pub const CODEX_IMAGE_LIST: &str = "codex_image.list";
     pub const CODEX_IMAGE_SWITCH: &str = "codex_image.switch";
     pub const MODE_SET: &str = "mode.set";
+    pub const CONFIG_TAKEOVER: &str = "config.takeover";
+    pub const CONFIG_RELEASE: &str = "config.release";
     pub const STATUS: &str = "status";
     pub const DOCTOR: &str = "doctor";
     pub const SETTINGS_GET: &str = "settings.get";
@@ -78,6 +80,7 @@ pub mod capability {
     pub const LOCAL_PROXY: &str = "local_proxy.v1";
     pub const SECURITY: &str = "security.v1";
     pub const CONFIG_SAGA: &str = "config_saga.v1";
+    pub const CONFIG_OWNERSHIP: &str = "config_ownership.v1";
     pub const MODEL_DISCOVERY: &str = "model_discovery.v1";
     pub const CODEX_IMAGE: &str = "codex_image.v1";
     pub const USAGE_STATS: &str = "usage_stats.v1";
@@ -118,6 +121,8 @@ pub struct HelloResult {
     pub daemon_version: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -371,7 +376,8 @@ fn validate_json_rpc_version(version: &str) -> Result<(), TransportError> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum IpcEndpoint {
     Filesystem(PathBuf),
     Namespaced(String),
@@ -1014,6 +1020,49 @@ mod tests {
         assert!(hello.capabilities.is_empty());
     }
 
+    #[test]
+    fn hello_instance_identity_is_optional_for_legacy_payloads() {
+        let legacy = serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "version_code": VERSION_CODE,
+            "daemon_version": "0.2.8",
+            "capabilities": []
+        });
+        let mut hello: HelloResult = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(hello.instance_id.is_none());
+        assert_eq!(serde_json::to_value(&hello).unwrap(), legacy);
+        hello.instance_id = Some("instance-uuid".into());
+        hello.capabilities.push(capability::CONFIG_OWNERSHIP.into());
+        assert_eq!(
+            serde_json::from_value::<HelloResult>(serde_json::to_value(&hello).unwrap()).unwrap(),
+            hello
+        );
+    }
+
+    #[test]
+    fn persisted_ipc_endpoints_retain_their_actual_endpoint_kind() {
+        for (endpoint, expected) in [
+            (
+                IpcEndpoint::filesystem("/tmp/hsin/hsind.sock"),
+                serde_json::json!({
+                    "kind": "filesystem", "value": "/tmp/hsin/hsind.sock"
+                }),
+            ),
+            (
+                IpcEndpoint::namespaced("hsin-test-hsind"),
+                serde_json::json!({
+                    "kind": "namespaced", "value": "hsin-test-hsind"
+                }),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&endpoint).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_value::<IpcEndpoint>(expected).unwrap(),
+                endpoint
+            );
+        }
+    }
+
     #[tokio::test]
     async fn local_transport_enforces_hello_before_calls() {
         let nonce = SystemTime::now()
@@ -1052,6 +1101,7 @@ mod tests {
                         version_code: VERSION_CODE,
                         daemon_version: "0.1.0".into(),
                         capabilities: vec![capability::PROVIDERS.into()],
+                        instance_id: None,
                     },
                 ),
             )

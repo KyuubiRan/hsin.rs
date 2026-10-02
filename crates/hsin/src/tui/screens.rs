@@ -12,6 +12,7 @@ use super::{
 };
 
 mod chart;
+mod config_takeover;
 mod header;
 mod home;
 mod image_picker;
@@ -39,6 +40,10 @@ use stats::draw_stats;
 pub(super) fn draw(frame: &mut Frame<'_>, state: &mut State, i18n: &I18n) {
     let mut hits = HitMap::default();
     draw_frame(frame, state, i18n, &mut hits);
+    if let Some(dialog) = &state.config_takeover {
+        hits.barrier(frame.area());
+        config_takeover::draw(frame, frame.area(), dialog, i18n, &mut hits);
+    }
     state.hits = hits;
 }
 

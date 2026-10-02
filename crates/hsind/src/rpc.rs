@@ -20,7 +20,11 @@ use crate::{
 const MAX_CONNECTIONS: usize = 32;
 
 pub async fn serve(app: Arc<App>) -> Result<()> {
-    let endpoint = hsin_ipc::default_endpoint();
+    let endpoint = app.endpoint.read().clone();
+    serve_on(app, endpoint).await
+}
+
+pub(crate) async fn serve_on(app: Arc<App>, endpoint: hsin_ipc::IpcEndpoint) -> Result<()> {
     #[cfg(unix)]
     if let hsin_ipc::IpcEndpoint::Filesystem(path) = &endpoint
         && path.exists()
@@ -100,6 +104,7 @@ async fn serve_connection(
                     protocol_version: PROTOCOL_VERSION,
                     version_code: VERSION_CODE,
                     daemon_version: env!("CARGO_PKG_VERSION").into(),
+                    instance_id: Some(app.instance.instance_id.clone()),
                     capabilities: vec![
                         capability::PROVIDERS.into(),
                         capability::LOCAL_PROXY.into(),
@@ -111,6 +116,7 @@ async fn serve_connection(
                         capability::USAGE_PRICING.into(),
                         capability::CONTEXT_PRESETS.into(),
                         capability::PLAN_MODE_REASONING.into(),
+                        capability::CONFIG_OWNERSHIP.into(),
                     ],
                 })
             }) {
@@ -152,6 +158,12 @@ async fn dispatch(
         };
     }
     match method_name {
+        method::CONFIG_TAKEOVER => {
+            call!(async { app.takeover_configuration(parse(params)?).await }.await)
+        }
+        method::CONFIG_RELEASE => {
+            call!(async { app.release_configuration(parse(params)?).await }.await)
+        }
         method::PROVIDER_LIST => call!(
             parse::<ProviderListParams>(params).and_then(|params| app.list_providers(&params))
         ),

@@ -13,7 +13,7 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// Monotonic CLI/daemon release compatibility code. Every published workspace
 /// version must be greater than the preceding release so a new CLI always
 /// replaces an older daemon.
-pub const VERSION_CODE: u32 = 32;
+pub const VERSION_CODE: u32 = 33;
 
 pub const HSIN_CODEX_CONFIG_NAME: &str = "hsin";
 pub const OPENAI_CODEX_CONFIG_NAME: &str = "OpenAI";
@@ -1292,6 +1292,70 @@ pub struct ModeSetParams {
     pub mode: ConnectionMode,
 }
 
+/// Public identity of an instance managing a client's configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigOwnerInfo {
+    pub instance_id: String,
+    pub instance_home: String,
+    pub instance_label: String,
+    pub daemon_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigOwnershipStatus {
+    pub client: ClientKind,
+    pub target_id: String,
+    pub config_path: String,
+    pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<ConfigOwnerInfo>,
+    pub owner_is_self: bool,
+    pub takeover_available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takeover_unavailable_reason: Option<String>,
+}
+
+/// Structured ownership conflicts, distinct from ordinary file CAS conflicts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigConflictDetails {
+    pub targets: Vec<ConfigOwnershipStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigTakeoverTarget {
+    pub client: ClientKind,
+    pub target_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_owner_id: Option<String>,
+    pub expected_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigTakeoverParams {
+    pub request_id: String,
+    pub targets: Vec<ConfigTakeoverTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigTakeoverResult {
+    pub request_id: String,
+    pub clients: Vec<ClientState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigReleaseParams {
+    pub request_id: String,
+    pub target: ConfigTakeoverTarget,
+    pub requester: ConfigOwnerInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigReleaseResult {
+    pub request_id: String,
+    pub target_id: String,
+    pub generation: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientState {
     pub client: ClientKind,
@@ -1299,6 +1363,8 @@ pub struct ClientState {
     pub active_provider_id: Option<String>,
     pub mode: ConnectionMode,
     pub config_status: ConfigStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_ownership: Option<ConfigOwnershipStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2128,6 +2194,8 @@ pub struct AppError {
     #[serde(default)]
     pub args: BTreeMap<String, String>,
     pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_conflict: Option<ConfigConflictDetails>,
 }
 
 impl AppError {
@@ -2137,6 +2205,7 @@ impl AppError {
             code,
             args: BTreeMap::new(),
             retryable: false,
+            config_conflict: None,
         }
     }
 
@@ -2718,6 +2787,108 @@ mod tests {
                 "args": {"expected": "3"},
                 "retryable": true
             })
+        );
+    }
+
+    #[test]
+    fn legacy_client_state_and_error_default_to_no_ownership_details() {
+        let state_json = serde_json::json!({
+            "client": "codex",
+            "active_provider_id": "official",
+            "mode": "direct",
+            "config_status": "synchronized"
+        });
+        let state: ClientState = serde_json::from_value(state_json.clone()).unwrap();
+        assert!(state.config_ownership.is_none());
+        assert_eq!(serde_json::to_value(state).unwrap(), state_json);
+
+        let error: AppError = serde_json::from_value(serde_json::json!({
+            "code": "config_conflict",
+            "retryable": true
+        }))
+        .unwrap();
+        assert!(error.config_conflict.is_none());
+        assert!(error.args.is_empty());
+    }
+
+    #[test]
+    fn ownership_handoff_and_conflict_details_survive_round_trip() {
+        let owner = ConfigOwnerInfo {
+            instance_id: "debug-instance".into(),
+            instance_home: "/tmp/hsin-debug".into(),
+            instance_label: "debug".into(),
+            daemon_version: "0.2.8".into(),
+        };
+        let ownership = ConfigOwnershipStatus {
+            client: ClientKind::Codex,
+            target_id: "codex:/tmp/codex".into(),
+            config_path: "/tmp/codex".into(),
+            generation: 7,
+            owner: Some(owner.clone()),
+            owner_is_self: false,
+            takeover_available: true,
+            takeover_unavailable_reason: None,
+        };
+        let mut error = AppError::new(ErrorCode::ConfigConflict).retryable(true);
+        error.config_conflict = Some(ConfigConflictDetails {
+            targets: vec![ownership.clone()],
+        });
+        let json = serde_json::to_value(&error).unwrap();
+        assert_eq!(json["config_conflict"]["targets"][0]["generation"], 7);
+        assert_eq!(serde_json::from_value::<AppError>(json).unwrap(), error);
+
+        let target = ConfigTakeoverTarget {
+            client: ClientKind::Codex,
+            target_id: ownership.target_id.clone(),
+            expected_owner_id: Some(owner.instance_id.clone()),
+            expected_generation: ownership.generation,
+        };
+        let takeover = ConfigTakeoverParams {
+            request_id: "transaction-id".into(),
+            targets: vec![target.clone()],
+        };
+        let json = serde_json::to_value(&takeover).unwrap();
+        assert_eq!(json["targets"][0]["client"], "codex");
+        assert_eq!(
+            serde_json::from_value::<ConfigTakeoverParams>(json).unwrap(),
+            takeover
+        );
+
+        let release = ConfigReleaseParams {
+            request_id: takeover.request_id.clone(),
+            target,
+            requester: owner,
+        };
+        assert_eq!(
+            serde_json::from_value::<ConfigReleaseParams>(serde_json::to_value(&release).unwrap())
+                .unwrap(),
+            release
+        );
+
+        let result = ConfigTakeoverResult {
+            request_id: takeover.request_id,
+            clients: vec![ClientState {
+                client: ClientKind::Codex,
+                active_provider_id: Some("official".into()),
+                mode: ConnectionMode::Direct,
+                config_status: ConfigStatus::Unmanaged,
+                config_ownership: Some(ownership),
+            }],
+        };
+        assert_eq!(
+            serde_json::from_value::<ConfigTakeoverResult>(serde_json::to_value(&result).unwrap())
+                .unwrap(),
+            result
+        );
+        let result = ConfigReleaseResult {
+            request_id: result.request_id,
+            target_id: "codex:/tmp/codex".into(),
+            generation: 8,
+        };
+        assert_eq!(
+            serde_json::from_value::<ConfigReleaseResult>(serde_json::to_value(&result).unwrap())
+                .unwrap(),
+            result
         );
     }
 

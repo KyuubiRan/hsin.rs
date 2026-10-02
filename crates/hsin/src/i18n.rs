@@ -60,6 +60,40 @@ impl I18n {
                 .or_else(|| self.fallback.get(&key))
                 .cloned()
                 .unwrap_or_else(|| application.code.to_string());
+            if let Some(conflict) = &application.config_conflict {
+                let details = conflict
+                    .targets
+                    .iter()
+                    .map(|target| {
+                        let owner = target.owner.as_ref().map_or_else(
+                            || self.text("config_owner_unknown").to_owned(),
+                            |owner| format!("{} ({})", owner.instance_label, owner.instance_home),
+                        );
+                        format!("{}: {owner} — {}", target.client, target.config_path)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let hint = if !conflict.targets.is_empty()
+                    && conflict
+                        .targets
+                        .iter()
+                        .all(|target| target.takeover_available)
+                {
+                    let clients = conflict
+                        .targets
+                        .iter()
+                        .map(|target| target.client.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    format!(
+                        "{}: hsin config takeover {clients}",
+                        self.text("config_takeover_cli_hint")
+                    )
+                } else {
+                    self.text("config_takeover_unavailable").to_owned()
+                };
+                return format!("{message}\n{details}\n{hint}");
+            }
             if application.args.is_empty() {
                 return message;
             }

@@ -11,6 +11,8 @@ pub enum DaemonError {
     NotFound(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("client configuration ownership conflict; inspect status before taking over")]
+    Ownership(hsin_core::ConfigConflictDetails),
     #[error("invalid input: {0}")]
     Invalid(String),
     #[error("Official OAuth providers cannot use the local proxy")]
@@ -49,6 +51,7 @@ impl DaemonError {
             Self::Locked => "security_locked",
             Self::NotFound(_) => "not_found",
             Self::Conflict(_) => "conflict",
+            Self::Ownership(_) => "config_conflict",
             Self::Invalid(_) => "invalid_input",
             Self::OAuthProxyUnsupported => "oauth_proxy_unsupported",
             Self::NoActiveProvider => "no_active_provider",
@@ -68,7 +71,10 @@ impl DaemonError {
     }
 
     pub fn retryable(&self) -> bool {
-        matches!(self, Self::Conflict(_) | Self::Io(_) | Self::Database(_))
+        matches!(
+            self,
+            Self::Conflict(_) | Self::Ownership(_) | Self::Io(_) | Self::Database(_)
+        )
     }
 
     pub fn wire(&self) -> WireError {

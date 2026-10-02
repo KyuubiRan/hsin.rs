@@ -13,6 +13,7 @@ mod db;
 mod error;
 mod model;
 mod network_proxy;
+mod ownership;
 mod paths;
 mod pricing;
 mod proxy;
@@ -282,6 +283,13 @@ fn tolerate_locked(step: &'static str, result: Result<()>) -> Result<()> {
                 step,
                 %reason,
                 "skipped startup reconciliation; fix the reported configuration and restart"
+            );
+            Ok(())
+        }
+        Err(error::DaemonError::Ownership(_)) => {
+            tracing::warn!(
+                step,
+                "skipped startup reconciliation; client configuration ownership requires attention"
             );
             Ok(())
         }

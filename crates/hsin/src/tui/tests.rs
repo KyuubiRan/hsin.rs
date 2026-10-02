@@ -35,6 +35,464 @@ fn key(code: KeyCode) -> Action {
     Action::Key(KeyEvent::new(code, crossterm::event::KeyModifiers::NONE))
 }
 
+fn config_conflict(available: bool) -> hsin_core::ConfigConflictDetails {
+    hsin_core::ConfigConflictDetails {
+        targets: vec![hsin_core::ConfigOwnershipStatus {
+            client: ClientKind::Codex,
+            target_id: "shared-codex".into(),
+            config_path: "/tmp/shared-codex/config.toml".into(),
+            generation: 7,
+            owner: Some(hsin_core::ConfigOwnerInfo {
+                instance_id: "release-owner".into(),
+                instance_home: "/tmp/hsin-release".into(),
+                instance_label: "Release".into(),
+                daemon_version: env!("CARGO_PKG_VERSION").into(),
+            }),
+            owner_is_self: false,
+            takeover_available: available,
+            takeover_unavailable_reason: (!available).then(|| "recovery_required".into()),
+        }],
+    }
+}
+
+fn startup_snapshot(details: hsin_core::ConfigConflictDetails) -> crate::rpc::StatusSnapshot {
+    let mut status = crate::rpc::StatusSnapshot {
+        codex_active_provider: Some("provider-1".into()),
+        ..crate::rpc::StatusSnapshot::default()
+    };
+    for target in details.targets {
+        match target.client {
+            ClientKind::Codex => status.codex_config_ownership = Some(target),
+            ClientKind::Claude => status.claude_config_ownership = Some(target),
+        }
+    }
+    status
+}
+
+fn load_startup_status(state: &mut State, status: crate::rpc::StatusSnapshot) {
+    state.reduce(Action::Loaded {
+        providers: vec![example_provider()],
+        status,
+        settings: Settings::default(),
+    });
+}
+
+#[test]
+fn startup_config_takeover_defaults_to_cancel_and_does_not_repeat_on_refresh() {
+    for cancel in [KeyCode::Enter, KeyCode::Esc] {
+        let mut state = State::default();
+        let status = startup_snapshot(config_conflict(true));
+        load_startup_status(&mut state, status.clone());
+        let dialog = state.config_takeover.as_ref().expect("startup dialog");
+        assert!(dialog.startup);
+        assert_eq!(dialog.selected, 0);
+        assert!(!state.loading);
+        assert!(state.take_effect().is_none());
+        let screen = render(&mut state, 100, 30);
+        assert!(screen.contains("Release"));
+        assert!(screen.contains("/tmp/hsin-release"));
+        assert!(screen.contains("/tmp/shared-codex/config.toml"));
+        assert!(screen.contains("Choose whether"));
+        assert!(screen.contains("safely take over"));
+        assert!(!screen.contains("Take over and continue"));
+        state.reduce(key(cancel));
+        assert!(state.config_takeover.is_none());
+        assert!(state.take_effect().is_none());
+        assert!(matches!(state.input, InputMode::Normal));
+        assert_eq!(
+            state.status.codex_active_provider.as_deref(),
+            Some("provider-1")
+        );
+        load_startup_status(&mut state, status);
+        assert!(state.config_takeover.is_none());
+        assert!(state.take_effect().is_none());
+    }
+}
+
+#[test]
+fn confirming_startup_takeover_transfers_both_clients_without_switching_a_provider() {
+    let mut details = config_conflict(true);
+    let mut claude = details.targets[0].clone();
+    claude.client = ClientKind::Claude;
+    claude.target_id = "shared-claude".into();
+    claude.config_path = "/tmp/shared-claude/settings.json".into();
+    claude.generation = 11;
+    details.targets.push(claude);
+    let status = startup_snapshot(details);
+    let mut state = State::default();
+    load_startup_status(&mut state, status.clone());
+    assert_eq!(
+        state
+            .config_takeover
+            .as_ref()
+            .expect("dialog")
+            .details
+            .targets
+            .len(),
+        2
+    );
+    state.reduce(key(KeyCode::Right));
+    state.reduce(key(KeyCode::Enter));
+    let Some(Effect::Takeover { request, operation }) = state.take_effect() else {
+        panic!("startup takeover queued")
+    };
+    assert!(matches!(*operation, Effect::Refresh));
+    assert_eq!(request.targets.len(), 2);
+    assert_eq!(request.targets[0].client, ClientKind::Codex);
+    assert_eq!(request.targets[0].expected_generation, 7);
+    assert_eq!(request.targets[1].client, ClientKind::Claude);
+    assert_eq!(request.targets[1].expected_generation, 11);
+    assert!(
+        request
+            .targets
+            .iter()
+            .all(|target| target.expected_owner_id.as_deref() == Some("release-owner"))
+    );
+    assert!(state.loading);
+    assert!(state.config_takeover.as_ref().expect("busy dialog").startup);
+    state.reduce(key(KeyCode::Enter));
+    assert!(state.take_effect().is_none());
+    load_startup_status(&mut state, status);
+    assert!(state.config_takeover.is_none());
+    assert!(!state.loading);
+    assert!(state.take_effect().is_none());
+    assert_eq!(
+        state.status.codex_active_provider.as_deref(),
+        Some("provider-1")
+    );
+}
+
+#[test]
+fn startup_does_not_offer_takeover_for_self_owned_unclaimed_or_ordinary_conflicts() {
+    let mut own = config_conflict(false);
+    own.targets[0].owner_is_self = true;
+    let mut unclaimed = config_conflict(false);
+    unclaimed.targets[0].owner = None;
+    for details in [
+        own,
+        unclaimed,
+        hsin_core::ConfigConflictDetails { targets: vec![] },
+    ] {
+        let mut state = State::default();
+        let mut status = startup_snapshot(details);
+        status.codex_config_status = Some(hsin_core::ConfigStatus::Conflict);
+        load_startup_status(&mut state, status);
+        assert!(state.config_takeover.is_none());
+        assert!(state.take_effect().is_none());
+    }
+}
+
+#[test]
+fn unavailable_startup_takeover_explains_the_reason_and_only_allows_cancel() {
+    let mut state = State::default();
+    load_startup_status(&mut state, startup_snapshot(config_conflict(false)));
+    let screen = render(&mut state, 100, 30);
+    assert!(
+        screen.contains("previous managing instance")
+            || screen.contains("original managing instance")
+    );
+    assert!(screen.contains("before takeover"));
+    state.reduce(key(KeyCode::Right));
+    assert_eq!(state.config_takeover.as_ref().expect("dialog").selected, 0);
+    state.reduce(key(KeyCode::Enter));
+    assert!(state.config_takeover.is_none());
+    assert!(state.take_effect().is_none());
+}
+
+#[test]
+fn startup_waits_for_successful_loading_and_preserves_later_action_conflict_prompts() {
+    let mut state = State::default();
+    state.reduce(Action::Failed("status temporarily unavailable".into()));
+    assert!(state.config_takeover.is_none());
+    load_startup_status(&mut state, startup_snapshot(config_conflict(true)));
+    assert!(
+        state
+            .config_takeover
+            .as_ref()
+            .expect("startup dialog")
+            .startup
+    );
+    state.reduce(key(KeyCode::Enter));
+    state.reduce(Action::ConfigConflict {
+        operation: Effect::SetProxyEnabled(false),
+        details: config_conflict(true),
+    });
+    assert!(
+        !state
+            .config_takeover
+            .as_ref()
+            .expect("action dialog")
+            .startup
+    );
+    assert!(render(&mut state, 100, 30).contains("Take over and continue"));
+}
+
+#[test]
+fn startup_takeover_uses_chinese_startup_copy_and_a_cancel_default() {
+    let mut state = State::default();
+    load_startup_status(&mut state, startup_snapshot(config_conflict(true)));
+    let locale = I18n::new(Some(LANGUAGE_ZH_CN));
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+    terminal
+        .draw(|frame| draw(frame, &mut state, &locale))
+        .expect("Chinese startup dialog");
+    let screen = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>();
+    let text = screen.split_whitespace().collect::<String>();
+    assert!(text.contains("检测到客户端配置"));
+    assert!(text.contains("取消"));
+    assert!(text.contains("接管"));
+    assert!(!text.contains("接管并继续"));
+    assert_eq!(state.config_takeover.as_ref().expect("dialog").selected, 0);
+}
+
+#[test]
+fn config_takeover_defaults_to_cancel_and_preserves_the_settings_page() {
+    let mut state = State {
+        input: InputMode::Settings(SettingsScreen {
+            selected: 3,
+            page: SettingsPage::Root,
+        }),
+        ..State::default()
+    };
+    state.reduce(Action::ConfigConflict {
+        operation: Effect::SetProxyEnabled(false),
+        details: config_conflict(true),
+    });
+    assert_eq!(state.config_takeover.as_ref().expect("dialog").selected, 0);
+    state.reduce(key(KeyCode::Enter));
+    assert!(state.config_takeover.is_none());
+    assert!(state.take_effect().is_none());
+    assert!(matches!(
+        state.input,
+        InputMode::Settings(SettingsScreen {
+            selected: 3,
+            page: SettingsPage::Root
+        })
+    ));
+}
+
+#[test]
+fn cancelling_config_takeover_restores_the_edit_form_without_exposing_its_secret() {
+    let mut state = State::default();
+    let mut form = submission();
+    form.id = Some("edited-provider".into());
+    form.revision = Some(9);
+    form.secret = Zeroizing::new("pending-secret-never-display".into());
+    form.proxy_password = Zeroizing::new("pending-proxy-password".into());
+    state.reduce(Action::ConfigConflict {
+        operation: Effect::Edit(form),
+        details: config_conflict(true),
+    });
+    let i18n = I18n::new(Some(LANGUAGE_EN_US));
+    let mut terminal = Terminal::new(TestBackend::new(100, 28)).expect("terminal");
+    terminal
+        .draw(|frame| draw(frame, &mut state, &i18n))
+        .expect("conflict overlay");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>();
+    assert!(rendered.contains("Release"));
+    assert!(!rendered.contains("pending-secret"));
+    assert!(!rendered.contains("pending-proxy-password"));
+    state.reduce(key(KeyCode::Esc));
+    let InputMode::Form(form) = &state.input else {
+        panic!("edit form restored")
+    };
+    assert_eq!(form.id.as_deref(), Some("edited-provider"));
+    assert_eq!(form.revision, Some(9));
+    assert_eq!(form.secret.as_str(), "pending-secret-never-display");
+    assert_eq!(form.proxy_password.as_str(), "pending-proxy-password");
+    assert!(!form.secret_visible);
+    assert!(state.take_effect().is_none());
+}
+
+#[test]
+fn confirming_config_takeover_keeps_the_original_edit_and_binds_the_detected_owner() {
+    let mut state = State::default();
+    let mut form = submission();
+    form.id = Some("provider-1".into());
+    form.revision = Some(4);
+    form.secret = Zeroizing::new("replacement-secret".into());
+    state.reduce(Action::ConfigConflict {
+        operation: Effect::Edit(form),
+        details: config_conflict(true),
+    });
+    state.reduce(key(KeyCode::Right));
+    state.reduce(key(KeyCode::Enter));
+    assert!(state.loading);
+    let Some(Effect::Takeover { request, operation }) = state.take_effect() else {
+        panic!("takeover queued")
+    };
+    assert_eq!(
+        request.targets[0].expected_owner_id.as_deref(),
+        Some("release-owner")
+    );
+    assert_eq!(request.targets[0].expected_generation, 7);
+    let Effect::Edit(form) = *operation else {
+        panic!("original edit retained")
+    };
+    assert_eq!(form.revision, Some(4));
+    assert_eq!(form.secret.as_str(), "replacement-secret");
+    state.reduce(key(KeyCode::Enter));
+    assert!(
+        state.take_effect().is_none(),
+        "busy dialog cannot queue a second replay"
+    );
+}
+
+#[test]
+fn changed_config_owner_requires_a_fresh_confirmation() {
+    let mut state = State::default();
+    state.reduce(Action::ConfigConflict {
+        operation: Effect::SetProxyEnabled(false),
+        details: config_conflict(true),
+    });
+    state.reduce(key(KeyCode::Right));
+    let mut details = config_conflict(true);
+    details.targets[0].generation = 8;
+    details.targets[0]
+        .owner
+        .as_mut()
+        .expect("owner")
+        .instance_id = "new-owner".into();
+    state.reduce(Action::ConfigConflict {
+        operation: Effect::SetProxyEnabled(false),
+        details,
+    });
+    assert_eq!(
+        state
+            .config_takeover
+            .as_ref()
+            .expect("fresh dialog")
+            .selected,
+        0
+    );
+    state.reduce(key(KeyCode::Enter));
+    assert!(state.take_effect().is_none());
+}
+
+#[test]
+fn unavailable_config_takeover_cannot_be_confirmed() {
+    let mut state = State::default();
+    state.reduce(Action::ConfigConflict {
+        operation: Effect::SetProxyEnabled(false),
+        details: config_conflict(false),
+    });
+    state.reduce(key(KeyCode::Right));
+    assert_eq!(state.config_takeover.as_ref().expect("dialog").selected, 0);
+    state.reduce(key(KeyCode::Enter));
+    assert!(state.take_effect().is_none());
+}
+
+#[test]
+fn cancelling_config_takeover_returns_to_the_submitted_model_page() {
+    let mut state = State {
+        input: InputMode::Models(ModelPicker {
+            form: submission(),
+            models: vec!["model-a".into(), "model-b".into()],
+            selected: 2,
+            query: String::new(),
+            mode: ModelPickerMode::Browse,
+            warning: None,
+            cursor: 0,
+        }),
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Enter));
+    let operation = state.take_effect().expect("submitted provider");
+    assert!(matches!(state.input, InputMode::Normal));
+    state.reduce(Action::ConfigConflict {
+        operation,
+        details: config_conflict(true),
+    });
+    state.reduce(key(KeyCode::Esc));
+    let InputMode::Models(picker) = state.input else {
+        panic!("original model page restored")
+    };
+    assert_eq!(picker.selected, 2);
+    assert_eq!(picker.models, ["model-a", "model-b"]);
+    assert_eq!(picker.form.model, ModelUpdate::Set("model-b".into()));
+    assert_eq!(picker.form.secret.as_str(), "secret");
+}
+
+#[test]
+fn cancelling_config_takeover_restores_imported_image_model_revision_and_secret() {
+    let mut form = submission();
+    form.id = Some("imported-image-provider".into());
+    form.revision = Some(11);
+    form.skip_primary_model = true;
+    form.codex_image.enabled = true;
+    let mut state = State {
+        image_section: true,
+        input: InputMode::ImageModels(ImageModelPicker {
+            form,
+            models: vec!["gpt-image-2".into()],
+            checked: ["gpt-image-2".into()].into(),
+            preferred: Some("gpt-image-2".into()),
+            selected: 0,
+            query: String::new(),
+            mode: ModelPickerMode::Browse,
+            warning: None,
+            cursor: 0,
+        }),
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Enter));
+    let operation = state.take_effect().expect("submitted image import");
+    state.reduce(Action::ConfigConflict {
+        operation,
+        details: config_conflict(true),
+    });
+    state.reduce(key(KeyCode::Esc));
+    let InputMode::ImageModels(picker) = state.input else {
+        panic!("imported image model page restored")
+    };
+    assert_eq!(picker.form.id.as_deref(), Some("imported-image-provider"));
+    assert_eq!(picker.form.revision, Some(11));
+    assert_eq!(picker.form.secret.as_str(), "secret");
+    assert_eq!(picker.form.codex_image.models, ["gpt-image-2"]);
+    assert_eq!(picker.checked, ["gpt-image-2".into()].into());
+}
+
+#[test]
+fn foreign_owner_hides_the_applied_provider_marker_and_shows_configuration_conflict() {
+    let mut state = State {
+        providers: vec![example_provider()],
+        ..State::default()
+    };
+    state.status.codex_active_provider = Some("provider-1".into());
+    state.status.codex_config_status = Some(hsin_core::ConfigStatus::Synchronized);
+    state.status.codex_config_ownership = Some(config_conflict(true).targets.remove(0));
+    let i18n = I18n::new(Some(LANGUAGE_EN_US));
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+    terminal
+        .draw(|frame| draw(frame, &mut state, &i18n))
+        .expect("foreign ownership state");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect::<String>();
+    assert!(rendered.contains("Release"));
+    assert!(!rendered.contains('●'));
+    assert_eq!(
+        state.status.codex_active_provider.as_deref(),
+        Some("provider-1")
+    );
+}
+
 fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> Action {
     Action::Key(KeyEvent::new(code, modifiers))
 }
@@ -1251,7 +1709,7 @@ fn upstream_proxy_settings_support_manual_socks5_authentication() {
                 && config.manual.host == "proxy.example.test"
                 && config.manual.port == 1080
                 && config.manual.username == "proxy-user"
-                && matches!(&password, SecretInput::Replace(value) if value == "proxy-password")
+                && matches!(&password.0, SecretInput::Replace(value) if value == "proxy-password")
     ));
 }
 

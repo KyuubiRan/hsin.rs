@@ -3,10 +3,10 @@ use std::io::{self, Read, Write};
 use anyhow::{Context, Result, bail};
 use chrono::{Local, NaiveDate, TimeZone};
 use hsin_core::{
-    ClaudeModelMappingUpdate, ClientKind, CodexConfigNameUpdate, DoctorFinding, DoctorReport,
-    DoctorSeverity, ImportCurrentParams, ModeSetParams, ModelUpdate, Provider, ProviderAddParams,
-    ProviderDraft, ProviderEditParams, ProviderPatch, ProviderRemoveParams, ProviderSwitchParams,
-    SecretInput, UsageStatsQuery, UsageStatsReport,
+    ClaudeModelMappingUpdate, ClientKind, CodexConfigNameUpdate, ConfigTakeoverResult,
+    DoctorFinding, DoctorReport, DoctorSeverity, ImportCurrentParams, ModeSetParams, ModelUpdate,
+    Provider, ProviderAddParams, ProviderDraft, ProviderEditParams, ProviderPatch,
+    ProviderRemoveParams, ProviderSwitchParams, SecretInput, UsageStatsQuery, UsageStatsReport,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -14,7 +14,8 @@ use serde_json::{Value, json};
 use crate::{
     bootstrap,
     cli::{
-        Cli, Command, DaemonCommand, ModeCommand, ProviderCommand, SecurityCommand, SettingsCommand,
+        Cli, Command, ConfigCommand, DaemonCommand, ModeCommand, ProviderCommand, SecurityCommand,
+        SettingsCommand,
     },
     i18n::I18n,
     rpc::DaemonClient,
@@ -45,6 +46,7 @@ pub async fn run(cli: Cli, i18n: &mut I18n) -> Result<()> {
     match command {
         Command::Provider { command } => run_provider(command, &client, cli.json).await,
         Command::Mode { command } => run_mode(command, &client, cli.json).await,
+        Command::Config { command } => run_config(command, &client, cli.json).await,
         Command::Status => {
             let value: Value = client.call("status", &json!({})).await?;
             print_value(&value, cli.json)
@@ -84,6 +86,31 @@ pub async fn run(cli: Cli, i18n: &mut I18n) -> Result<()> {
         }
         Command::Daemon { .. } => unreachable!("daemon command handled before connecting"),
     }
+}
+
+async fn run_config(command: ConfigCommand, client: &DaemonClient, json: bool) -> Result<()> {
+    let ConfigCommand::Takeover { clients } = command;
+    let status = client.status().await?;
+    let mut targets = Vec::new();
+    for kind in clients.into_iter().map(ClientKind::from) {
+        if targets
+            .iter()
+            .any(|target: &hsin_core::ConfigOwnershipStatus| target.client == kind)
+        {
+            bail!("each client may be specified only once");
+        }
+        let ownership = status
+            .config_ownership(kind)
+            .context("daemon did not report client configuration ownership")?;
+        targets.push(ownership.clone());
+    }
+    let result: ConfigTakeoverResult = client
+        .call(
+            hsin_ipc::method::CONFIG_TAKEOVER,
+            &crate::rpc::config_takeover_params(&targets),
+        )
+        .await?;
+    print_value(&serde_json::to_value(result)?, json)
 }
 
 async fn run_stats(args: crate::cli::StatsArgs, client: &DaemonClient, json: bool) -> Result<()> {

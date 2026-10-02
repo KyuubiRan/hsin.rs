@@ -41,6 +41,9 @@ use crate::{
 };
 
 const CODEX_AUTH_BACKUP_KEY: &str = "codex_auth_backup_v1";
+mod config_ownership;
+#[cfg(test)]
+mod ownership_tests;
 const CLAUDE_MODEL_ENV_BEFORE_KEY: &str = "claude_model_env_before";
 const CLAUDE_MODEL_NAMES_ENABLED_KEY: &str = "claude_model_names_enabled";
 const STATS_CHART_STYLE_KEY: &str = "stats_chart_style";
@@ -88,6 +91,9 @@ pub struct App {
     shutdown: tokio::sync::Notify,
     config_paths: RwLock<HashMap<ClientKind, PathBuf>>,
     usage: Arc<UsageCollector>,
+    pub(crate) instance: hsin_core::ConfigOwnerInfo,
+    pub(crate) endpoint: RwLock<hsin_ipc::IpcEndpoint>,
+    ownership_guards: parking_lot::Mutex<BTreeMap<PathBuf, crate::ownership::Guard>>,
 }
 
 pub(crate) struct UpstreamRequestSnapshot {
@@ -142,6 +148,23 @@ impl App {
         paths.prepare()?;
         let db = Arc::new(Database::open(&paths.database, &paths.backups)?);
         let crypto = Arc::new(CryptoManager::initialize(db.clone(), store)?);
+        let instance_id = db
+            .setting("instance_id_v1")?
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        db.set_setting("instance_id_v1", &instance_id)?;
+        let instance = hsin_core::ConfigOwnerInfo {
+            instance_id,
+            instance_home: fs::canonicalize(&paths.home)?
+                .to_string_lossy()
+                .into_owned(),
+            instance_label: if cfg!(debug_assertions) {
+                "Debug"
+            } else {
+                "Release"
+            }
+            .into(),
+            daemon_version: env!("CARGO_PKG_VERSION").into(),
+        };
         let credential_command = std::env::current_exe()
             .map_err(DaemonError::Io)?
             .with_file_name("hsin");
@@ -195,6 +218,9 @@ impl App {
             shutdown: tokio::sync::Notify::new(),
             config_paths: RwLock::new(config_paths),
             usage,
+            instance,
+            endpoint: RwLock::new(hsin_ipc::default_endpoint()),
+            ownership_guards: parking_lot::Mutex::new(BTreeMap::new()),
         }))
     }
 
@@ -319,6 +345,24 @@ impl App {
         }
         for client in [ClientKind::Codex, ClientKind::Claude] {
             let official = self.ensure_official_provider(client)?;
+            let ownership = self.configuration_ownership(client);
+            let blocked = match &ownership {
+                Ok(status) => {
+                    (status.owner.is_some() && !status.owner_is_self)
+                        || status.takeover_unavailable_reason.is_some()
+                }
+                Err(_) => true,
+            };
+            if blocked {
+                // Importing another instance's managed key as a new provider would
+                // make that temporary configuration appear to be a native baseline.
+                self.db.set_active(client, &official.id, "conflict")?;
+                self.db.set_mode(client, ConnectionMode::Direct)?;
+                if let Err(error) = ownership {
+                    tracing::warn!(%client, code = error.code(), "configuration ownership needs recovery before provider import");
+                }
+                continue;
+            }
             let detected = match config::detect_current(&self.config_path(client)?, client) {
                 Ok(provider) => provider,
                 Err(error) => {
@@ -352,16 +396,64 @@ impl App {
             return Ok(());
         };
         let provider = self.db.get_provider(&provider_id)?;
-        if provider.official && self.codex_auth_backup()?.is_none() {
+        if provider.official && self.db.protected_value(CODEX_AUTH_BACKUP_KEY)?.is_none() {
             return Ok(());
         }
+        let _transaction = match self.begin_config_transaction(&[ClientKind::Codex], true) {
+            Ok(transaction) => transaction,
+            Err(
+                error @ (DaemonError::Ownership(_)
+                | DaemonError::Conflict(_)
+                | DaemonError::Config(_)
+                | DaemonError::Io(_)
+                | DaemonError::Crypto),
+            ) => {
+                self.db.set_config_status(
+                    ClientKind::Codex,
+                    if matches!(error, DaemonError::Ownership(_) | DaemonError::Conflict(_)) {
+                        "conflict"
+                    } else {
+                        "unavailable"
+                    },
+                )?;
+                tracing::warn!(
+                    code = error.code(),
+                    "Codex authentication synchronization is blocked by configuration ownership"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         let client_auth = self.client_auth_settings()?;
-        self.apply_configuration_with_auth(
+        match self.apply_configuration_with_auth(
             &provider,
             state.mode,
             Some(client_auth.codex_disable_custom_auth),
             Some(client_auth.codex_preserve_official_auth),
-        )
+        ) {
+            Err(
+                error @ (DaemonError::Ownership(_)
+                | DaemonError::Conflict(_)
+                | DaemonError::Config(_)
+                | DaemonError::Io(_)
+                | DaemonError::Crypto),
+            ) => {
+                self.db.set_config_status(
+                    ClientKind::Codex,
+                    if matches!(error, DaemonError::Ownership(_) | DaemonError::Conflict(_)) {
+                        "conflict"
+                    } else {
+                        "unavailable"
+                    },
+                )?;
+                tracing::warn!(
+                    code = error.code(),
+                    "Codex authentication synchronization needs recovery"
+                );
+                Ok(())
+            }
+            result => result,
+        }
     }
 
     fn ensure_official_provider(&self, client: ClientKind) -> Result<Provider> {
@@ -582,6 +674,9 @@ impl App {
             network_proxy,
         };
         let mut provider = Database::new_provider(&input)?;
+        let affected = self
+            .image_configuration_impact(!image_available_before && provider.codex_image.enabled)?;
+        let _transaction = self.begin_config_transaction(&affected, false)?;
         let encrypted = self.crypto.encrypt_for(&provider, &api_key)?;
         let encrypted_proxy_password = proxy_password
             .as_ref()
@@ -607,8 +702,12 @@ impl App {
     #[allow(clippy::too_many_lines)]
     pub async fn edit_provider(&self, params: ProviderEditParams) -> Result<Provider> {
         let _guard = self.mutation.lock().await;
-        let image_available_before = self.db.image_active_provider_id()?.is_some();
+        let image_active_before = self.db.image_active_provider_id()?;
+        let image_available_before = image_active_before.is_some();
         let current = self.db.get_provider(&params.id)?;
+        if current.revision != params.expected_revision {
+            return Err(DaemonError::Conflict("provider revision changed".into()));
+        }
         if current.official {
             return Err(DaemonError::Invalid(
                 "Official providers cannot be edited".into(),
@@ -712,6 +811,15 @@ impl App {
                 || mapping_changed
                 || config_name_changed
                 || provider.client == ClientKind::Codex);
+        let mut affected = self.image_configuration_impact(
+            (!image_available_before && provider.codex_image.enabled)
+                || (!provider.codex_image.enabled
+                    && image_active_before.as_deref() == Some(provider.id.as_str())),
+        )?;
+        if update_active_config {
+            affected.push(provider.client);
+        }
+        let _transaction = self.begin_config_transaction(&affected, false)?;
         if active_direct
             && !matches!(
                 (provider.client, provider.auth_scheme),
@@ -767,6 +875,7 @@ impl App {
                 before_hash.as_deref(),
                 &serde_json::to_string(&target)?,
             )?;
+            self.start_ownership_write(&target, &operation)?;
             let backup_created = if Self::manages_codex_auth(&target) {
                 let auth_path = config::codex_auth_path(&path)?;
                 match self.ensure_codex_auth_backup(&auth_path) {
@@ -829,13 +938,16 @@ impl App {
                 self.db.set_config_status(provider.client, "unavailable")?;
                 return Err(error);
             }
+            self.finish_ownership_write(target.client)?;
             if target.client == ClientKind::Codex && !Self::manages_codex_auth(&target) {
                 self.remove_codex_auth_backup()?;
+                self.finish_ownership_write(target.client)?;
             }
             self.db
                 .set_active(provider.client, &provider.id, "synchronized")?;
             self.db.set_mode(provider.client, target.mode)?;
             self.release_claude_model_env_snapshot(&target)?;
+            self.finish_ownership_write(target.client)?;
             self.db.finish_operation(&operation, "complete", None)?;
         }
         if image_available_before != self.db.image_active_provider_id()?.is_some() {
@@ -1022,7 +1134,8 @@ impl App {
 
     pub async fn remove_provider(&self, params: ProviderRemoveParams) -> Result<()> {
         let _guard = self.mutation.lock().await;
-        let image_available_before = self.db.image_active_provider_id()?.is_some();
+        let image_active_before = self.db.image_active_provider_id()?;
+        let image_available_before = image_active_before.is_some();
         let provider = self.db.get_provider(&params.id)?;
         if provider.official {
             return Err(DaemonError::Invalid(
@@ -1032,6 +1145,10 @@ impl App {
         if provider.revision != params.expected_revision {
             return Err(DaemonError::Conflict("provider revision changed".into()));
         }
+        let affected = self.image_configuration_impact(
+            image_active_before.as_deref() == Some(provider.id.as_str()),
+        )?;
+        let _transaction = self.begin_config_transaction(&affected, false)?;
         self.db.remove_provider(&params.id)?;
         if image_available_before != self.db.image_active_provider_id()?.is_some() {
             self.reconcile_codex_image_capability()?;
@@ -1042,6 +1159,8 @@ impl App {
     pub async fn switch_codex_image(&self, params: CodexImageSwitchParams) -> Result<Provider> {
         let _guard = self.mutation.lock().await;
         let image_available_before = self.db.image_active_provider_id()?.is_some();
+        let affected = self.image_configuration_impact(!image_available_before)?;
+        let _transaction = self.begin_config_transaction(&affected, false)?;
         self.db.set_image_active(&params.provider_id)?;
         if !image_available_before {
             self.reconcile_codex_image_capability()?;
@@ -1063,6 +1182,7 @@ impl App {
 
     pub async fn import_current(&self, params: ImportCurrentParams) -> Result<ImportCurrentResult> {
         let _guard = self.mutation.lock().await;
+        let _transaction = self.begin_config_transaction(&[params.client], false)?;
         if let Some(provider) = self.current_configuration_provider(params.client)? {
             return Ok(ImportCurrentResult {
                 provider,
@@ -1117,6 +1237,7 @@ impl App {
             before_hash.as_deref(),
             &target_json,
         )?;
+        self.start_ownership_write(&target, &operation)?;
         if let Err(error) = self.recover_official_import_operation(
             provider.client,
             before_hash.as_deref(),
@@ -1147,6 +1268,7 @@ impl App {
                 "provider belongs to another client".into(),
             ));
         }
+        let _transaction = self.begin_config_transaction(&[params.client], false)?;
         if provider.official {
             self.apply_configuration(&provider, ConnectionMode::Direct)?;
             return Ok(provider);
@@ -1176,10 +1298,11 @@ impl App {
             .active_provider_id
             .ok_or(DaemonError::NoActiveProvider)?;
         let provider = self.db.get_provider(&id)?;
+        if mode == ConnectionMode::Proxy && provider.auth_scheme == AuthScheme::OAuth {
+            return Err(DaemonError::OAuthProxyUnsupported);
+        }
+        let _transaction = self.begin_config_transaction(&[client], false)?;
         if mode == ConnectionMode::Proxy {
-            if provider.auth_scheme == AuthScheme::OAuth {
-                return Err(DaemonError::OAuthProxyUnsupported);
-            }
             self.set_proxy_enabled_locked(true).await?;
         }
         self.apply_configuration(&provider, mode)?;
@@ -1215,6 +1338,7 @@ impl App {
         self.apply_configuration_with_overrides(provider, mode, None, None, Some(enabled))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn apply_configuration_with_overrides(
         &self,
         provider: &Provider,
@@ -1223,6 +1347,7 @@ impl App {
         codex_preserve_official_auth: Option<bool>,
         claude_model_names_enabled: Option<bool>,
     ) -> Result<()> {
+        let _transaction = self.begin_config_transaction(&[provider.client], false)?;
         if mode == ConnectionMode::Proxy && provider.auth_scheme == AuthScheme::OAuth {
             return Err(DaemonError::OAuthProxyUnsupported);
         }
@@ -1256,6 +1381,7 @@ impl App {
             before_hash.as_deref(),
             &target_json,
         )?;
+        self.start_ownership_write(&target, &operation)?;
         let backup_created = if Self::manages_codex_auth(&target) {
             let auth_path = config::codex_auth_path(&path)?;
             match self.ensure_codex_auth_backup(&auth_path) {
@@ -1304,8 +1430,10 @@ impl App {
             self.db.set_config_status(provider.client, "unavailable")?;
             return Err(error);
         }
+        self.finish_ownership_write(target.client)?;
         if target.client == ClientKind::Codex && !Self::manages_codex_auth(&target) {
             self.remove_codex_auth_backup()?;
+            self.finish_ownership_write(target.client)?;
         }
         self.db
             .set_active(provider.client, &provider.id, "synchronized")?;
@@ -1317,6 +1445,7 @@ impl App {
             claude_model_names_enabled,
         )?;
         self.release_claude_model_env_snapshot(&target)?;
+        self.finish_ownership_write(target.client)?;
         self.db.finish_operation(&operation, "complete", None)?;
         self.record_usage_route(provider.client);
         Ok(())
@@ -1416,6 +1545,7 @@ impl App {
             claude_model_names_update: claude_model_names_enabled,
             codex_auth_before_hash,
             claude_model_env_before,
+            ownership_lease: self.ownership_lease(provider.client)?,
         })
     }
 
@@ -1523,6 +1653,17 @@ impl App {
 
     fn codex_auth_backup(&self) -> Result<Option<config::CodexAuthSnapshot>> {
         let Some(encrypted) = self.db.protected_value(CODEX_AUTH_BACKUP_KEY)? else {
+            if let Some(lease) = self.ownership_lease(ClientKind::Codex)?
+                && self
+                    .db
+                    .setting(&format!(
+                        "config_auth_backup_required:{}:{}",
+                        lease.target_id, lease.generation
+                    ))?
+                    .is_some()
+            {
+                return Err(DaemonError::Conflict("the managed Codex authentication backup is missing; restore native authentication before continuing".into()));
+            }
             return Ok(None);
         };
         let plaintext = self.crypto.decrypt_protected(&encrypted)?;
@@ -1532,25 +1673,49 @@ impl App {
     }
 
     fn ensure_codex_auth_backup(&self, path: &std::path::Path) -> Result<bool> {
+        let lease = self.ownership_lease(ClientKind::Codex)?.ok_or_else(|| {
+            DaemonError::Conflict("Codex authentication has no configuration lease".into())
+        })?;
+        let required_key = format!(
+            "config_auth_backup_required:{}:{}",
+            lease.target_id, lease.generation
+        );
         if let Some(snapshot) = self.codex_auth_backup()? {
+            self.check_auth_backup_lease(&snapshot)?;
             if std::path::Path::new(&snapshot.auth_path) != path {
                 return Err(DaemonError::Conflict(
                     "Codex auth backup belongs to a different CODEX_HOME".into(),
                 ));
             }
+            self.db.set_setting(&required_key, "true")?;
             return Ok(false);
         }
-        let snapshot = config::capture_codex_auth(path)?;
+        if self.db.setting(&required_key)?.is_some() {
+            return Err(DaemonError::Conflict("the managed Codex authentication backup is missing; restore native authentication before continuing".into()));
+        }
+        let mut snapshot = config::capture_codex_auth(path)?;
+        snapshot.lease = self.ownership_lease(ClientKind::Codex)?;
+        if snapshot.lease.is_none() {
+            return Err(self.ownership_conflict(&[ClientKind::Codex])?);
+        }
         let serialized = Zeroizing::new(serde_json::to_vec(&snapshot)?);
         let encrypted = self
             .crypto
             .encrypt_protected(CODEX_AUTH_BACKUP_KEY, &serialized)?;
         self.db.put_protected_value(&encrypted)?;
+        self.db.set_setting(&required_key, "true")?;
         Ok(true)
     }
 
     fn remove_codex_auth_backup(&self) -> Result<()> {
-        self.db.delete_protected_value(CODEX_AUTH_BACKUP_KEY)
+        self.db.delete_protected_value(CODEX_AUTH_BACKUP_KEY)?;
+        if let Some(lease) = self.ownership_lease(ClientKind::Codex)? {
+            self.db.delete_setting(&format!(
+                "config_auth_backup_required:{}:{}",
+                lease.target_id, lease.generation
+            ))?;
+        }
+        Ok(())
     }
 
     fn codex_auth_is_currently_managed(
@@ -1611,6 +1776,7 @@ impl App {
             let key = Self::managed_codex_auth_key(target, credential)?;
             config::apply_codex_auth(&auth_path, target.codex_auth_before_hash.as_deref(), key)?;
         } else if let Some(snapshot) = self.codex_auth_backup()? {
+            self.check_auth_backup_lease(&snapshot)?;
             if std::path::Path::new(&snapshot.auth_path) != auth_path {
                 return Err(DaemonError::Conflict(
                     "Codex auth backup belongs to a different CODEX_HOME".into(),
@@ -1647,6 +1813,7 @@ impl App {
         let Some(snapshot) = self.codex_auth_backup()? else {
             return Ok(true);
         };
+        self.check_auth_backup_lease(&snapshot)?;
         if std::path::Path::new(&snapshot.auth_path) != auth_path {
             return Err(DaemonError::Conflict(
                 "Codex auth backup belongs to a different CODEX_HOME".into(),
@@ -1663,16 +1830,32 @@ impl App {
         if target.client != ClientKind::Codex {
             return Ok(());
         }
+        self.check_target_lease(target)?;
         self.ensure_codex_official_auth_available(target)?;
         let config_path = self.config_path(ClientKind::Codex)?;
         let auth_path = config::codex_auth_path(&config_path)?;
         if Self::manages_codex_auth(target) {
+            let lease = target
+                .ownership_lease
+                .as_ref()
+                .expect("recovery lease was validated");
+            let backup_required = self
+                .db
+                .setting(&format!(
+                    "config_auth_backup_required:{}:{}",
+                    lease.target_id, lease.generation,
+                ))?
+                .is_some();
+            if self.db.protected_value(CODEX_AUTH_BACKUP_KEY)?.is_none()
+                && (backup_required || self.codex_auth_target_is_applied(target, credential)?)
+            {
+                return Err(DaemonError::Conflict(
+                    "preserved Codex authentication is missing; recovery cannot capture a managed API key".into(),
+                ));
+            }
             self.ensure_codex_auth_backup(&auth_path)?;
         }
         if self.codex_auth_target_is_applied(target, credential)? {
-            if !Self::manages_codex_auth(target) {
-                self.remove_codex_auth_backup()?;
-            }
             return Ok(());
         }
         let current_hash = config::file_hash(&auth_path)?;
@@ -1681,11 +1864,7 @@ impl App {
                 "Codex authentication changed during configuration recovery".into(),
             ));
         }
-        self.apply_codex_auth_target(target, credential)?;
-        if !Self::manages_codex_auth(target) {
-            self.remove_codex_auth_backup()?;
-        }
-        Ok(())
+        self.apply_codex_auth_target(target, credential)
     }
 
     pub fn recover_operations(&self) -> Result<()> {
@@ -1697,6 +1876,13 @@ impl App {
                 "import_official_auth" => self
                     .recover_official_import_operation(client, before_hash.as_deref(), &target_json)
                     .map(|()| RecoveryOutcome::Complete),
+                "release_config" => serde_json::from_str(&target_json)
+                    .map_err(DaemonError::from)
+                    .and_then(|params| self.recover_release_configuration(&params))
+                    .map(|()| RecoveryOutcome::Complete),
+                // A requesting instance must retry its cooperative RPC with the
+                // same transaction ID; startup cannot block waiting for its peer.
+                "takeover_config" => continue,
                 _ => Err(DaemonError::Config(format!(
                     "unknown pending operation kind {kind}"
                 ))),
@@ -1709,17 +1895,20 @@ impl App {
                     self.db.finish_operation(&id, "aborted", None)?;
                 }
                 Err(error) => {
-                    let conflict = matches!(error, DaemonError::Conflict(_));
+                    let conflict =
+                        matches!(error, DaemonError::Conflict(_) | DaemonError::Ownership(_));
                     self.db.set_config_status(
                         client,
                         if conflict { "conflict" } else { "unavailable" },
                     )?;
-                    self.db.finish_operation(
-                        &id,
-                        if conflict { "conflict" } else { "failed" },
-                        Some(&error.to_string()),
-                    )?;
-                    tracing::warn!(operation_id = %id, %error, "configuration operation recovery failed");
+                    if kind != "release_config" {
+                        self.db.finish_operation(
+                            &id,
+                            if conflict { "conflict" } else { "failed" },
+                            Some(&error.to_string()),
+                        )?;
+                    }
+                    tracing::warn!(operation_id = %id, code = error.code(), "configuration operation recovery failed");
                 }
             }
         }
@@ -1735,6 +1924,7 @@ impl App {
         let mut target: ConfigTarget = serde_json::from_str(target_json)?;
         if client != ClientKind::Codex
             || target.client != client
+            || target.provider.client != client
             || target.mode != ConnectionMode::Direct
             || !target.provider.official
             || target.codex_auth_before_hash.as_deref() != before_hash
@@ -1743,6 +1933,8 @@ impl App {
                 "official import recovery target is invalid".into(),
             ));
         }
+        let _transaction = self.begin_config_transaction(&[client], true)?;
+        self.check_target_lease(&target)?;
         let persisted = self.db.get_provider(&target.provider.id)?;
         target.provider.official = persisted.official;
         target.provider.credential_configured = persisted.credential_configured;
@@ -1764,7 +1956,10 @@ impl App {
         self.recover_codex_auth_target(&target, None)?;
         self.db
             .set_active(client, &target.provider.id, "synchronized")?;
-        self.db.set_mode(client, ConnectionMode::Direct)
+        self.db.set_mode(client, ConnectionMode::Direct)?;
+        self.finish_ownership_write(client)?;
+        self.remove_codex_auth_backup()?;
+        self.finish_ownership_write(client)
     }
 
     fn recover_operation(
@@ -1774,6 +1969,13 @@ impl App {
         target_json: &str,
     ) -> Result<RecoveryOutcome> {
         let mut target: ConfigTarget = serde_json::from_str(target_json)?;
+        if target.client != client || target.provider.client != client {
+            return Err(DaemonError::Conflict(
+                "configuration recovery target belongs to another client".into(),
+            ));
+        }
+        let _transaction = self.begin_config_transaction(&[client], true)?;
+        self.check_target_lease(&target)?;
         let persisted = self.db.get_provider(&target.provider.id)?;
         target.provider.official = persisted.official;
         target.provider.credential_configured = persisted.credential_configured;
@@ -1804,6 +2006,37 @@ impl App {
         let current_hash = config::file_hash(&path)?;
         let credential = self.config_credential(&target)?;
         let credential = credential.as_ref().map(ExposeSecret::expose_secret);
+        // Check authentication before touching config.toml, so a new login during
+        // a crash does not leave half of an older configuration restored.
+        if client == ClientKind::Codex {
+            let auth_hash = config::file_hash(&config::codex_auth_path(&path)?)?;
+            let lease = target
+                .ownership_lease
+                .as_ref()
+                .expect("recovery lease was validated");
+            let backup_required = self
+                .db
+                .setting(&format!(
+                    "config_auth_backup_required:{}:{}",
+                    lease.target_id, lease.generation,
+                ))?
+                .is_some();
+            if Self::manages_codex_auth(&target)
+                && self.db.protected_value(CODEX_AUTH_BACKUP_KEY)?.is_none()
+                && (backup_required || self.codex_auth_target_is_applied(&target, credential)?)
+            {
+                return Err(DaemonError::Conflict(
+                    "preserved Codex authentication is missing; recovery cannot capture a managed API key".into(),
+                ));
+            }
+            if auth_hash != target.codex_auth_before_hash
+                && !self.codex_auth_target_is_applied(&target, credential)?
+            {
+                return Err(DaemonError::Conflict(
+                    "Codex authentication changed during configuration recovery".into(),
+                ));
+            }
+        }
         if current_hash.as_deref() == before_hash {
             config::apply_with_credential(&path, before_hash, &target, credential)?;
         } else if config::patch_text_with_credential(&current, &target, credential)? != current {
@@ -1826,11 +2059,63 @@ impl App {
             self.db
                 .set_setting(CLAUDE_MODEL_NAMES_ENABLED_KEY, &enabled.to_string())?;
         }
+        self.finish_ownership_write(client)?;
+        if client == ClientKind::Codex && !Self::manages_codex_auth(&target) {
+            self.remove_codex_auth_backup()?;
+            self.finish_ownership_write(client)?;
+        }
         self.release_claude_model_env_snapshot(&target)?;
         Ok(RecoveryOutcome::Complete)
     }
 
     pub fn status(&self) -> Result<DaemonStatus> {
+        let mut clients = Vec::with_capacity(ClientKind::ALL.len());
+        for client in ClientKind::ALL {
+            let mut state = self.db.client_state(client)?;
+            match self.configuration_ownership(client) {
+                Ok(mut ownership) => {
+                    if ownership.owner_is_self {
+                        let local_generation = self
+                            .db
+                            .setting(&format!("config_lease:{}", ownership.target_id))?;
+                        if local_generation.as_deref()
+                            != Some(ownership.generation.to_string().as_str())
+                        {
+                            ownership.takeover_unavailable_reason = Some(
+                                "recovery_required: this instance has no matching configuration lease".into(),
+                            );
+                            ownership.takeover_available = false;
+                        }
+                    }
+                    if (ownership.owner.is_some() && !ownership.owner_is_self)
+                        || ownership.takeover_unavailable_reason.is_some()
+                    {
+                        state.config_status = hsin_core::ConfigStatus::Conflict;
+                    } else if ownership.owner.is_none()
+                        && !matches!(
+                            state.config_status,
+                            hsin_core::ConfigStatus::Conflict
+                                | hsin_core::ConfigStatus::Unavailable
+                        )
+                    {
+                        state.config_status = hsin_core::ConfigStatus::Unmanaged;
+                    }
+                    state.config_ownership = Some(ownership);
+                }
+                Err(error) => {
+                    // A damaged sidecar must not make status and takeover help
+                    // inaccessible for both clients, or terminate the daemon.
+                    state.config_status = match error {
+                        DaemonError::Conflict(_) | DaemonError::Ownership(_) => {
+                            hsin_core::ConfigStatus::Conflict
+                        }
+                        _ => hsin_core::ConfigStatus::Unavailable,
+                    };
+                    state.config_ownership = None;
+                }
+            }
+            clients.push(state);
+        }
         Ok(DaemonStatus {
             version: env!("CARGO_PKG_VERSION").into(),
             locked: !self.crypto.is_unlocked(),
@@ -1838,10 +2123,7 @@ impl App {
             proxy_enabled: self.proxy_enabled(),
             proxy_address: self.proxy_address()?.to_string(),
             codex_image_active_provider_id: self.db.image_active_provider_id()?,
-            clients: vec![
-                self.db.client_state(ClientKind::Codex)?,
-                self.db.client_state(ClientKind::Claude)?,
-            ],
+            clients,
         })
     }
 
@@ -2061,6 +2343,7 @@ impl App {
             .set_setting("client_auth", &serde_json::to_string(&client_auth)?)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn update_settings(&self, patch: SettingsPatch) -> Result<Settings> {
         let _guard = self.mutation.lock().await;
         let SettingsPatch {
@@ -2096,15 +2379,84 @@ impl App {
                 "proxy port must be at least 1024".into(),
             ));
         }
-        if let Some(language) = language {
-            if !matches!(
+        if let Some(language) = &language
+            && !matches!(
                 language.as_str(),
                 hsin_core::LANGUAGE_SYSTEM | hsin_core::LANGUAGE_EN_US | hsin_core::LANGUAGE_ZH_CN
-            ) {
-                return Err(DaemonError::Invalid(
-                    "language must be system, en-US, or zh-CN".into(),
-                ));
+            )
+        {
+            return Err(DaemonError::Invalid(
+                "language must be system, en-US, or zh-CN".into(),
+            ));
+        }
+        let binding_changed = new_host != old_host || new_port != old_port;
+        let previous_auth = self.client_auth_settings()?;
+        let mut desired_codex_auth = previous_auth;
+        if let Some(update) = client_auth.filter(|update| update.client == ClientKind::Codex) {
+            desired_codex_auth.codex_disable_custom_auth = update.disable_custom_auth;
+            if update.disable_custom_auth {
+                desired_codex_auth.codex_preserve_official_auth = false;
             }
+        }
+        if let Some(preserve) = codex_preserve_official_auth {
+            desired_codex_auth.codex_preserve_official_auth = preserve;
+            if preserve {
+                desired_codex_auth.codex_disable_custom_auth = false;
+            }
+        }
+        let claude_auth_changed = client_auth.is_some_and(|update| {
+            update.client == ClientKind::Claude
+                && update.disable_custom_auth != previous_auth.claude_disable_custom_auth
+        });
+        let claude_names_changed = match claude_model_names_enabled {
+            Some(enabled) => enabled != self.claude_model_names_enabled()?,
+            None => false,
+        };
+        let mut affected_clients = Vec::new();
+        let mut claude_auth_rewrites_config = false;
+        let mut claude_names_rewrite_config = false;
+        for client in ClientKind::ALL {
+            let may_rewrite_config = proxy_enabled == Some(false)
+                || binding_changed
+                || match client {
+                    ClientKind::Codex => desired_codex_auth != previous_auth,
+                    ClientKind::Claude => claude_auth_changed || claude_names_changed,
+                };
+            if !may_rewrite_config {
+                continue;
+            }
+            let state = self.db.client_state(client)?;
+            let proxy_rewrites_config = state.mode == ConnectionMode::Proxy
+                && (proxy_enabled == Some(false) || binding_changed);
+            let provider = state
+                .active_provider_id
+                .as_ref()
+                .map(|id| self.db.get_provider(id))
+                .transpose()?;
+            let auth_rewrites_config = match client {
+                ClientKind::Codex => {
+                    desired_codex_auth != previous_auth
+                        && provider.as_ref().is_some_and(|provider| !provider.official)
+                }
+                ClientKind::Claude => {
+                    claude_auth_changed
+                        && provider.as_ref().is_some_and(|provider| !provider.official)
+                }
+            };
+            if client == ClientKind::Claude {
+                claude_auth_rewrites_config = auth_rewrites_config;
+                claude_names_rewrite_config = claude_names_changed
+                    && provider.as_ref().is_some_and(claude_model_mapping_active);
+            }
+            if proxy_rewrites_config
+                || auth_rewrites_config
+                || (client == ClientKind::Claude && claude_names_rewrite_config)
+            {
+                affected_clients.push(client);
+            }
+        }
+        let _transaction = self.begin_config_transaction(&affected_clients, false)?;
+        if let Some(language) = language {
             self.db.set_setting("language", &language)?;
         }
         if let Some(update) = upstream_proxy {
@@ -2117,7 +2469,6 @@ impl App {
             self.disable_all_client_proxies_locked()?;
             self.set_proxy_enabled_locked(false).await?;
         }
-        let binding_changed = new_host != old_host || new_port != old_port;
         if binding_changed {
             self.set_proxy_binding_settings(new_host, new_port)?;
             if let Err(error) = self.reconcile_proxy_configurations() {
@@ -2139,8 +2490,25 @@ impl App {
                 .set_setting("clients", &serde_json::to_string(&clients)?)?;
         }
         self.update_codex_auth_settings(client_auth, codex_preserve_official_auth)?;
-        self.update_claude_auth_setting(client_auth)?;
-        self.update_claude_model_names_setting(claude_model_names_enabled)?;
+        if claude_auth_rewrites_config {
+            self.update_claude_auth_setting(client_auth)?;
+        } else if let Some(update) =
+            client_auth.filter(|update| update.client == ClientKind::Claude)
+            && claude_auth_changed
+        {
+            let mut auth = self.client_auth_settings()?;
+            auth.claude_disable_custom_auth = update.disable_custom_auth;
+            self.db
+                .set_setting("client_auth", &serde_json::to_string(&auth)?)?;
+        }
+        if claude_names_rewrite_config {
+            self.update_claude_model_names_setting(claude_model_names_enabled)?;
+        } else if let Some(enabled) = claude_model_names_enabled
+            && claude_names_changed
+        {
+            self.db
+                .set_setting(CLAUDE_MODEL_NAMES_ENABLED_KEY, &enabled.to_string())?;
+        }
         if proxy_enabled == Some(true) {
             self.set_proxy_enabled_locked(true).await?;
         }
@@ -2159,8 +2527,51 @@ impl App {
                 continue;
             }
             if let Some(provider_id) = state.active_provider_id {
+                let _transaction = match self.begin_config_transaction(&[client], true) {
+                    Ok(transaction) => transaction,
+                    Err(
+                        error @ (DaemonError::Ownership(_)
+                        | DaemonError::Conflict(_)
+                        | DaemonError::Config(_)
+                        | DaemonError::Io(_)
+                        | DaemonError::Crypto),
+                    ) => {
+                        self.db.set_config_status(
+                            client,
+                            if matches!(error, DaemonError::Ownership(_) | DaemonError::Conflict(_))
+                            {
+                                "conflict"
+                            } else {
+                                "unavailable"
+                            },
+                        )?;
+                        tracing::warn!(%client, code = error.code(), "proxy configuration synchronization is blocked by ownership");
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let provider = self.db.get_provider(&provider_id)?;
-                self.apply_configuration(&provider, ConnectionMode::Proxy)?;
+                match self.apply_configuration(&provider, ConnectionMode::Proxy) {
+                    Err(
+                        error @ (DaemonError::Ownership(_)
+                        | DaemonError::Conflict(_)
+                        | DaemonError::Config(_)
+                        | DaemonError::Io(_)
+                        | DaemonError::Crypto),
+                    ) => {
+                        self.db.set_config_status(
+                            client,
+                            if matches!(error, DaemonError::Ownership(_) | DaemonError::Conflict(_))
+                            {
+                                "conflict"
+                            } else {
+                                "unavailable"
+                            },
+                        )?;
+                        tracing::warn!(%client, code = error.code(), "proxy configuration synchronization needs recovery");
+                    }
+                    result => result?,
+                }
             }
         }
         Ok(())
@@ -2434,22 +2845,61 @@ impl App {
         if crate::service::uses_fallback() {
             findings.push(finding("systemd_user_unavailable", DoctorSeverity::Warning));
         }
-        for client in [ClientKind::Codex, ClientKind::Claude] {
+        for state in self.status()?.clients {
+            let client = state.client;
             if !self.config_path(client)?.exists() {
                 let mut item = finding("client_config_missing", DoctorSeverity::Info);
                 item.args.insert("client".into(), client.to_string());
                 findings.push(item);
+            }
+            match state.config_ownership {
+                Some(ownership)
+                    if matches!(
+                        state.config_status,
+                        hsin_core::ConfigStatus::Conflict | hsin_core::ConfigStatus::Unavailable
+                    ) =>
+                {
+                    let mut item = finding("client_config_conflict", DoctorSeverity::Warning);
+                    item.args.insert("client".into(), client.to_string());
+                    item.args.insert(
+                        "message".into(),
+                        ownership.takeover_unavailable_reason.unwrap_or_else(|| {
+                            if ownership.owner.is_some() && !ownership.owner_is_self {
+                                "another hsin instance manages this configuration".into()
+                            } else {
+                                "configuration synchronization requires recovery".into()
+                            }
+                        }),
+                    );
+                    findings.push(item);
+                }
+                None if matches!(
+                    state.config_status,
+                    hsin_core::ConfigStatus::Conflict | hsin_core::ConfigStatus::Unavailable
+                ) =>
+                {
+                    let mut item = finding("client_config_conflict", DoctorSeverity::Warning);
+                    item.args.insert("client".into(), client.to_string());
+                    item.args.insert(
+                        "message".into(),
+                        "configuration ownership metadata is damaged or unavailable".into(),
+                    );
+                    findings.push(item);
+                }
+                _ => {}
             }
         }
         Ok(DoctorReport::from_findings(findings))
     }
 
     fn config_path(&self, client: ClientKind) -> Result<PathBuf> {
-        self.config_paths
+        let path = self
+            .config_paths
             .read()
             .get(&client)
             .cloned()
-            .ok_or_else(|| DaemonError::Config("missing client config path".into()))
+            .ok_or_else(|| DaemonError::Config("missing client config path".into()))?;
+        Ok(crate::ownership::Target::new(client, path)?.config_path)
     }
 }
 
@@ -2507,7 +2957,7 @@ impl From<&DaemonError> for AppError {
             {
                 ErrorCode::RevisionConflict
             }
-            DaemonError::Conflict(_) => ErrorCode::ConfigConflict,
+            DaemonError::Conflict(_) | DaemonError::Ownership(_) => ErrorCode::ConfigConflict,
             DaemonError::Invalid(_) => ErrorCode::InvalidArgument,
             DaemonError::OAuthProxyUnsupported => ErrorCode::OAuthProxyUnsupported,
             DaemonError::NoActiveProvider => ErrorCode::NoActiveProvider,
@@ -2519,9 +2969,13 @@ impl From<&DaemonError> for AppError {
             DaemonError::PermissionDenied(_) => ErrorCode::PermissionDenied,
             _ => ErrorCode::Internal,
         };
-        AppError::new(code)
+        let mut result = AppError::new(code)
             .with_arg("message", error.to_string())
-            .retryable(error.retryable())
+            .retryable(error.retryable());
+        if let DaemonError::Ownership(details) = error {
+            result.config_conflict = Some(details.clone());
+        }
+        result
     }
 }
 
@@ -2590,56 +3044,308 @@ mod tests {
         path: &std::path::Path,
         target: &ConfigTarget,
     ) {
+        let _transaction = app
+            .begin_config_transaction(&[target.client], false)
+            .unwrap();
+        let normalized = crate::ownership::Target::new(target.client, path).unwrap();
+        let path = &normalized.config_path;
+        let mut target = target.clone();
+        target.ownership_lease = app.ownership_lease(target.client).unwrap();
+        if App::manages_codex_auth(&target) {
+            app.ensure_codex_auth_backup(&config::codex_auth_path(path).unwrap())
+                .unwrap();
+        }
         let before_hash = config::file_hash(path).unwrap();
-        app.db
+        let operation = app
+            .db
             .begin_operation(
                 "apply_config",
                 target.client,
                 before_hash.as_deref(),
-                &serde_json::to_string(target).unwrap(),
+                &serde_json::to_string(&target).unwrap(),
             )
             .unwrap();
-        let credential = app.config_credential(target).unwrap();
+        app.start_ownership_write(&target, &operation).unwrap();
+        let credential = app.config_credential(&target).unwrap();
         config::apply_with_credential(
             path,
             before_hash.as_deref(),
-            target,
+            &target,
             credential.as_ref().map(ExposeSecret::expose_secret),
         )
         .unwrap();
     }
 
-    fn leave_legacy_pending_configuration_operation(
-        app: &App,
-        path: &std::path::Path,
-        target: &ConfigTarget,
-    ) {
-        let before_hash = config::file_hash(path).unwrap();
-        let mut legacy = serde_json::to_value(target).unwrap();
-        legacy["provider"]
-            .as_object_mut()
-            .unwrap()
-            .remove("codex_config_name");
-        legacy
-            .as_object_mut()
-            .unwrap()
-            .remove("codex_preserve_official_auth");
+    fn recovery_app(home: &Path, shared: &Path) -> Arc<App> {
+        let paths = Paths::for_home(home.to_owned());
+        let app = App::open_with_store(&paths, Arc::new(MemoryStore::default())).unwrap();
+        *app.config_paths.write() = HashMap::from([
+            (ClientKind::Codex, shared.join("codex/config.toml")),
+            (ClientKind::Claude, shared.join("claude/settings.json")),
+        ]);
+        app
+    }
+
+    #[test]
+    fn recovery_never_replays_a_configuration_journal_without_a_lease() {
+        for previously_owned in [false, true] {
+            let root =
+                std::env::temp_dir().join(format!("hsind-legacy-journal-{}", uuid::Uuid::new_v4()));
+            let app = recovery_app(&root.join("instance"), &root.join("clients"));
+            let config_path = app.config_path(ClientKind::Codex).unwrap();
+            fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+            let before = "# native configuration\nmodel_provider = \"openai\"\n";
+            fs::write(&config_path, before).unwrap();
+            let official = app.ensure_official_provider(ClientKind::Codex).unwrap();
+            if previously_owned {
+                app.apply_configuration(&official, ConnectionMode::Direct)
+                    .unwrap();
+                fs::write(&config_path, before).unwrap();
+                let transaction = app.begin_config_transaction(&[ClientKind::Codex], true);
+                // The comment-only edit does not alter the managed-field fingerprint.
+                assert!(transaction.is_ok());
+            }
+            let mut target = app
+                .config_target(&official, ConnectionMode::Direct, None)
+                .unwrap();
+            target.ownership_lease = None;
+            app.db
+                .begin_operation(
+                    "apply_config",
+                    ClientKind::Codex,
+                    config::file_hash(&config_path).unwrap().as_deref(),
+                    &serde_json::to_string(&target).unwrap(),
+                )
+                .unwrap();
+
+            app.recover_operations().unwrap();
+
+            assert_eq!(fs::read_to_string(&config_path).unwrap(), before);
+            assert!(app.db.pending_operations().unwrap().is_empty());
+            assert!(
+                app.db
+                    .protected_value(CODEX_AUTH_BACKUP_KEY)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                app.status().unwrap().clients[0].config_status,
+                hsin_core::ConfigStatus::Conflict
+            );
+            if !previously_owned {
+                assert!(
+                    crate::ownership::Target::new(ClientKind::Codex, &config_path)
+                        .unwrap()
+                        .read_record()
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            drop(app);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn startup_does_not_claim_unowned_configuration_for_proxy_reconciliation() {
+        let root = std::env::temp_dir().join(format!(
+            "hsind-no-maintenance-claim-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let app = recovery_app(&root.join("instance"), &root.join("clients"));
+        let config_path = app.config_path(ClientKind::Codex).unwrap();
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let before = "model_provider = \"openai\"\n";
+        fs::write(&config_path, before).unwrap();
+        let official = app.ensure_official_provider(ClientKind::Codex).unwrap();
         app.db
-            .begin_operation(
-                "apply_config",
-                target.client,
-                before_hash.as_deref(),
-                &serde_json::to_string(&legacy).unwrap(),
-            )
+            .set_active(ClientKind::Codex, &official.id, "synchronized")
             .unwrap();
-        let credential = app.config_credential(target).unwrap();
-        config::apply_with_credential(
-            path,
-            before_hash.as_deref(),
-            target,
-            credential.as_ref().map(ExposeSecret::expose_secret),
+        app.db
+            .set_mode(ClientKind::Codex, ConnectionMode::Proxy)
+            .unwrap();
+
+        app.reconcile_proxy_configurations().unwrap();
+
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), before);
+        assert!(
+            crate::ownership::Target::new(ClientKind::Codex, &config_path)
+                .unwrap()
+                .read_record()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            app.status().unwrap().clients[0].config_status,
+            hsin_core::ConfigStatus::Conflict
+        );
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_preserves_foreign_configuration_and_does_not_import_its_managed_key() {
+        let root =
+            std::env::temp_dir().join(format!("hsind-foreign-startup-{}", uuid::Uuid::new_v4()));
+        let shared = root.join("clients");
+        let owner = recovery_app(&root.join("owner"), &shared);
+        let config_path = owner.config_path(ClientKind::Codex).unwrap();
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        let auth_path = config::codex_auth_path(&config_path).unwrap();
+        fs::write(
+            &auth_path,
+            "{\"auth_mode\":\"chatgpt\",\"tokens\":{\"access_token\":\"keep\"}}",
         )
         .unwrap();
+        let mut provider = owner.ensure_official_provider(ClientKind::Codex).unwrap();
+        provider.id = "foreign-custom".into();
+        provider.name = "Foreign custom".into();
+        provider.base_url = "https://foreign.example.test/v1".into();
+        provider.auth_scheme = AuthScheme::Bearer;
+        provider.official = false;
+        provider.credential_configured = true;
+        let encrypted = owner
+            .crypto
+            .encrypt_for(&provider, "foreign-secret")
+            .unwrap();
+        owner
+            .db
+            .insert_provider(&provider, Some(&encrypted), None)
+            .unwrap();
+        owner
+            .apply_configuration(&provider, ConnectionMode::Direct)
+            .unwrap();
+        let before_config = fs::read(&config_path).unwrap();
+        let before_auth = fs::read(&auth_path).unwrap();
+        let observer = recovery_app(&root.join("observer"), &shared);
+
+        observer.initialize_providers().unwrap();
+        observer.reconcile_client_auth_configuration().unwrap();
+        observer.reconcile_proxy_configurations().unwrap();
+
+        assert_eq!(fs::read(&config_path).unwrap(), before_config);
+        assert_eq!(fs::read(&auth_path).unwrap(), before_auth);
+        assert_eq!(
+            observer
+                .db
+                .list_providers(Some(ClientKind::Codex))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            observer
+                .db
+                .protected_value(CODEX_AUTH_BACKUP_KEY)
+                .unwrap()
+                .is_none()
+        );
+        let status = observer.status().unwrap();
+        assert_eq!(
+            status.clients[0].config_status,
+            hsin_core::ConfigStatus::Conflict
+        );
+        assert_eq!(
+            status.clients[0]
+                .config_ownership
+                .as_ref()
+                .unwrap()
+                .owner
+                .as_ref()
+                .unwrap()
+                .instance_id,
+            owner.instance.instance_id
+        );
+        drop(observer);
+        drop(owner);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn status_and_doctor_remain_available_for_pending_and_damaged_ownership() {
+        let root = std::env::temp_dir().join(format!(
+            "hsind-damaged-owner-status-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let app = recovery_app(&root.join("instance"), &root.join("clients"));
+        let official = app.ensure_official_provider(ClientKind::Codex).unwrap();
+        app.apply_configuration(&official, ConnectionMode::Direct)
+            .unwrap();
+        let target = crate::ownership::Target::new(
+            ClientKind::Codex,
+            app.config_path(ClientKind::Codex).unwrap(),
+        )
+        .unwrap();
+        let mut guard = target.lock().unwrap();
+        let mut record = guard.record().unwrap().clone();
+        record.pending = Some(crate::ownership::Pending {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            kind: crate::ownership::PendingKind::Write,
+            requester: None,
+        });
+        guard.set_record(record).unwrap();
+        drop(guard);
+        assert_eq!(
+            app.status().unwrap().clients[0].config_status,
+            hsin_core::ConfigStatus::Conflict
+        );
+        fs::write(target.path.join(".hsin-config-owner.json"), "damaged").unwrap();
+
+        assert_eq!(
+            app.status().unwrap().clients[0].config_status,
+            hsin_core::ConfigStatus::Conflict
+        );
+        assert!(
+            app.doctor()
+                .unwrap()
+                .findings
+                .iter()
+                .any(|finding| finding.code == "client_config_conflict")
+        );
+        app.reconcile_client_auth_configuration().unwrap();
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_keeps_an_unreadable_auth_backup_and_continues_serving_status() {
+        let root = std::env::temp_dir().join(format!(
+            "hsind-unreadable-auth-backup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let app = recovery_app(&root.join("instance"), &root.join("clients"));
+        let config_path = app.config_path(ClientKind::Codex).unwrap();
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, "model_provider = \"openai\"\n").unwrap();
+        let official = app.ensure_official_provider(ClientKind::Codex).unwrap();
+        app.apply_configuration(&official, ConnectionMode::Direct)
+            .unwrap();
+        let before = fs::read(&config_path).unwrap();
+        let encrypted = app
+            .crypto
+            .encrypt_protected(CODEX_AUTH_BACKUP_KEY, b"invalid protected snapshot")
+            .unwrap();
+        app.db.put_protected_value(&encrypted).unwrap();
+
+        app.reconcile_client_auth_configuration().unwrap();
+
+        assert_eq!(fs::read(&config_path).unwrap(), before);
+        assert!(
+            app.db
+                .protected_value(CODEX_AUTH_BACKUP_KEY)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            app.db
+                .client_state(ClientKind::Codex)
+                .unwrap()
+                .config_status,
+            hsin_core::ConfigStatus::Unavailable
+        );
+        assert!(app.status().is_ok());
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3760,8 +4466,7 @@ mod tests {
         let enable = app
             .config_target(&provider, ConnectionMode::Direct, Some(true))
             .unwrap();
-        app.ensure_codex_auth_backup(&codex_auth).unwrap();
-        leave_legacy_pending_configuration_operation(&app, &codex_config, &enable);
+        leave_pending_configuration_operation(&app, &codex_config, &enable);
         app.recover_operations().unwrap();
         assert!(
             fs::read_to_string(&codex_auth)
@@ -3893,7 +4598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_reconciles_the_previous_experimental_bearer_token_format() {
+    async fn startup_preserves_the_legacy_bearer_format_until_explicit_recovery() {
         let root =
             std::env::temp_dir().join(format!("hsind-auth-upgrade-{}", uuid::Uuid::new_v4()));
         let paths = Paths {
@@ -3959,13 +4664,19 @@ mod tests {
 
         app.reconcile_client_auth_configuration().unwrap();
         let configured = fs::read_to_string(&codex_config).unwrap();
-        assert!(configured.contains("requires_openai_auth = true"));
-        assert!(!configured.contains("experimental_bearer_token"));
-        let auth = fs::read_to_string(root.join("codex/auth.json")).unwrap();
-        assert!(auth.contains(&format!(
-            "\"OPENAI_API_KEY\": \"{}\"",
-            config::HSIN_MANAGED_KEY
-        )));
+        assert!(configured.contains("experimental_bearer_token"));
+        assert!(!configured.contains("requires_openai_auth = true"));
+        assert!(!root.join("codex/auth.json").exists());
+        assert!(
+            app.db
+                .protected_value(CODEX_AUTH_BACKUP_KEY)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            app.status().unwrap().clients[0].config_status,
+            hsin_core::ConfigStatus::Conflict
+        );
 
         drop(app);
         fs::remove_dir_all(root).unwrap();
@@ -4020,6 +4731,9 @@ mod tests {
             .set_mode(ClientKind::Codex, ConnectionMode::Proxy)
             .unwrap();
 
+        // Startup may refresh a previously applied lease, but never establish one.
+        app.apply_configuration(&provider, ConnectionMode::Proxy)
+            .unwrap();
         app.reconcile_client_auth_configuration().unwrap();
 
         let configured = fs::read_to_string(&codex_config).unwrap();
@@ -4185,6 +4899,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn importing_official_codex_restores_auth_without_rewriting_config() {
         let root =
             std::env::temp_dir().join(format!("hsind-import-oauth-{}", uuid::Uuid::new_v4()));
@@ -4236,6 +4951,37 @@ mod tests {
         let official_config = "# keep\nmodel_provider = \"openai\"\napproval_policy = \"never\"\n";
         fs::write(&codex_config, official_config).unwrap();
 
+        let rejected = app
+            .import_current(ImportCurrentParams {
+                client: ClientKind::Codex,
+                name: String::new(),
+            })
+            .await;
+        assert!(matches!(rejected, Err(DaemonError::Ownership(_))));
+        assert!(app.codex_auth_backup().unwrap().is_some());
+        // Restore the owned representation before the cooperative Official
+        // transition; a manually changed selector is not permission to restore auth.
+        let original_custom = app
+            .db
+            .client_state(ClientKind::Codex)
+            .unwrap()
+            .active_provider_id
+            .unwrap();
+        let custom = app.db.get_provider(&original_custom).unwrap();
+        let target = app
+            .config_target(&custom, ConnectionMode::Direct, None)
+            .unwrap();
+        let configured =
+            config::patch_text_with_credential(official_config, &target, None).unwrap();
+        fs::write(&codex_config, configured).unwrap();
+        let official = app.ensure_official_provider(ClientKind::Codex).unwrap();
+        app.switch_provider(ProviderSwitchParams {
+            client: ClientKind::Codex,
+            provider_id: official.id,
+        })
+        .await
+        .unwrap();
+        let native_config = fs::read_to_string(&codex_config).unwrap();
         let result = app
             .import_current(ImportCurrentParams {
                 client: ClientKind::Codex,
@@ -4246,7 +4992,7 @@ mod tests {
 
         assert!(result.provider.official);
         assert!(!result.imported);
-        assert_eq!(fs::read_to_string(&codex_config).unwrap(), official_config);
+        assert_eq!(fs::read_to_string(&codex_config).unwrap(), native_config);
         assert_eq!(fs::read_to_string(&codex_auth).unwrap(), original_auth);
         assert!(
             app.db
@@ -4264,7 +5010,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_completes_pending_official_codex_import() {
+    async fn recovery_blocks_pending_official_import_after_external_configuration_change() {
         let root =
             std::env::temp_dir().join(format!("hsind-recover-oauth-{}", uuid::Uuid::new_v4()));
         let paths = Paths {
@@ -4307,10 +5053,11 @@ mod tests {
             .unwrap();
         app.switch_provider(ProviderSwitchParams {
             client: ClientKind::Codex,
-            provider_id: custom.id,
+            provider_id: custom.id.clone(),
         })
         .await
         .unwrap();
+        let managed_auth = fs::read_to_string(&codex_auth).unwrap();
         let official_config = "model_provider = \"openai\"\n";
         fs::write(&codex_config, official_config).unwrap();
         let official = app.ensure_official_provider(ClientKind::Codex).unwrap();
@@ -4329,12 +5076,12 @@ mod tests {
         app.recover_operations().unwrap();
 
         assert_eq!(fs::read_to_string(&codex_config).unwrap(), official_config);
-        assert_eq!(fs::read_to_string(&codex_auth).unwrap(), original_auth);
+        assert_eq!(fs::read_to_string(&codex_auth).unwrap(), managed_auth);
         assert!(
             app.db
                 .protected_value(CODEX_AUTH_BACKUP_KEY)
                 .unwrap()
-                .is_none()
+                .is_some()
         );
         assert_eq!(
             app.db
@@ -4342,7 +5089,11 @@ mod tests {
                 .unwrap()
                 .active_provider_id
                 .as_deref(),
-            Some("official-codex")
+            Some(custom.id.as_str())
+        );
+        assert_eq!(
+            app.status().unwrap().clients[0].config_status,
+            hsin_core::ConfigStatus::Conflict
         );
         assert!(app.db.pending_operations().unwrap().is_empty());
 
@@ -4351,7 +5102,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn import_current_deduplicates_by_url_and_secret() {
+    async fn import_current_deduplicates_and_rejects_changes_to_owned_fields() {
         let root = std::env::temp_dir().join(format!("hsind-reimport-{}", uuid::Uuid::new_v4()));
         let paths = Paths {
             database: root.join("hsin.sqlite3"),
@@ -4403,15 +5154,14 @@ mod tests {
                 client: ClientKind::Claude,
                 name: String::new(),
             })
-            .await
-            .unwrap();
-        assert!(changed_key.imported);
+            .await;
+        assert!(matches!(changed_key, Err(DaemonError::Ownership(_))));
         assert_eq!(
             app.db
                 .list_providers(Some(ClientKind::Claude))
                 .unwrap()
                 .len(),
-            3
+            2
         );
 
         fs::write(
@@ -4424,15 +5174,14 @@ mod tests {
                 client: ClientKind::Claude,
                 name: String::new(),
             })
-            .await
-            .unwrap();
-        assert!(changed_url.imported);
+            .await;
+        assert!(matches!(changed_url, Err(DaemonError::Ownership(_))));
         assert_eq!(
             app.db
                 .list_providers(Some(ClientKind::Claude))
                 .unwrap()
                 .len(),
-            4
+            2
         );
 
         drop(app);
@@ -4493,10 +5242,7 @@ mod tests {
                 name: String::new(),
             })
             .await;
-        assert!(matches!(
-            helper_import,
-            Err(DaemonError::CurrentCredentialUnavailable)
-        ));
+        assert!(matches!(helper_import, Err(DaemonError::Ownership(_))));
         assert!(!helper_marker.exists());
         assert_eq!(
             app.db
@@ -4826,8 +5572,19 @@ mod tests {
         .unwrap();
         app.reconcile_proxy_configurations().unwrap();
         let reconciled = fs::read_to_string(&codex_config_path).unwrap();
-        assert!(reconciled.contains(&configured_proxy_url));
-        assert!(!reconciled.contains(&stale_proxy_url));
+        assert!(!reconciled.contains(&configured_proxy_url));
+        assert!(reconciled.contains(&stale_proxy_url));
+        assert_eq!(
+            app.status().unwrap().clients[0].config_status,
+            hsin_core::ConfigStatus::Conflict
+        );
+        assert!(matches!(
+            app.set_mode(ClientKind::Codex, ConnectionMode::Direct)
+                .await,
+            Err(DaemonError::Ownership(_))
+        ));
+        // The user explicitly restores the fields last written by this owner.
+        fs::write(&codex_config_path, configured).unwrap();
 
         app.set_mode(ClientKind::Codex, ConnectionMode::Direct)
             .await

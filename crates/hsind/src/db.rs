@@ -304,6 +304,7 @@ impl Database {
                         active_provider_id: row.get(0)?,
                         mode: ConnectionMode::from_str(&mode).map_err(parse_to_sql_error)?,
                         config_status: parse_config_status(&status).map_err(to_sql_error)?,
+                        config_ownership: None,
                     })
                 },
             )
@@ -482,6 +483,21 @@ impl Database {
         self.connection
             .lock()
             .execute("DELETE FROM protected_values WHERE key=?1", [key])?;
+        Ok(())
+    }
+
+    /// Retain a legacy encrypted backup inside a new encrypted envelope without
+    /// interpreting or restoring it as the new configuration's baseline.
+    pub fn quarantine_protected_value(
+        &self,
+        old_key: &str,
+        envelope: &EncryptedProtectedValue,
+    ) -> Result<()> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        upsert_protected_value(&transaction, envelope, unix_time()?)?;
+        transaction.execute("DELETE FROM protected_values WHERE key=?1", [old_key])?;
+        transaction.commit()?;
         Ok(())
     }
 

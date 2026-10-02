@@ -43,7 +43,9 @@ pub(super) fn draw_provider_list(
         providers
             .iter()
             .map(|provider| {
-                let marker = if active.as_deref() == Some(provider.id.as_str()) {
+                let marker = if state.status.configuration_applied(state.client)
+                    && active.as_deref() == Some(provider.id.as_str())
+                {
                     "●"
                 } else {
                     "○"
@@ -173,6 +175,34 @@ pub(super) fn draw_details(frame: &mut Frame<'_>, area: Rect, state: &State, i18
         detail_line(i18n.text("tool_proxy"), proxy),
         detail_line(i18n.text("upstream_proxy"), &network_proxy),
     ];
+    let client = if state.image_section {
+        ClientKind::Codex
+    } else {
+        state.client
+    };
+    if let Some(status) = state.status.config_status(client) {
+        let key = match status {
+            hsin_core::ConfigStatus::Unmanaged => "config_status_unmanaged",
+            hsin_core::ConfigStatus::Synchronized => "config_status_synchronized",
+            hsin_core::ConfigStatus::Drifted => "config_status_drifted",
+            hsin_core::ConfigStatus::Conflict => "config_status_conflict",
+            hsin_core::ConfigStatus::Unavailable => "config_status_unavailable",
+        };
+        lines.push(detail_line(i18n.text("config_status"), i18n.text(key)));
+    }
+    if let Some(ownership) = state.status.config_ownership(client) {
+        let owner = if ownership.owner_is_self {
+            i18n.text("config_owner_self").to_owned()
+        } else if let Some(owner) = &ownership.owner {
+            format!("{} · {}", owner.instance_label, owner.instance_home)
+        } else {
+            i18n.text("config_owner_unknown").to_owned()
+        };
+        lines.push(Line::from(format!(
+            "{}: {owner}",
+            i18n.text("config_owner")
+        )));
+    }
     if state.image_section {
         lines.push(detail_line(
             i18n.text("image_provider_source"),

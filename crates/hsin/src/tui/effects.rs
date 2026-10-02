@@ -1,14 +1,16 @@
 use anyhow::{Context, Result, ensure};
 use hsin_core::{
     ClaudeModelMappingUpdate, ClientAuthUpdate, ClientKind, ClientSettings, CodexConfigNameUpdate,
-    CodexImageConfigUpdate, CodexImageListParams, CodexImageSwitchParams, ConnectionMode,
-    ImportCurrentParams, ImportCurrentResult, ModeSetParams, ModelDiscoverParams, ModelPriceInput,
-    ModelPriceList, ModelUpdate, Provider, ProviderAddParams, ProviderDraft, ProviderEditParams,
-    ProviderPatch, ProviderRemoveParams, ProviderSwitchParams, SecretInput, Settings,
-    SettingsPatch, UsageStatsQuery, UsageStatsReport,
+    CodexImageConfigUpdate, CodexImageListParams, CodexImageSwitchParams, ConfigConflictDetails,
+    ConfigTakeoverParams, ConfigTakeoverResult, ConnectionMode, ErrorCode, ImportCurrentParams,
+    ImportCurrentResult, ModeSetParams, ModelDiscoverParams, ModelPriceInput, ModelPriceList,
+    ModelUpdate, Provider, ProviderAddParams, ProviderDraft, ProviderEditParams, ProviderPatch,
+    ProviderRemoveParams, ProviderSwitchParams, SecretInput, Settings, SettingsPatch,
+    UsageStatsQuery, UsageStatsReport,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+use zeroize::Zeroize;
 
 use crate::rpc::{DaemonClient, StatusSnapshot};
 
@@ -50,7 +52,7 @@ pub(super) enum Effect {
     SetLanguage(String),
     SetUpstreamProxy {
         config: hsin_core::UpstreamProxyConfig,
-        password: SecretInput,
+        password: SensitiveSecretInput,
     },
     SetStatsChartStyle(hsin_core::StatsChartStyle),
     QueryUsage(UsageStatsQuery),
@@ -60,6 +62,51 @@ pub(super) enum Effect {
     RemovePrice(String),
     /// Fetches the public price list; only ever sent on the user's request.
     RefreshPrices,
+    Takeover {
+        request: ConfigTakeoverParams,
+        operation: Box<Effect>,
+    },
+}
+
+/// A retained UI operation must clear its password on cancellation as well as on completion.
+#[derive(Debug)]
+pub(super) struct SensitiveSecretInput(pub(super) SecretInput);
+
+impl From<SecretInput> for SensitiveSecretInput {
+    fn from(value: SecretInput) -> Self {
+        Self(value)
+    }
+}
+
+impl PartialEq<SecretInput> for SensitiveSecretInput {
+    fn eq(&self, other: &SecretInput) -> bool {
+        self.0 == *other
+    }
+}
+
+impl Drop for SensitiveSecretInput {
+    fn drop(&mut self) {
+        clear_secret(&mut self.0);
+    }
+}
+
+fn clear_secret(secret: &mut SecretInput) {
+    if let SecretInput::Replace(value) = secret {
+        value.zeroize();
+    }
+}
+
+fn ownership_conflict(error: &anyhow::Error) -> Option<ConfigConflictDetails> {
+    error.chain().find_map(|source| {
+        let hsin_ipc::TransportError::Rpc(rpc) = source.downcast_ref()? else {
+            return None;
+        };
+        rpc.data.as_ref().and_then(|application| {
+            (application.code == ErrorCode::ConfigConflict)
+                .then(|| application.config_conflict.clone())
+                .flatten()
+        })
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -141,7 +188,20 @@ pub(super) async fn worker(
             }
             continue;
         }
-        let result = execute_effect(&client, effect).await;
+        let (operation, result, takeover_failed) =
+            if let Effect::Takeover { request, operation } = effect {
+                let takeover = client
+                    .call::<_, ConfigTakeoverResult>(hsin_ipc::method::CONFIG_TAKEOVER, &request)
+                    .await;
+                let (result, takeover_failed) = match takeover {
+                    Ok(_) => (execute_effect(&client, &operation).await, false),
+                    Err(error) => (Err(error), true),
+                };
+                (*operation, result, takeover_failed)
+            } else {
+                let result = execute_effect(&client, &effect).await;
+                (effect, result, false)
+            };
         match result {
             Ok(notice) => {
                 if let Some(notice) = notice {
@@ -163,7 +223,19 @@ pub(super) async fn worker(
                 }
             }
             Err(error) => {
-                let _ = actions.send(Action::Failed(error_notice(&error))).await;
+                let action = if let Some(details) = ownership_conflict(&error) {
+                    Action::ConfigConflict { operation, details }
+                } else {
+                    Action::ConfigurationFailed {
+                        operation,
+                        message: if takeover_failed {
+                            takeover_error_notice(&error)
+                        } else {
+                            error_notice(&error)
+                        },
+                    }
+                };
+                let _ = actions.send(action).await;
             }
         }
     }
@@ -240,8 +312,47 @@ fn error_notice(error: &anyhow::Error) -> String {
     format!("{error:#}")
 }
 
+/// Only translate the daemon's controlled takeover failure reasons; never display request data.
+fn takeover_error_notice(error: &anyhow::Error) -> String {
+    let application = error.chain().find_map(|source| {
+        let hsin_ipc::TransportError::Rpc(rpc) = source.downcast_ref()? else {
+            return None;
+        };
+        rpc.data.as_ref()
+    });
+    let key = application.and_then(|application| {
+        if application.code == ErrorCode::KeyStoreLocked {
+            return Some("config_takeover_owner_locked");
+        }
+        let message = application.args.get("message")?;
+        let message = message
+            .strip_prefix("configuration error: ")
+            .unwrap_or(message);
+        let message = message
+            .strip_prefix("codex: ")
+            .or_else(|| message.strip_prefix("claude: "))
+            .unwrap_or(message);
+        if message.starts_with("managing instance is unavailable") {
+            Some("config_takeover_owner_unavailable")
+        } else if message.starts_with("managing instance has an incompatible version")
+            || message.starts_with("managing instance has no IPC endpoint")
+        {
+            Some("config_takeover_owner_upgrade")
+        } else if message.starts_with("managing instance identity or capability changed") {
+            Some("config_takeover_owner_changed")
+        } else if message.starts_with("managing instance could not restore its configuration") {
+            Some("config_takeover_owner_restore_failed")
+        } else if message.starts_with("Codex authentication backup could not be decrypted") {
+            Some("config_takeover_auth_backup_unreadable")
+        } else {
+            None
+        }
+    });
+    key.map_or_else(|| error_notice(error), |key| format!("@{key}"))
+}
+
 #[allow(clippy::too_many_lines)]
-async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<&'static str>> {
+async fn execute_effect(client: &DaemonClient, effect: &Effect) -> Result<Option<&'static str>> {
     match effect {
         Effect::Refresh => Ok(None),
         Effect::Switch { client: kind, id } => {
@@ -249,8 +360,8 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
                 .call(
                     "provider.switch",
                     &ProviderSwitchParams {
-                        client: kind,
-                        provider_id: id,
+                        client: *kind,
+                        provider_id: id.clone(),
                     },
                 )
                 .await?;
@@ -260,35 +371,43 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
             let _: Value = client
                 .call(
                     "codex_image.switch",
-                    &CodexImageSwitchParams { provider_id },
+                    &CodexImageSwitchParams {
+                        provider_id: provider_id.clone(),
+                    },
                 )
                 .await?;
             Ok(Some("image_provider_switched"))
         }
         Effect::SetMode { client: kind, mode } => {
             let _: Value = client
-                .call("mode.set", &ModeSetParams { client: kind, mode })
+                .call(
+                    "mode.set",
+                    &ModeSetParams {
+                        client: *kind,
+                        mode: *mode,
+                    },
+                )
                 .await?;
-            Ok(Some(if mode == ConnectionMode::Proxy {
+            Ok(Some(if *mode == ConnectionMode::Proxy {
                 "mode_proxy_enabled"
             } else {
                 "mode_proxy_disabled"
             }))
         }
-        Effect::SetProxyEnabled(enabled) => update_proxy_enabled(client, enabled).await,
-        Effect::SetProxyHost(host) => update_proxy_host(client, host).await,
-        Effect::SetProxyPort(port) => update_proxy_port(client, port).await,
-        Effect::SetClients(settings) => update_clients(client, settings).await,
+        Effect::SetProxyEnabled(enabled) => update_proxy_enabled(client, *enabled).await,
+        Effect::SetProxyHost(host) => update_proxy_host(client, host.clone()).await,
+        Effect::SetProxyPort(port) => update_proxy_port(client, *port).await,
+        Effect::SetClients(settings) => update_clients(client, settings.clone()).await,
         Effect::SetClientAuth {
             client: kind,
             disable_custom_auth,
-        } => update_client_auth(client, kind, disable_custom_auth).await,
+        } => update_client_auth(client, *kind, *disable_custom_auth).await,
         Effect::SetCodexOfficialAuthPreservation(enabled) => {
-            update_codex_official_auth_preservation(client, enabled).await
+            update_codex_official_auth_preservation(client, *enabled).await
         }
-        Effect::SetClaudeModelNames(enabled) => update_claude_model_names(client, enabled).await,
+        Effect::SetClaudeModelNames(enabled) => update_claude_model_names(client, *enabled).await,
         Effect::ImportCurrent(kind) => {
-            let imported = import_current(client, kind).await?;
+            let imported = import_current(client, *kind).await?;
             Ok(Some(if imported {
                 "provider_imported"
             } else {
@@ -296,15 +415,19 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
             }))
         }
         Effect::Add(form) => {
-            let _: Value = client
-                .call("provider.add", &provider_add_params(form))
-                .await?;
+            let mut request = provider_add_params(form.clone());
+            let result = client.call::<_, Value>("provider.add", &request).await;
+            clear_secret(&mut request.secret);
+            clear_secret(&mut request.proxy_password);
+            result?;
             Ok(Some("provider_added"))
         }
         Effect::Edit(form) => {
-            let _: Value = client
-                .call("provider.edit", &provider_edit_params(form)?)
-                .await?;
+            let mut request = provider_edit_params(form.clone())?;
+            let result = client.call::<_, Value>("provider.edit", &request).await;
+            clear_secret(&mut request.secret);
+            clear_secret(&mut request.proxy_password);
+            result?;
             Ok(Some("provider_updated"))
         }
         Effect::Remove {
@@ -315,23 +438,23 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
                 .call(
                     "provider.remove",
                     &ProviderRemoveParams {
-                        id,
-                        expected_revision,
+                        id: id.clone(),
+                        expected_revision: *expected_revision,
                     },
                 )
                 .await?;
             Ok(Some("provider_removed"))
         }
-        Effect::SetLanguage(language) => update_language(client, language).await,
+        Effect::SetLanguage(language) => update_language(client, language.clone()).await,
         Effect::SetUpstreamProxy { config, password } => {
-            update_upstream_proxy(client, config, password).await
+            update_upstream_proxy(client, config.clone(), &password.0).await
         }
         Effect::SetStatsChartStyle(style) => {
             let _: Value = client
                 .call(
                     "settings.set",
                     &SettingsPatch {
-                        stats_chart_style: Some(style),
+                        stats_chart_style: Some(*style),
                         ..SettingsPatch::default()
                     },
                 )
@@ -352,6 +475,7 @@ async fn execute_effect(client: &DaemonClient, effect: Effect) -> Result<Option<
         | Effect::RefreshPrices => {
             unreachable!("price rules are handled by the worker")
         }
+        Effect::Takeover { .. } => unreachable!("takeover is handled by the worker"),
     }
 }
 
@@ -578,17 +702,20 @@ async fn update_language(client: &DaemonClient, language: String) -> Result<Opti
 async fn update_upstream_proxy(
     client: &DaemonClient,
     config: hsin_core::UpstreamProxyConfig,
-    password: SecretInput,
+    password: &SecretInput,
 ) -> Result<Option<&'static str>> {
-    let _: Settings = client
-        .call(
-            "settings.set",
-            &SettingsPatch {
-                upstream_proxy: Some(hsin_core::UpstreamProxyUpdate { config, password }),
-                ..SettingsPatch::default()
-            },
-        )
-        .await?;
+    let mut request = SettingsPatch {
+        upstream_proxy: Some(hsin_core::UpstreamProxyUpdate {
+            config,
+            password: password.clone(),
+        }),
+        ..SettingsPatch::default()
+    };
+    let result = client.call::<_, Settings>("settings.set", &request).await;
+    if let Some(proxy) = &mut request.upstream_proxy {
+        clear_secret(&mut proxy.password);
+    }
+    result?;
     Ok(Some("upstream_proxy_changed"))
 }
 
@@ -710,4 +837,75 @@ async fn load(client: &DaemonClient) -> Result<(Vec<Provider>, StatusSnapshot, S
     status.recovery_key_exported = client.security_status().await?.recovery_key_configured;
     let settings = client.call("settings.get", &serde_json::json!({})).await?;
     Ok((providers, status, settings))
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_cas_and_transport_errors_are_never_takeover_candidates() {
+        for error in [
+            anyhow::Error::new(hsin_ipc::TransportError::Rpc(
+                hsin_ipc::RpcError::application(hsin_core::AppError::new(
+                    ErrorCode::ConfigConflict,
+                )),
+            )),
+            anyhow::Error::new(hsin_ipc::TransportError::Rpc(
+                hsin_ipc::RpcError::application(hsin_core::AppError::new(
+                    ErrorCode::RevisionConflict,
+                )),
+            )),
+            anyhow::Error::new(hsin_ipc::TransportError::Timeout(
+                std::time::Duration::from_secs(10),
+            )),
+        ] {
+            assert!(ownership_conflict(&error).is_none());
+        }
+    }
+
+    #[test]
+    fn takeover_failures_identify_the_remote_owner_without_echoing_rpc_data() {
+        for (code, message, expected) in [
+            (
+                ErrorCode::ConfigUnavailable,
+                "configuration error: codex: managing instance is unavailable; start it and retry takeover",
+                "@config_takeover_owner_unavailable",
+            ),
+            (
+                ErrorCode::ConfigUnavailable,
+                "configuration error: codex: Codex authentication backup could not be decrypted; configuration files were left unchanged",
+                "@config_takeover_auth_backup_unreadable",
+            ),
+            (
+                ErrorCode::ConfigUnavailable,
+                "configuration error: managing instance is unavailable; start it and retry takeover",
+                "@config_takeover_owner_unavailable",
+            ),
+            (
+                ErrorCode::ConfigUnavailable,
+                "configuration error: managing instance has an incompatible version; upgrade it and retry",
+                "@config_takeover_owner_upgrade",
+            ),
+            (
+                ErrorCode::ConfigUnavailable,
+                "configuration error: managing instance could not restore its configuration; inspect its status, unlock it if needed, and retry",
+                "@config_takeover_owner_restore_failed",
+            ),
+            (
+                ErrorCode::KeyStoreLocked,
+                "daemon is locked because the system keyring is unavailable",
+                "@config_takeover_owner_locked",
+            ),
+        ] {
+            let application = hsin_core::AppError::new(code)
+                .with_arg("message", message)
+                .with_arg("unrelated", "never-echo-this-value");
+            let error = anyhow::Error::new(hsin_ipc::TransportError::Rpc(
+                hsin_ipc::RpcError::application(application),
+            ));
+            assert_eq!(takeover_error_notice(&error), expected);
+            assert!(!takeover_error_notice(&error).contains("never-echo"));
+        }
+    }
 }

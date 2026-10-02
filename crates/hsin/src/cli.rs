@@ -35,6 +35,11 @@ pub enum Command {
         #[command(subcommand)]
         command: ModeCommand,
     },
+    /// Manage ownership of shared client configuration.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Show daemon and client state.
     Status,
     /// Show Codex or Claude Code token statistics.
@@ -186,6 +191,16 @@ pub struct ProviderSwitch {
     pub client: ClientArg,
     /// Provider ID to activate.
     pub id: String,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Safely take over configuration from another hsin instance.
+    Takeover {
+        /// Clients whose configuration this instance will manage.
+        #[arg(value_enum, num_args = 1..=2, required = true)]
+        clients: Vec<ClientArg>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -486,6 +501,25 @@ mod tests {
                 command: ProviderCommand::Switch(_)
             })
         ));
+    }
+
+    #[test]
+    fn parses_explicit_config_takeover_for_one_or_both_clients() {
+        for arguments in [
+            vec!["hsin", "config", "takeover", "codex"],
+            vec!["hsin", "config", "takeover", "codex", "claude"],
+        ] {
+            let cli = Cli::try_parse_from(arguments).expect("explicit takeover command");
+            assert!(matches!(cli.command, Some(Command::Config {
+                command: ConfigCommand::Takeover { clients }
+            }) if !clients.is_empty()));
+        }
+        assert!(Cli::try_parse_from(["hsin", "config", "takeover"]).is_err());
+        assert!(Cli::try_parse_from(["hsin", "config", "takeover", "unknown"]).is_err());
+        assert!(
+            Cli::try_parse_from(["hsin", "config", "takeover", "codex", "claude", "codex"])
+                .is_err()
+        );
     }
 
     #[test]
