@@ -1017,7 +1017,7 @@ mod tests {
         let hello = HelloParams::new("hsin", "0.1.0");
         assert_eq!(hello.protocol_version, PROTOCOL_VERSION);
         assert_eq!(hello.version_code, VERSION_CODE);
-        assert!(hello.capabilities.is_empty());
+        assert_eq!(hello.capabilities, Vec::<String>::new());
     }
 
     #[test]

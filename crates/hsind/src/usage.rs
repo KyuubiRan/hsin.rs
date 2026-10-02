@@ -3032,7 +3032,7 @@ mod tests {
         assert_eq!(readings[1].window, "secondary");
         assert_eq!(readings[1].plan_type.as_deref(), Some("plus"));
         let unmetered = serde_json::json!({"type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":null}}});
-        assert!(codex_quota_readings(&unmetered, 0).is_empty());
+        assert_eq!(codex_quota_readings(&unmetered, 0).len(), 0);
     }
 
     #[test]

@@ -3586,7 +3586,7 @@ fn escape_clears_an_active_filter_before_it_quits() {
     state.reduce(key(KeyCode::Enter));
 
     assert_eq!(state.reduce(key(KeyCode::Esc)), Transition::Continue);
-    assert!(state.search.is_empty());
+    assert_eq!(state.search, "");
     assert_eq!(state.visible_providers().len(), 2);
     assert_eq!(state.reduce(key(KeyCode::Esc)), Transition::Quit);
 }

@@ -447,7 +447,7 @@ mod tests {
         );
         assert_eq!(request.targets[0].expected_generation, 42);
         assert_eq!(request.targets[0].target_id, "canonical-target");
-        assert!(!request.request_id.is_empty());
+        assert_ne!(request.request_id, "");
     }
 
     #[test]

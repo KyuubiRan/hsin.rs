@@ -348,7 +348,7 @@ async fn foreign_switch_preserves_auth_state_and_both_encrypted_backups() {
         .unwrap();
     assert_eq!(backup_after.nonce, backup_before.nonce);
     assert_eq!(backup_after.ciphertext, backup_before.ciphertext);
-    assert!(fixture.second.db.pending_operations().unwrap().is_empty());
+    assert_eq!(fixture.second.db.pending_operations().unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -452,7 +452,7 @@ async fn editing_a_current_provider_blocks_owned_field_drift_before_revision_or_
     );
     assert_eq!(fs::read(fixture.codex_config()).unwrap(), config_before);
     assert_eq!(fs::read(fixture.codex_auth()).unwrap(), auth_before);
-    assert!(fixture.first.db.pending_operations().unwrap().is_empty());
+    assert_eq!(fixture.first.db.pending_operations().unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -836,7 +836,7 @@ async fn a_persisted_release_reservation_can_be_retried_after_the_old_owner_goes
     assert_eq!(first, second);
     assert_eq!(fixture.owner_record(ClientKind::Codex), reserved_record);
     assert_eq!(fs::read(fixture.codex_auth()).unwrap(), auth_after_release);
-    assert!(fixture.first.db.pending_operations().unwrap().is_empty());
+    assert_eq!(fixture.first.db.pending_operations().unwrap().len(), 0);
     assert!(fixture.first.codex_auth_backup().unwrap().is_none());
     // No RPC listener is running. The completed release is sufficient to retry the receiver phase.
     fixture
@@ -1003,7 +1003,7 @@ async fn restart_recovers_release_after_config_or_auth_write_before_sidecar_hand
         let restored_config = fs::read(&target.config_path).unwrap();
         let restarted = fixture.reopen_first();
         restarted.recover_operations().unwrap();
-        assert!(restarted.db.pending_operations().unwrap().is_empty());
+        assert_eq!(restarted.db.pending_operations().unwrap().len(), 0);
         assert!(restarted.codex_auth_backup().unwrap().is_none());
         assert_eq!(fs::read(&target.config_path).unwrap(), restored_config);
         assert!(read_json(&fixture.codex_auth())["auth_mode"] == "chatgpt");
@@ -1057,7 +1057,7 @@ async fn restart_finishes_cleanup_when_sidecar_handoff_precedes_backup_and_journ
     let sidecar_before = fixture.owner_record(ClientKind::Codex);
     let restarted = fixture.reopen_first();
     restarted.recover_operations().unwrap();
-    assert!(restarted.db.pending_operations().unwrap().is_empty());
+    assert_eq!(restarted.db.pending_operations().unwrap().len(), 0);
     assert!(restarted.codex_auth_backup().unwrap().is_none());
     assert!(
         restarted
@@ -1107,7 +1107,7 @@ async fn external_relogin_or_api_key_change_blocks_release_without_overwriting_n
         assert_eq!(fs::read(fixture.codex_config()).unwrap(), config_before);
         assert_eq!(fixture.owner_record(ClientKind::Codex), record_before);
         assert!(fixture.first.codex_auth_backup().unwrap().is_some());
-        assert!(fixture.first.db.pending_operations().unwrap().is_empty());
+        assert_eq!(fixture.first.db.pending_operations().unwrap().len(), 0);
     }
 }
 
@@ -1164,7 +1164,7 @@ async fn an_unreadable_auth_backup_blocks_direct_and_rpc_release_before_any_file
         .unwrap()
         .unwrap();
     assert!(retained.ciphertext == encrypted.ciphertext);
-    assert!(fixture.first.db.pending_operations().unwrap().is_empty());
+    assert_eq!(fixture.first.db.pending_operations().unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -1198,7 +1198,7 @@ async fn foreign_claude_ownership_does_not_block_official_auth_preference_withou
     assert_eq!(fs::read(fixture.claude_config()).unwrap(), settings_before);
     assert_eq!(fixture.owner_record(ClientKind::Claude), sidecar_before);
     assert!(ownership(&fixture.first, ClientKind::Claude).owner_is_self);
-    assert!(fixture.second.db.pending_operations().unwrap().is_empty());
+    assert_eq!(fixture.second.db.pending_operations().unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -1230,7 +1230,7 @@ async fn foreign_claude_ownership_does_not_block_names_preference_for_unmapped_s
     assert_eq!(fs::read(fixture.claude_config()).unwrap(), settings_before);
     assert_eq!(fixture.owner_record(ClientKind::Claude), sidecar_before);
     assert!(ownership(&fixture.first, ClientKind::Claude).owner_is_self);
-    assert!(fixture.second.db.pending_operations().unwrap().is_empty());
+    assert_eq!(fixture.second.db.pending_operations().unwrap().len(), 0);
 }
 
 #[tokio::test]
@@ -1431,7 +1431,7 @@ async fn a_missing_required_auth_backup_blocks_custom_official_and_recovery_befo
                 .unwrap()
                 .is_none()
         );
-        assert!(fixture.first.db.pending_operations().unwrap().is_empty());
+        assert_eq!(fixture.first.db.pending_operations().unwrap().len(), 0);
     }
     assert!(matches!(
         fixture
@@ -1463,7 +1463,7 @@ async fn a_missing_required_auth_backup_blocks_custom_official_and_recovery_befo
             .unwrap()
             .is_none()
     );
-    assert!(fixture.first.db.pending_operations().unwrap().is_empty());
+    assert_eq!(fixture.first.db.pending_operations().unwrap().len(), 0);
 }
 
 #[tokio::test]

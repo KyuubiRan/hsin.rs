@@ -3121,7 +3121,7 @@ mod tests {
             app.recover_operations().unwrap();
 
             assert_eq!(fs::read_to_string(&config_path).unwrap(), before);
-            assert!(app.db.pending_operations().unwrap().is_empty());
+            assert_eq!(app.db.pending_operations().unwrap().len(), 0);
             assert!(
                 app.db
                     .protected_value(CODEX_AUTH_BACKUP_KEY)
@@ -4368,7 +4368,7 @@ mod tests {
                 .client_auth
                 .codex_preserve_official_auth
         );
-        assert!(app.db.pending_operations().unwrap().is_empty());
+        assert_eq!(app.db.pending_operations().unwrap().len(), 0);
 
         drop(app);
         fs::remove_dir_all(root).unwrap();
@@ -4479,7 +4479,7 @@ mod tests {
                 .client_auth
                 .codex_disable_custom_auth
         );
-        assert!(app.db.pending_operations().unwrap().is_empty());
+        assert_eq!(app.db.pending_operations().unwrap().len(), 0);
 
         let helper_auth = app
             .config_target(&provider, ConnectionMode::Direct, Some(false))
@@ -4502,7 +4502,7 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert!(app.db.pending_operations().unwrap().is_empty());
+        assert_eq!(app.db.pending_operations().unwrap().len(), 0);
 
         let official = app.ensure_official_provider(ClientKind::Codex).unwrap();
         let restore = app
@@ -4517,7 +4517,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(app.db.pending_operations().unwrap().is_empty());
+        assert_eq!(app.db.pending_operations().unwrap().len(), 0);
 
         drop(app);
         fs::remove_dir_all(root).unwrap();
@@ -4591,7 +4591,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(app.db.pending_operations().unwrap().is_empty());
+        assert_eq!(app.db.pending_operations().unwrap().len(), 0);
 
         drop(app);
         fs::remove_dir_all(root).unwrap();
@@ -5003,7 +5003,7 @@ mod tests {
         let state = app.db.client_state(ClientKind::Codex).unwrap();
         assert_eq!(state.active_provider_id.as_deref(), Some("official-codex"));
         assert_eq!(state.mode, ConnectionMode::Direct);
-        assert!(app.db.pending_operations().unwrap().is_empty());
+        assert_eq!(app.db.pending_operations().unwrap().len(), 0);
 
         drop(app);
         fs::remove_dir_all(root).unwrap();
@@ -5095,7 +5095,7 @@ mod tests {
             app.status().unwrap().clients[0].config_status,
             hsin_core::ConfigStatus::Conflict
         );
-        assert!(app.db.pending_operations().unwrap().is_empty());
+        assert_eq!(app.db.pending_operations().unwrap().len(), 0);
 
         drop(app);
         fs::remove_dir_all(root).unwrap();
