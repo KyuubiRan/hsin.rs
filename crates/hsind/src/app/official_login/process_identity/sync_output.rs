@@ -8,7 +8,7 @@ use std::{
 };
 
 use super::unavailable;
-use crate::error::Result;
+use crate::error::{DaemonError, Result};
 
 const MAX_OUTPUT: u64 = 1024 * 1024;
 
@@ -40,13 +40,15 @@ pub(super) fn bounded_output(command: &mut Command, timeout: Duration) -> Result
             None => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(unavailable());
+                return Err(DaemonError::Config(
+                    "isolated process metadata query timed out".into(),
+                ));
             }
         }
     };
     let output = receiver
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .map_err(|_| unavailable())??;
+        .map_err(|_| DaemonError::Config("isolated process metadata output timed out".into()))??;
     if output.len() as u64 > MAX_OUTPUT {
         return Err(unavailable());
     }

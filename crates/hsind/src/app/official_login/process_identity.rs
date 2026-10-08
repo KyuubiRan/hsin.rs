@@ -63,7 +63,9 @@ fn read_command(command: &mut Command) -> Result<String> {
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()?;
-    let value = String::from_utf8(output.stdout).map_err(|_| unavailable())?;
+    let value = String::from_utf8(output.stdout).map_err(|_| {
+        DaemonError::Config("isolated process metadata query returned invalid UTF-8".into())
+    })?;
     if value.trim() == "[hsin:absent]"
         || (cfg!(target_os = "macos") && output.status.code() == Some(1) && value.trim().is_empty())
     {
@@ -71,8 +73,15 @@ fn read_command(command: &mut Command) -> Result<String> {
             "isolated official login process".into(),
         ));
     }
-    if !output.status.success() || value.trim().is_empty() {
-        return Err(unavailable());
+    if !output.status.success() {
+        return Err(DaemonError::Config(
+            "isolated process metadata query failed".into(),
+        ));
+    }
+    if value.trim().is_empty() {
+        return Err(DaemonError::Config(
+            "isolated process metadata query returned no identity".into(),
+        ));
     }
     Ok(value.trim().into())
 }
