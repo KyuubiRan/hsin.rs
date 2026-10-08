@@ -1,6 +1,7 @@
 //! Bound local process-metadata helpers without a Tokio runtime.
 use std::{
     io::Read,
+    os::windows::process::CommandExt,
     process::{Command, Output, Stdio},
     sync::mpsc,
     thread,
@@ -14,6 +15,9 @@ const MAX_OUTPUT: u64 = 1024 * 1024;
 
 pub(super) fn bounded_output(command: &mut Command, timeout: Duration) -> Result<Output> {
     let mut child = command
+        // The daemon has no console. Creating one for a metadata probe can
+        // stall its host initialization and must never display a window.
+        .creation_flags(0x0800_0000)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
