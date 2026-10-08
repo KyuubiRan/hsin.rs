@@ -62,3 +62,45 @@ pub(super) fn bounded_output(command: &mut Command, timeout: Duration) -> Result
         stderr: Vec::new(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dotnet_command(expression: &str) -> Command {
+        let mut command = Command::new("powershell.exe");
+        command.args([
+            "-NoProfile",
+            "-NoLogo",
+            "-NonInteractive",
+            "-Command",
+            expression,
+        ]);
+        command
+    }
+
+    #[test]
+    fn redirected_dotnet_output_is_drained_and_the_exit_status_is_retained() {
+        for code in [0, 7] {
+            let output = bounded_output(
+                &mut dotnet_command(&format!("[Console]::Out.Write('hsin-probe'); exit {code}")),
+                super::super::WINDOWS_METADATA_TIMEOUT,
+            )
+            .unwrap();
+            assert_eq!(output.status.code(), Some(code));
+            assert_eq!(output.stdout, b"hsin-probe");
+        }
+    }
+
+    #[test]
+    fn a_nonterminating_probe_is_killed_without_becoming_a_process_identity() {
+        let error = bounded_output(
+            &mut dotnet_command("[System.Threading.Thread]::Sleep(10000); exit 0"),
+            Duration::from_millis(250),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, DaemonError::Config(message) if message == "isolated process metadata query timed out")
+        );
+    }
+}

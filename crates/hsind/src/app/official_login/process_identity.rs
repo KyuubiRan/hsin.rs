@@ -13,7 +13,6 @@ mod sync_output;
 #[cfg(windows)]
 mod windows_tree;
 
-// Cold PowerShell startup can exceed five seconds while the system is busy.
 // Metadata probes remain bounded and never authorize cleanup on a timeout.
 #[cfg(windows)]
 const WINDOWS_METADATA_TIMEOUT: Duration = Duration::from_secs(15);
@@ -39,10 +38,15 @@ pub(super) fn process_start(pid: u32) -> Result<String> {
     #[cfg(windows)]
     {
         let expression = format!(
-            "$p=Get-Process -Id {pid} -ErrorAction SilentlyContinue; if($null -eq $p){{'[hsin:absent]'}}else{{$p.StartTime.ToFileTimeUtc()}}"
+            // Get-Process requires loading Microsoft.PowerShell.Management. Recovery needs
+            // only a FILETIME, so call .NET directly and bypass cmdlet discovery/autoload.
+            // Only GetProcessById's ArgumentException means the PID is absent: failures
+            // reading StartTime, including access denied or exit races, remain fail-closed.
+            "$ErrorActionPreference='Stop'; try{{$p=[System.Diagnostics.Process]::GetProcessById({pid})}}catch [System.ArgumentException]{{[Console]::Out.WriteLine('[hsin:absent]'); exit 0}}catch{{exit 1}}; try{{[Console]::Out.WriteLine($p.StartTime.ToFileTimeUtc().ToString([System.Globalization.CultureInfo]::InvariantCulture)); exit 0}}catch{{exit 1}}finally{{$p.Dispose()}}"
         );
         read_command(Command::new("powershell.exe").args([
             "-NoProfile",
+            "-NoLogo",
             "-NonInteractive",
             "-Command",
             &expression,
@@ -66,7 +70,7 @@ fn read_command(command: &mut Command) -> Result<String> {
     let value = String::from_utf8(output.stdout).map_err(|_| {
         DaemonError::Config("isolated process metadata query returned invalid UTF-8".into())
     })?;
-    if value.trim() == "[hsin:absent]"
+    if (output.status.success() && value.trim() == "[hsin:absent]")
         || (cfg!(target_os = "macos") && output.status.code() == Some(1) && value.trim().is_empty())
     {
         return Err(DaemonError::NotFound(

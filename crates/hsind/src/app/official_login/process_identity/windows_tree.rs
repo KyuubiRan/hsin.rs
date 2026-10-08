@@ -13,11 +13,17 @@ pub(super) struct Member {
 
 pub(super) fn capture(root: u32) -> Result<Vec<Member>> {
     let expression = format!(
-        r"$ErrorActionPreference='Stop'; $all=@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId); $ids=[System.Collections.Generic.HashSet[uint32]]::new(); [void]$ids.Add({root}); $result=@(); do {{ $added=$false; foreach($p in $all){{ if($ids.Contains([uint32]$p.ParentProcessId) -and !$ids.Contains([uint32]$p.ProcessId)){{ [void]$ids.Add([uint32]$p.ProcessId); $live=Get-Process -Id $p.ProcessId -ErrorAction SilentlyContinue; if($null -ne $live){{ $result+=@{{pid=[uint32]$p.ProcessId;start=$live.StartTime.ToFileTimeUtc().ToString()}} }}; $added=$true }} }} }} while($added); ConvertTo-Json -InputObject @($result) -Compress"
+        r"$ErrorActionPreference='Stop'; try{{ $all=@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId); $ids=[System.Collections.Generic.HashSet[uint32]]::new(); [void]$ids.Add({root}); $result=@(); do {{ $added=$false; foreach($p in $all){{ if($ids.Contains([uint32]$p.ParentProcessId) -and !$ids.Contains([uint32]$p.ProcessId)){{ [void]$ids.Add([uint32]$p.ProcessId); $added=$true; try{{ $live=[System.Diagnostics.Process]::GetProcessById([int]$p.ProcessId) }}catch [System.ArgumentException]{{ continue }}; try{{ $result+=@{{pid=[uint32]$p.ProcessId;start=$live.StartTime.ToFileTimeUtc().ToString([System.Globalization.CultureInfo]::InvariantCulture)}} }}finally{{ $live.Dispose() }} }} }} }} while($added); [Console]::Out.WriteLine((ConvertTo-Json -InputObject @($result) -Compress)); exit 0 }}catch{{ exit 1 }}"
     );
     let output = bounded_output(
         Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &expression])
+            .args([
+                "-NoProfile",
+                "-NoLogo",
+                "-NonInteractive",
+                "-Command",
+                &expression,
+            ])
             .stdin(Stdio::null())
             .stderr(Stdio::null()),
         WINDOWS_METADATA_TIMEOUT,
