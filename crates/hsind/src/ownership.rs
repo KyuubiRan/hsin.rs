@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{DaemonError, Result};
 
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 const RECORD_NAME: &str = ".hsin-config-owner.json";
 const LOCK_NAME: &str = ".hsin-config-owner.lock";
 const MAX_RECORD_BYTES: u64 = 1024 * 1024;
@@ -153,6 +153,8 @@ impl Target {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagedScope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_auth_store: Option<String>,
     #[serde(default)]
     pub codex_auth: bool,
     #[serde(default)]
@@ -163,6 +165,8 @@ pub struct ManagedScope {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Fingerprints {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_auth: Option<String>,
     pub config: String,
     pub auth: Option<String>,
 }
@@ -256,6 +260,7 @@ impl Guard {
     fn write_record(&mut self, target_id: String, record: Record) -> Result<()> {
         validate_record(&record)?;
         let mut document = self.document.clone();
+        document.version = FORMAT_VERSION;
         document.targets.insert(target_id, record);
         let bytes = serde_json::to_vec(&document)?;
         if bytes.len() > usize::try_from(MAX_RECORD_BYTES).unwrap_or(usize::MAX) {
@@ -313,7 +318,7 @@ fn read_document(path: &Path) -> Result<(Document, Option<String>)> {
     let document: Document = serde_json::from_slice(&bytes).map_err(|_| {
         invalid_record("configuration ownership record is damaged; repair is required")
     })?;
-    if document.version != FORMAT_VERSION {
+    if !(1..=FORMAT_VERSION).contains(&document.version) {
         return Err(invalid_record(
             "configuration ownership record uses an unsupported version; upgrade is required",
         ));
@@ -334,6 +339,16 @@ fn validate_record(record: &Record) -> Result<()> {
         || record
             .fingerprints
             .auth
+            .as_deref()
+            .is_some_and(|value| !is_fingerprint(value))
+        || record
+            .fingerprints
+            .official_auth
+            .as_deref()
+            .is_some_and(|value| !is_fingerprint(value))
+        || record
+            .scope
+            .official_auth_store
             .as_deref()
             .is_some_and(|value| !is_fingerprint(value))
     {
@@ -478,6 +493,7 @@ mod tests {
             endpoint: Some(IpcEndpoint::namespaced("test-owner")),
             scope: ManagedScope::default(),
             fingerprints: Fingerprints {
+                official_auth: None,
                 config: hash(b"managed-fields"),
                 auth: None,
             },
@@ -495,6 +511,35 @@ mod tests {
         assert_eq!(status.generation, 0);
         assert!(!status.takeover_available);
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn legacy_records_upgrade_before_adding_official_identity_scope() {
+        let directory = TestDirectory::new();
+        let target = directory.target(ClientKind::Codex);
+        let legacy = serde_json::json!({"version":1,"targets":{target.id.clone():record(1)}});
+        fs::write(
+            target.path.join(RECORD_NAME),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            target
+                .read_record()
+                .unwrap()
+                .unwrap()
+                .scope
+                .official_auth_store
+                .is_none()
+        );
+        let mut updated = target.read_record().unwrap().unwrap();
+        updated.scope.official_auth_store = Some(hash(b"native store"));
+        updated.fingerprints.official_auth = Some(hash(b"official identity"));
+        target.lock().unwrap().set_record(updated.clone()).unwrap();
+        let document: serde_json::Value =
+            serde_json::from_slice(&fs::read(target.path.join(RECORD_NAME)).unwrap()).unwrap();
+        assert_eq!(document["version"], FORMAT_VERSION);
+        assert_eq!(target.read_record().unwrap().unwrap(), updated);
     }
 
     #[test]
@@ -558,7 +603,7 @@ mod tests {
     fn damaged_and_future_records_do_not_become_unmanaged() {
         let directory = TestDirectory::new();
         let target = directory.target(ClientKind::Codex);
-        for contents in ["not json", "{\"version\":2,\"targets\":{}}"] {
+        for contents in ["not json", "{\"version\":3,\"targets\":{}}"] {
             fs::write(target.path.join(RECORD_NAME), contents).unwrap();
             assert!(matches!(
                 target.read_record(),

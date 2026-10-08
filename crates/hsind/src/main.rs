@@ -12,6 +12,7 @@ mod crypto;
 mod db;
 mod error;
 mod model;
+mod native_auth;
 mod network_proxy;
 mod ownership;
 mod paths;
@@ -186,8 +187,14 @@ async fn run(
     paths.prepare()?;
     let _instance = InstanceGuard::acquire(&paths.lock)?;
     let app = app::App::open(&paths, codex_home, claude_config_dir)?;
+    tolerate_locked(
+        "migrate legacy Codex configuration",
+        app.migrate_legacy_codex_configuration(),
+    )?;
     tolerate_locked("recover operations", app.recover_operations())?;
     tolerate_locked("initialize providers", app.initialize_providers())?;
+    app.cleanup_official_logins()?;
+    app.capture_existing_official_accounts().await?;
     tolerate_locked(
         "reconcile client auth configuration",
         app.reconcile_client_auth_configuration(),
@@ -231,6 +238,7 @@ async fn run(
     };
     let rpc_stopped_unexpectedly = rpc_result.is_some() && !app.is_shutdown_requested();
     app.notify_shutdown();
+    app.cancel_all_official_logins().await;
     let rpc_result = match rpc_result {
         Some(result) => result,
         None => rpc.await,

@@ -37,13 +37,14 @@ pub async fn run(client: DaemonClient, i18n: &mut I18n, follow_saved_language: b
     let _restore = RestoreTerminal;
     let (effect_tx, effect_rx) = mpsc::channel(16);
     let (action_tx, mut action_rx) = mpsc::channel(16);
-    tokio::spawn(worker(client, effect_rx, action_tx));
+    let mut worker_task = tokio::spawn(worker(client, effect_rx, action_tx));
 
     let mut state = State::default();
     effect_tx.send(Effect::Refresh).await?;
     let mut events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(250));
 
+    let result = async {
     loop {
         terminal.draw(|frame| draw(frame, &mut state, i18n))?;
         tokio::select! {
@@ -71,8 +72,24 @@ pub async fn run(client: DaemonClient, i18n: &mut I18n, follow_saved_language: b
                 reduce_action(&mut state, i18n, follow_saved_language, Action::Tick);
             }
         }
+        if let Some(effect) = state.take_effect() {
+            effect_tx.send(effect).await?;
+        }
     }
     Ok(())
+    }.await;
+    state.input = state::InputMode::Normal;
+    drop(effect_tx);
+    drop(action_rx);
+    // Wait for an in-flight start to return its ID and for the worker to cancel it. Both IPC
+    // calls retain their normal timeouts; terminal failures use this same cleanup path.
+    if tokio::time::timeout(Duration::from_secs(25), &mut worker_task)
+        .await
+        .is_err()
+    {
+        worker_task.abort();
+    }
+    result
 }
 
 /// Held-down keys. `REPORT_EVENT_TYPES` makes terminals that speak the kitty keyboard protocol

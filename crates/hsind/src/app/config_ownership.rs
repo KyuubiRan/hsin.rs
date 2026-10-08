@@ -28,6 +28,20 @@ impl Drop for ConfigTransaction<'_> {
 }
 
 impl App {
+    fn owned_fingerprints(
+        &self,
+        client: ClientKind,
+        path: &std::path::Path,
+        scope: &ManagedScope,
+    ) -> Result<crate::ownership::Fingerprints> {
+        let mut fingerprints = config::ownership_fingerprints(client, path, scope)?;
+        fingerprints.official_auth = scope
+            .official_auth_store
+            .as_ref()
+            .map(|store| self.official_identity_fingerprint(client, store))
+            .transpose()?;
+        Ok(fingerprints)
+    }
     fn ownership_target(&self, client: ClientKind) -> Result<Target> {
         Target::new(client, self.config_path(client)?)
     }
@@ -96,6 +110,12 @@ impl App {
                 self.db.finish_operation(&id, "quarantined", None)?;
             }
         }
+        if target.client == ClientKind::Codex {
+            // A fresh native baseline supersedes an interrupted legacy claim;
+            // its old generation must not be replayed on the next startup.
+            self.db
+                .delete_setting(&format!("config_legacy_claim:{}", target.id))?;
+        }
         Ok(())
     }
 
@@ -113,7 +133,7 @@ impl App {
             ));
         }
         let fingerprints =
-            config::ownership_fingerprints(target.client, &target.config_path, &record.scope)?;
+            self.owned_fingerprints(target.client, &target.config_path, &record.scope)?;
         Ok((fingerprints != record.fingerprints).then(|| "configuration_changed: managed fields were changed outside the managing instance; automatic restoration is blocked".into()))
     }
 
@@ -208,7 +228,7 @@ impl App {
             }
             if pending_write
                 && !maintenance
-                && config::ownership_fingerprints(
+                && self.owned_fingerprints(
                     target.client,
                     &target.config_path,
                     &record.expect("pending record").scope,
@@ -243,7 +263,7 @@ impl App {
                 self.quarantine_native_legacy_state(target)?;
                 let scope = ManagedScope::default();
                 let fingerprints =
-                    config::ownership_fingerprints(target.client, &target.config_path, &scope)?;
+                    self.owned_fingerprints(target.client, &target.config_path, &scope)?;
                 let generation = self
                     .db
                     .setting(&format!("config_lease:{}", target.id))?
@@ -309,7 +329,11 @@ impl App {
             }))
     }
 
-    fn validate_codex_backup_record(&self, target: &Target, record: &Record) -> Result<()> {
+    pub(super) fn validate_codex_backup_record(
+        &self,
+        target: &Target,
+        record: &Record,
+    ) -> Result<()> {
         let required_key = format!(
             "config_auth_backup_required:{}:{}",
             target.id, record.generation
@@ -335,7 +359,7 @@ impl App {
         Ok(())
     }
 
-    fn managed_scope(target: &ConfigTarget) -> ManagedScope {
+    pub(super) fn managed_scope(target: &ConfigTarget) -> ManagedScope {
         let mut scope = ManagedScope {
             codex_auth: Self::manages_codex_auth(target),
             ..ManagedScope::default()
@@ -398,6 +422,9 @@ impl App {
             .cloned()
             .ok_or_else(|| DaemonError::Conflict("configuration ownership is missing".into()))?;
         let mut scope = Self::managed_scope(target);
+        scope.official_auth_store = self
+            .official_scope_store(target)?
+            .or_else(|| record.scope.official_auth_store.clone());
         scope
             .codex_keys
             .extend(record.scope.codex_keys.iter().cloned());
@@ -410,7 +437,7 @@ impl App {
         scope.claude_model_keys.dedup();
         record.scope = scope;
         record.fingerprints =
-            config::ownership_fingerprints(path.client, &path.config_path, &record.scope)?;
+            self.owned_fingerprints(path.client, &path.config_path, &record.scope)?;
         record.pending = Some(Pending {
             request_id: operation.to_owned(),
             kind: PendingKind::Write,
@@ -449,8 +476,7 @@ impl App {
             record.scope.codex_keys =
                 Self::codex_managed_keys(&self.db.get_provider(&provider_id)?);
         }
-        record.fingerprints =
-            config::ownership_fingerprints(client, &path.config_path, &record.scope)?;
+        record.fingerprints = self.owned_fingerprints(client, &path.config_path, &record.scope)?;
         record.pending = None;
         guard.set_record_for(&path, record)
     }
@@ -569,12 +595,8 @@ impl App {
                 });
             if reserved
                 && record.as_ref().is_some_and(|record| {
-                    config::ownership_fingerprints(
-                        target.client,
-                        &target.config_path,
-                        &record.scope,
-                    )
-                    .is_ok_and(|fingerprints| fingerprints != record.fingerprints)
+                    self.owned_fingerprints(target.client, &target.config_path, &record.scope)
+                        .is_ok_and(|fingerprints| fingerprints != record.fingerprints)
                 })
             {
                 return Err(self.ownership_conflict(&[request.client])?);
@@ -665,7 +687,7 @@ impl App {
                     ))
                 })?;
                 let hello = peer
-                    .hello(&hsin_ipc::HelloParams::new(
+                    .hello_for_config_release(&hsin_ipc::HelloParams::new(
                         "hsind-config-takeover",
                         env!("CARGO_PKG_VERSION"),
                     ))
@@ -705,7 +727,7 @@ impl App {
             let mut record = current.clone().unwrap_or(Record::unclaimed(
                 0,
                 ManagedScope::default(),
-                config::ownership_fingerprints(
+                self.owned_fingerprints(
                     target.client,
                     &target.config_path,
                     &ManagedScope::default(),
@@ -736,11 +758,8 @@ impl App {
                 return Err(self.ownership_conflict(&[target.client])?);
             }
             if reserved
-                && config::ownership_fingerprints(
-                    target.client,
-                    &target.config_path,
-                    &record.scope,
-                )? != record.fingerprints
+                && self.owned_fingerprints(target.client, &target.config_path, &record.scope)?
+                    != record.fingerprints
             {
                 return Err(self.ownership_conflict(&[target.client])?);
             }
@@ -761,7 +780,7 @@ impl App {
                 requester: Some(self.instance.clone()),
             });
             record.fingerprints =
-                config::ownership_fingerprints(target.client, &target.config_path, &record.scope)?;
+                self.owned_fingerprints(target.client, &target.config_path, &record.scope)?;
             guard.set_record(record.clone())?;
             self.db.set_setting(
                 &format!("config_lease:{}", target.id),
@@ -885,14 +904,28 @@ impl App {
                 })?;
         }
         let official = self.ensure_official_provider(target.client)?;
-        let restore = self.config_target(&official, ConnectionMode::Direct, None)?;
+        let restore_key = format!(
+            "official_release_target:{}:{}",
+            params.request_id, target.id
+        );
+        let restore = if let Some(json) = self.db.setting(&restore_key)? {
+            let restore: ConfigTarget = serde_json::from_str(&json)?;
+            self.check_target_lease(&restore)?;
+            restore
+        } else {
+            let mut restore = self.config_target(&official, ConnectionMode::Direct, None)?;
+            restore.official_auth_transition = self.prepare_official_auth_transition(&official)?;
+            self.db
+                .set_setting(&restore_key, &serde_json::to_string(&restore)?)?;
+            restore
+        };
         let current = if target.config_path.exists() {
             fs::read_to_string(&target.config_path)?
         } else {
             String::new()
         };
         let fingerprints =
-            config::ownership_fingerprints(target.client, &target.config_path, &record.scope)?;
+            self.owned_fingerprints(target.client, &target.config_path, &record.scope)?;
         if retry
             && fingerprints.config != record.fingerprints.config
             && config::patch_text_with_credential(&current, &restore, None)? != current
@@ -949,9 +982,12 @@ impl App {
             &restore,
             None,
         )?;
+        self.apply_official_auth_transition(&restore)?;
+        self.commit_official_auth_transition(&restore)?;
         self.apply_codex_auth_target(&restore, None)?;
         let scope = ManagedScope {
             codex_auth: record.scope.codex_auth,
+            official_auth_store: record.scope.official_auth_store.clone(),
             ..ManagedScope::default()
         };
         let mut reserved = Record::unclaimed(
@@ -960,7 +996,7 @@ impl App {
                 .checked_add(1)
                 .ok_or_else(|| DaemonError::Config("ownership generation exhausted".into()))?,
             scope.clone(),
-            config::ownership_fingerprints(target.client, &target.config_path, &scope)?,
+            self.owned_fingerprints(target.client, &target.config_path, &scope)?,
         );
         reserved.pending = Some(Pending {
             request_id: params.request_id.clone(),
@@ -978,8 +1014,11 @@ impl App {
         self.db
             .delete_setting(&format!("config_lease:{}", target.id))?;
         self.remove_codex_auth_backup_if_released(target.client, record.generation)?;
+        self.clear_official_lease(target.client, &target.id, record.generation)?;
         self.release_claude_model_env_snapshot(&restore)?;
         self.db.finish_operation(&operation, "complete", None)?;
+        self.clean_official_transition(&restore)?;
+        self.db.delete_setting(&restore_key)?;
         Ok(ConfigReleaseResult {
             request_id: params.request_id.clone(),
             target_id: target.id,
@@ -1008,6 +1047,19 @@ impl App {
                 params.target.client,
                 params.target.expected_generation,
             )?;
+            self.clear_official_lease(
+                params.target.client,
+                &params.target.target_id,
+                params.target.expected_generation,
+            )?;
+            let restore_key = format!(
+                "official_release_target:{}:{}",
+                params.request_id, params.target.target_id
+            );
+            if let Some(json) = self.db.setting(&restore_key)? {
+                self.clean_official_transition(&serde_json::from_str::<ConfigTarget>(&json)?)?;
+                self.db.delete_setting(&restore_key)?;
+            }
             if params.target.client == ClientKind::Claude {
                 self.db.delete_setting(CLAUDE_MODEL_ENV_BEFORE_KEY)?;
             }

@@ -42,6 +42,9 @@ use crate::{
 
 const CODEX_AUTH_BACKUP_KEY: &str = "codex_auth_backup_v1";
 mod config_ownership;
+mod legacy_config;
+mod official_accounts;
+mod official_login;
 #[cfg(test)]
 mod ownership_tests;
 const CLAUDE_MODEL_ENV_BEFORE_KEY: &str = "claude_model_env_before";
@@ -94,6 +97,9 @@ pub struct App {
     pub(crate) instance: hsin_core::ConfigOwnerInfo,
     pub(crate) endpoint: RwLock<hsin_ipc::IpcEndpoint>,
     ownership_guards: parking_lot::Mutex<BTreeMap<PathBuf, crate::ownership::Guard>>,
+    native_credentials: Arc<dyn crate::native_auth::NativeCredentialStore>,
+    claude_explicit_dir: bool,
+    official_logins: official_login::LoginManager,
 }
 
 pub(crate) struct UpstreamRequestSnapshot {
@@ -136,7 +142,20 @@ impl App {
     /// client home overrides a service definition passes on the command line.
     #[cfg(test)]
     pub fn open_with_store(paths: &Paths, store: Arc<dyn KeyStore>) -> Result<Arc<Self>> {
-        Self::open_inner(paths, store, None, None)
+        let mut app = Self::open_inner(
+            paths,
+            store,
+            Some(&paths.home.join("codex")),
+            Some(&paths.home.join("claude")),
+        )?;
+        Arc::get_mut(&mut app)
+            .expect("new application")
+            .native_credentials =
+            Arc::new(crate::native_auth::MemoryNativeCredentialStore::default());
+        Arc::get_mut(&mut app)
+            .expect("new application")
+            .claude_explicit_dir = true;
+        Ok(app)
     }
 
     fn open_inner(
@@ -221,6 +240,10 @@ impl App {
             instance,
             endpoint: RwLock::new(hsin_ipc::default_endpoint()),
             ownership_guards: parking_lot::Mutex::new(BTreeMap::new()),
+            native_credentials: Arc::new(crate::native_auth::SystemNativeCredentialStore),
+            claude_explicit_dir: claude_config_dir.is_some()
+                || std::env::var_os("CLAUDE_CONFIG_DIR").is_some(),
+            official_logins: official_login::LoginManager::default(),
         }))
     }
 
@@ -480,6 +503,7 @@ impl App {
             base_url: detected.base_url,
             auth_scheme: AuthScheme::OAuth,
             official: true,
+            official_account: None,
             credential_configured: false,
             credential_preview: None,
             model: None,
@@ -602,6 +626,13 @@ impl App {
     pub fn list_providers(&self, params: &ProviderListParams) -> Result<Vec<Provider>> {
         let mut providers = self.db.list_providers(params.client)?;
         for provider in &mut providers {
+            if provider.official && provider.official_account.is_none() {
+                provider.official_account = self
+                    .db
+                    .setting(&format!("official_native_summary:{}", provider.client))?
+                    .map(|json| serde_json::from_str(&json))
+                    .transpose()?;
+            }
             if provider.official || !provider.credential_configured {
                 continue;
             }
@@ -788,6 +819,7 @@ impl App {
             base_url: input.base_url.trim().trim_end_matches('/').to_owned(),
             auth_scheme: input.auth_scheme,
             official: false,
+            official_account: None,
             credential_configured: current.credential_configured,
             credential_preview: None,
             model: input.model.as_ref().map(|model| model.trim().to_owned()),
@@ -1137,7 +1169,7 @@ impl App {
         let image_active_before = self.db.image_active_provider_id()?;
         let image_available_before = image_active_before.is_some();
         let provider = self.db.get_provider(&params.id)?;
-        if provider.official {
+        if provider.official && self.db.official_account(&provider.id)?.is_none() {
             return Err(DaemonError::Invalid(
                 "Official providers cannot be removed".into(),
             ));
@@ -1363,13 +1395,14 @@ impl App {
                     .into(),
             ));
         }
-        let target = self.config_target_with_overrides(
+        let mut target = self.config_target_with_overrides(
             provider,
             mode,
             disable_custom_auth,
             codex_preserve_official_auth,
             claude_model_names_enabled,
         )?;
+        target.official_auth_transition = self.prepare_official_auth_transition(provider)?;
         self.ensure_codex_official_auth_available(&target)?;
         let credential = self.config_credential(&target)?;
         let path = self.config_path(provider.client)?;
@@ -1382,6 +1415,10 @@ impl App {
             &target_json,
         )?;
         self.start_ownership_write(&target, &operation)?;
+        if let Err(error) = self.apply_official_auth_transition(&target) {
+            self.db.set_config_status(provider.client, "unavailable")?;
+            return Err(error);
+        }
         let backup_created = if Self::manages_codex_auth(&target) {
             let auth_path = config::codex_auth_path(&path)?;
             match self.ensure_codex_auth_backup(&auth_path) {
@@ -1401,6 +1438,11 @@ impl App {
             &target,
             credential.as_ref().map(ExposeSecret::expose_secret),
         ) {
+            if target.official_auth_transition.is_some() {
+                self.rollback_official_auth_transition(&target)?;
+                self.finish_ownership_write(target.client)?;
+                self.clean_official_transition(&target)?;
+            }
             if backup_created {
                 self.remove_codex_auth_backup()?;
             }
@@ -1445,8 +1487,10 @@ impl App {
             claude_model_names_enabled,
         )?;
         self.release_claude_model_env_snapshot(&target)?;
+        self.commit_official_auth_transition(&target)?;
         self.finish_ownership_write(target.client)?;
         self.db.finish_operation(&operation, "complete", None)?;
+        self.clean_official_transition(&target)?;
         self.record_usage_route(provider.client);
         Ok(())
     }
@@ -1529,6 +1573,7 @@ impl App {
             None
         };
         Ok(ConfigTarget {
+            official_auth_transition: None,
             client: provider.client,
             mode,
             provider: provider.clone(),
@@ -1766,7 +1811,7 @@ impl App {
         target: &ConfigTarget,
         credential: Option<&str>,
     ) -> Result<()> {
-        if target.client != ClientKind::Codex {
+        if target.client != ClientKind::Codex || target.official_auth_transition.is_some() {
             return Ok(());
         }
         self.ensure_codex_official_auth_available(target)?;
@@ -1796,6 +1841,9 @@ impl App {
         target: &ConfigTarget,
         credential: Option<&str>,
     ) -> Result<bool> {
+        if target.official_auth_transition.is_some() {
+            return self.official_auth_transition_is_applied(target);
+        }
         if target.client != ClientKind::Codex {
             return Ok(true);
         }
@@ -1827,7 +1875,7 @@ impl App {
         target: &ConfigTarget,
         credential: Option<&str>,
     ) -> Result<()> {
-        if target.client != ClientKind::Codex {
+        if target.client != ClientKind::Codex || target.official_auth_transition.is_some() {
             return Ok(());
         }
         self.check_target_lease(target)?;
@@ -1890,6 +1938,11 @@ impl App {
             match outcome {
                 Ok(RecoveryOutcome::Complete) => {
                     self.db.finish_operation(&id, "complete", None)?;
+                    if matches!(kind.as_str(), "apply_config" | "edit_active_config") {
+                        self.clean_official_transition(&serde_json::from_str::<ConfigTarget>(
+                            &target_json,
+                        )?)?;
+                    }
                 }
                 Ok(RecoveryOutcome::Aborted) => {
                     self.db.finish_operation(&id, "aborted", None)?;
@@ -1938,6 +1991,10 @@ impl App {
         let persisted = self.db.get_provider(&target.provider.id)?;
         target.provider.official = persisted.official;
         target.provider.credential_configured = persisted.credential_configured;
+        target
+            .provider
+            .official_account
+            .clone_from(&persisted.official_account);
         // A journal row written before the model-mapping field existed deserializes it as `None`;
         // adopt the persisted value so the comparison below is not a false conflict.
         target
@@ -1962,6 +2019,8 @@ impl App {
         self.finish_ownership_write(client)
     }
 
+    // Keep credential preflight ahead of the configuration and state commits.
+    #[allow(clippy::too_many_lines)]
     fn recover_operation(
         &self,
         client: ClientKind,
@@ -1979,6 +2038,10 @@ impl App {
         let persisted = self.db.get_provider(&target.provider.id)?;
         target.provider.official = persisted.official;
         target.provider.credential_configured = persisted.credential_configured;
+        target
+            .provider
+            .official_account
+            .clone_from(&persisted.official_account);
         // A journal row written before the model-mapping field existed deserializes it as `None`;
         // adopt the persisted value so the comparison below is not a false conflict.
         target
@@ -2008,7 +2071,7 @@ impl App {
         let credential = credential.as_ref().map(ExposeSecret::expose_secret);
         // Check authentication before touching config.toml, so a new login during
         // a crash does not leave half of an older configuration restored.
-        if client == ClientKind::Codex {
+        if client == ClientKind::Codex && target.official_auth_transition.is_none() {
             let auth_hash = config::file_hash(&config::codex_auth_path(&path)?)?;
             let lease = target
                 .ownership_lease
@@ -2037,14 +2100,19 @@ impl App {
                 ));
             }
         }
-        if current_hash.as_deref() == before_hash {
-            config::apply_with_credential(&path, before_hash, &target, credential)?;
-        } else if config::patch_text_with_credential(&current, &target, credential)? != current {
+        if current_hash.as_deref() != before_hash
+            && config::patch_text_with_credential(&current, &target, credential)? != current
+        {
             return Err(DaemonError::Conflict(
                 "configuration diverged during recovery".into(),
             ));
         }
+        self.apply_official_auth_transition(&target)?;
+        if current_hash.as_deref() == before_hash {
+            config::apply_with_credential(&path, before_hash, &target, credential)?;
+        }
         self.recover_codex_auth_target(&target, credential)?;
+        self.commit_official_auth_transition(&target)?;
         self.db
             .set_active(client, &target.provider.id, "synchronized")?;
         self.db.set_mode(client, target.mode)?;
@@ -2347,6 +2415,7 @@ impl App {
     pub async fn update_settings(&self, patch: SettingsPatch) -> Result<Settings> {
         let _guard = self.mutation.lock().await;
         let SettingsPatch {
+            official_account_display,
             language,
             proxy_host,
             proxy_port,
@@ -2490,6 +2559,15 @@ impl App {
                 .set_setting("clients", &serde_json::to_string(&clients)?)?;
         }
         self.update_codex_auth_settings(client_auth, codex_preserve_official_auth)?;
+        if let Some(update) = official_account_display {
+            let mut auth = self.client_auth_settings()?;
+            match update.client {
+                ClientKind::Codex => auth.codex_official_account_display = update.display,
+                ClientKind::Claude => auth.claude_official_account_display = update.display,
+            }
+            self.db
+                .set_setting("client_auth", &serde_json::to_string(&auth)?)?;
+        }
         if claude_auth_rewrites_config {
             self.update_claude_auth_setting(client_auth)?;
         } else if let Some(update) =
@@ -2685,10 +2763,15 @@ impl App {
         self.mark_recovery_key_held()?;
         Ok(recovery)
     }
-    pub fn import_recovery_key(&self, value: &str) -> Result<()> {
-        self.crypto.import_recovery_key(value)?;
-        // A successful import proves the operator still holds the key.
-        self.mark_recovery_key_held()
+    pub async fn import_recovery_key(&self, value: &str) -> Result<()> {
+        {
+            let _guard = self.mutation.lock().await;
+            self.crypto.import_recovery_key(value)?;
+            // A successful import proves the operator still holds the key.
+            self.mark_recovery_key_held()?;
+            self.migrate_legacy_codex_configuration()?;
+        }
+        self.capture_existing_official_accounts().await
     }
     pub async fn rotate_key(&self) -> Result<u32> {
         let _guard = self.mutation.lock().await;
@@ -3551,7 +3634,7 @@ mod tests {
             !app.security_status().unwrap().recovery_key_configured,
             "the exported key no longer matches the current key version"
         );
-        assert!(app.import_recovery_key(&recovery).is_err());
+        assert!(app.import_recovery_key(&recovery).await.is_err());
 
         // Re-exporting after rotation restores the held state.
         app.export_recovery_key().unwrap();
@@ -3963,6 +4046,7 @@ mod tests {
         };
         let settings = app
             .update_settings(SettingsPatch {
+                official_account_display: None,
                 language: None,
                 proxy_host: None,
                 proxy_port: None,
@@ -3981,6 +4065,7 @@ mod tests {
 
         let invalid = app
             .update_settings(SettingsPatch {
+                official_account_display: None,
                 language: None,
                 proxy_host: None,
                 proxy_port: None,
@@ -4090,12 +4175,15 @@ mod tests {
         );
 
         let client_auth = ClientAuthSettings {
+            codex_official_account_display: hsin_core::OfficialAccountDisplay::default(),
+            claude_official_account_display: hsin_core::OfficialAccountDisplay::default(),
             codex_disable_custom_auth: true,
             codex_preserve_official_auth: false,
             claude_disable_custom_auth: false,
         };
         let settings = app
             .update_settings(SettingsPatch {
+                official_account_display: None,
                 language: None,
                 proxy_host: None,
                 proxy_port: None,
@@ -4140,6 +4228,7 @@ mod tests {
 
         let settings = app
             .update_settings(SettingsPatch {
+                official_account_display: None,
                 language: None,
                 proxy_host: None,
                 proxy_port: None,
@@ -4177,6 +4266,7 @@ mod tests {
 
         let preserved = app
             .update_settings(SettingsPatch {
+                official_account_display: None,
                 language: None,
                 proxy_host: None,
                 proxy_port: None,
@@ -4240,6 +4330,7 @@ mod tests {
 
         let compatibility = app
             .update_settings(SettingsPatch {
+                official_account_display: None,
                 language: None,
                 proxy_host: None,
                 proxy_port: None,
@@ -4654,6 +4745,8 @@ mod tests {
             .set_setting(
                 "client_auth",
                 &serde_json::to_string(&ClientAuthSettings {
+                    codex_official_account_display: hsin_core::OfficialAccountDisplay::default(),
+                    claude_official_account_display: hsin_core::OfficialAccountDisplay::default(),
                     codex_disable_custom_auth: true,
                     codex_preserve_official_auth: false,
                     claude_disable_custom_auth: false,
@@ -5432,6 +5525,7 @@ mod tests {
         drop(probe);
         let disabled_settings = app
             .update_settings(SettingsPatch {
+                official_account_display: None,
                 language: None,
                 proxy_host: Some("127.0.0.1".into()),
                 proxy_port: Some(port),
@@ -5497,6 +5591,7 @@ mod tests {
             .set_active(ClientKind::Claude, &claude.id, "synchronized")
             .unwrap();
         app.update_settings(SettingsPatch {
+            official_account_display: None,
             language: None,
             proxy_host: None,
             proxy_port: None,
@@ -5536,6 +5631,7 @@ mod tests {
         drop(next_probe);
         let restarted = app
             .update_settings(SettingsPatch {
+                official_account_display: None,
                 language: None,
                 proxy_host: Some("0.0.0.0".into()),
                 proxy_port: Some(next_port),
@@ -5599,6 +5695,7 @@ mod tests {
             .await
             .unwrap();
         app.update_settings(SettingsPatch {
+            official_account_display: None,
             language: None,
             proxy_host: None,
             proxy_port: None,
@@ -5721,6 +5818,7 @@ mod tests {
 
         let settings = app
             .update_settings(SettingsPatch {
+                official_account_display: None,
                 language: None,
                 proxy_host: None,
                 proxy_port: None,
@@ -5753,6 +5851,7 @@ mod tests {
         assert!(untouched.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"Latest User Opus\""));
 
         app.update_settings(SettingsPatch {
+            official_account_display: None,
             language: None,
             proxy_host: None,
             proxy_port: None,
@@ -5770,6 +5869,7 @@ mod tests {
         assert!(renamed.contains("\"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"deepseek-v4-flash\""));
 
         app.update_settings(SettingsPatch {
+            official_account_display: None,
             language: None,
             proxy_host: None,
             proxy_port: None,

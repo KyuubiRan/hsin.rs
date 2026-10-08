@@ -18,6 +18,7 @@ The Cargo workspace contains:
 - Do not add SQLite, keyring, proxy-server, or client-config parsing dependencies to `hsin`.
 - Keep public provider DTOs free of complete credentials. Only `credential.resolve` may return credential material.
 - Preserve IPC method names, wire enum values, protocol checks, frame limits, request IDs, and hello negotiation.
+- Ordinary CLI hello requires the exact version code. Configuration handoff uses `config_handoff.v1` with a `config.release`-only connection, preserving protocol, owner identity, ownership format and capability validation; only the known v0.2.9/code-33 owner may use the legacy hello retry.
 - Every workspace release must set `hsin_core::VERSION_CODE` strictly greater than the preceding release and ship matching `hsind` and `hsin` binaries. A compatibility change may make that increment before the release-only version commit; never increment it twice for one release, which is why the release check enforces an increase rather than an exact step. Version-code mismatches must continue to reinstall the daemon automatically.
 - `HSIN_HOME` instances must remain isolated across storage, IPC, keyring entries, installation markers, and service identities.
 
@@ -38,6 +39,13 @@ Never modify MCP servers, hooks, permissions, profiles, features, approval polic
 - Switching to an official provider restores the prior Codex `auth_mode` and `OPENAI_API_KEY` without changing unrelated login fields.
 - Importing an official Codex provider restores any daemon-owned auth backup before synchronization and preserves the native official `config.toml` representation.
 - Treat Claude Code as official OAuth only when the base URL is official and its API key, auth token, and `apiKeyHelper` are absent or empty. Never execute a detected `apiKeyHelper` during import.
+
+Saved official-account operations extend the authentication allowlist only:
+
+- Codex native auth: `auth_mode`, `OPENAI_API_KEY`, `tokens`, and `last_refresh` in the selected file/keyring/auto backend. Windows encrypted secrets writes are limited to `global/CODEX_AUTH`; preserve unrelated secrets and the shared encryption key. Ephemeral authentication is excluded.
+- Claude native credentials: the `claudeAiOauth` subtree only; native account metadata: the `oauthAccount` subtree only. Preserve MCP credentials and every other field. Use the native directory locks and the explicit `CLAUDE_CONFIG_DIR` Keychain namespace.
+- Capture outgoing refresh tokens before a switch. Credential revisions are independent of Provider revisions; a previous session must not overwrite a later explicit login. Stable identity and organization protect ownership, while immediate credential digests protect writes. Restore the latest same-identity native credentials during recovery and cooperative handoff.
+- The daemon owns isolated OAuth processes and encrypted credentials. Login RPCs return status and account summaries only; successful login adds an account without enabling it. API-only native configurations never produce a saved official account.
 
 ## Security
 

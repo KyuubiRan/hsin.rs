@@ -146,6 +146,15 @@ fn footer_help(state: &State, i18n: &I18n) -> String {
         }
         InputMode::ModelMapping(_) => i18n.text("model_mapping_help"),
         InputMode::DeleteConfirm { .. } => i18n.text("delete_help"),
+        InputMode::OfficialLogin(dialog) => {
+            i18n.text(if dialog.client == hsin_core::ClientKind::Claude {
+                "official_login_claude_help"
+            } else {
+                "official_login_help"
+            })
+        }
+        InputMode::OfficialRename { .. } => i18n.text("official_rename_help"),
+        InputMode::OfficialSwitch { .. } => i18n.text("official_switch_help"),
         InputMode::Settings(screen) => match &screen.page {
             SettingsPage::Root => i18n.text("settings_root_help"),
             SettingsPage::Proxy {

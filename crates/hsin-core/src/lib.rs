@@ -13,7 +13,7 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// Monotonic CLI/daemon release compatibility code. Every published workspace
 /// version must be greater than the preceding release so a new CLI always
 /// replaces an older daemon.
-pub const VERSION_CODE: u32 = 33;
+pub const VERSION_CODE: u32 = 34;
 
 pub const HSIN_CODEX_CONFIG_NAME: &str = "hsin";
 pub const OPENAI_CODEX_CONFIG_NAME: &str = "OpenAI";
@@ -139,6 +139,95 @@ pub struct ClientAuthSettings {
     pub codex_preserve_official_auth: bool,
     #[serde(default)]
     pub claude_disable_custom_auth: bool,
+    #[serde(default)]
+    pub codex_official_account_display: OfficialAccountDisplay,
+    #[serde(default)]
+    pub claude_official_account_display: OfficialAccountDisplay,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfficialAccountDisplay {
+    #[default]
+    Email,
+    Name,
+    NameAndEmail,
+}
+
+impl ClientAuthSettings {
+    #[must_use]
+    pub const fn official_account_display(self, client: ClientKind) -> OfficialAccountDisplay {
+        match client {
+            ClientKind::Codex => self.codex_official_account_display,
+            ClientKind::Claude => self.claude_official_account_display,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfficialAccountDisplayUpdate {
+    pub client: ClientKind,
+    pub display: OfficialAccountDisplay,
+}
+
+/// Public account information; OAuth credentials never cross the IPC boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfficialAccountSummary {
+    pub email: Option<String>,
+    pub native_name: Option<String>,
+    pub saved: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OfficialLoginState {
+    Starting,
+    AwaitingBrowser,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfficialLoginStatus {
+    pub login_id: String,
+    pub client: ClientKind,
+    pub state: OfficialLoginState,
+    pub browser_url: Option<String>,
+    pub provider_id: Option<String>,
+    pub error: Option<AppError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfficialLoginStartParams {
+    pub client: ClientKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfficialLoginStatusParams {
+    pub login_id: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct OfficialLoginSubmitParams {
+    pub login_id: String,
+    pub code: String,
+}
+
+impl fmt::Debug for OfficialLoginSubmitParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OfficialLoginSubmitParams")
+            .field("login_id", &self.login_id)
+            .field("code", &"[REDACTED]")
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfficialAccountRenameParams {
+    pub provider_id: String,
+    pub expected_revision: u64,
+    pub name: String,
 }
 
 const fn default_true() -> bool {
@@ -809,6 +898,8 @@ pub struct Provider {
     pub auth_scheme: AuthScheme,
     #[serde(default)]
     pub official: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_account: Option<OfficialAccountSummary>,
     #[serde(default)]
     pub credential_configured: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2058,6 +2149,8 @@ pub struct UpstreamProxyUpdate {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SettingsPatch {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_account_display: Option<OfficialAccountDisplayUpdate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

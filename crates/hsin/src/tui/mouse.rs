@@ -171,6 +171,12 @@ pub(super) fn hint_key(token: &str) -> Option<KeyEvent> {
             {
                 return Some(KeyEvent::new(KeyCode::Char(letter), KeyModifiers::CONTROL));
             }
+            if let Some(letter) = first.strip_prefix("alt+")
+                && let [letter] = letter.chars().collect::<Vec<_>>()[..]
+                && letter.is_ascii_alphabetic()
+            {
+                return Some(KeyEvent::new(KeyCode::Char(letter), KeyModifiers::ALT));
+            }
             let mut characters = first.chars();
             match (characters.next(), characters.next()) {
                 (Some(character), None) if character.is_ascii_graphic() => KeyCode::Char(character),

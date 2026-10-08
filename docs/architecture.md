@@ -16,6 +16,8 @@ The proxy listening IP and port are daemon-owned settings. They can be changed w
 
 The only client-side bootstrap operation is launching `hsind service install --start` when the local IPC endpoint is absent. All provider, settings and security operations require a successful protocol handshake.
 
+Ordinary CLI hello checks the exact daemon version code. Owner-to-owner configuration handoff instead requests `config_handoff.v1` on a connection restricted to `config.release`, then verifies the wire protocol, release capability and recorded owner identity. Known v0.2.9/code-33 owners may retry hello with their legacy code; other old versions cannot use that fallback. Ownership format, generation, CAS and restoration checks remain in the release/claim operations.
+
 ## Configuration ownership
 
 - Codex: `model_provider`, the `model_providers.hsin` subtree, and the four optional top-level tuning keys `model_context_window`, `model_auto_compact_token_limit`, `model_reasoning_effort`, and `plan_mode_reasoning_effort`. Each primary Codex Provider persists its own optional Context override and two reasoning efforts. Activating it writes the context keys only when the override is enabled (empty removes its key); disabled means neither key is modified. Selected reasoning efforts write their keys independently; each default “do not modify” leaves its key untouched. With official-auth preservation disabled, hsin also owns only the top-level `auth_mode` and `OPENAI_API_KEY` fields in `auth.json`; preservation restores those fields once and then leaves the file untouched.
@@ -23,6 +25,16 @@ The only client-side bootstrap operation is launching `hsind service install --s
 - Claude Code model mapping (opt-in per provider): `env.ANTHROPIC_DEFAULT_FABLE_MODEL`, `env.ANTHROPIC_DEFAULT_OPUS_MODEL`, `env.ANTHROPIC_DEFAULT_SONNET_MODEL`, and `env.ANTHROPIC_DEFAULT_HAIKU_MODEL`. The 1M-context option is written as a `[1m]` suffix on the model ID. Whatever the user had in these keys before hsin first wrote them is snapshotted and restored for any tier that is not mapped, so disabling the mapping is non-destructive. `ANTHROPIC_MODEL` is never touched.
 
 Everything else is outside hsin ownership. Patchers operate on source-preserving syntax trees and use compare-and-swap plus atomic replacement.
+
+## Saved official accounts
+
+`official_accounts` binds a Provider to a stable native identity and organization, a public email/name summary, and an independent credential revision. OAuth snapshots are encrypted in `protected_values`; they are never API-key credentials or public Provider fields. The fixed Official provider remains a separate native-login recovery entry. Existing persistent native logins are captured automatically; API-only and ephemeral authentication produce no saved account.
+
+The `official_accounts.v1` IPC capability adds `official_account.login.start`, `.status`, `.submit`, `.cancel`, and `official_account.rename`. The daemon launches an installed official CLI in a private temporary home and owns login cancellation, timeout, orphan cleanup, credential capture, and vault writes. The TUI opens the browser and renders progress. Successful login saves or refreshes the account while retaining the active Provider. `settings.update` accepts a per-client `official_account_display` update; switching and deletion use the existing Provider methods.
+
+Official-account writes extend the native-auth allowlist to Codex's `auth_mode`, `OPENAI_API_KEY`, `tokens`, and `last_refresh`, or Claude's `claudeAiOauth` credential subtree and `oauthAccount` metadata subtree. Codex file/keyring/auto and Windows encrypted secrets retain unrelated records. Claude respects native directory locks and the Keychain namespace derived from the explicit configuration directory. Third-party configuration writes retain their existing allowlists.
+
+Switch journals reference encrypted immutable before/after snapshots. Ownership fingerprints use stable identity and organization so token refreshes remain valid; each write also checks current credentials. Independent credential revisions prevent old refresh results from overwriting a later login. Cooperative handoff restores the latest native credentials and reserves their identity until the receiving instance claims them. Account selection applies to newly started client sessions.
 
 ## Usage statistics
 

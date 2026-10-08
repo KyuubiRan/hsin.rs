@@ -1,6 +1,6 @@
 use hsin_core::{
     AuthScheme, ClientKind, ConnectionMode, DEFAULT_CODEX_CONFIG_NAME, OPENAI_CODEX_CONFIG_NAME,
-    ProviderProxyMode,
+    OfficialAccountDisplay, Provider, ProviderProxyMode,
 };
 use ratatui::{
     Frame,
@@ -14,7 +14,7 @@ use crate::i18n::I18n;
 
 use super::super::{
     mouse::{ENTER, HitMap},
-    state::{InputMode, MAPPING_TIERS, State},
+    state::{InputMode, MAPPING_TIERS, State, saved_official_account},
     theme::{MUTED, RED, WHITE},
     widgets::draw_input_field,
 };
@@ -50,14 +50,22 @@ pub(super) fn draw_provider_list(
                 } else {
                     "○"
                 };
-                let name = if provider.official {
-                    i18n.text("official")
-                } else {
-                    &provider.name
-                };
+                let name = provider_display_name(
+                    provider,
+                    state.client_auth.official_account_display(provider.client),
+                    i18n,
+                );
                 ListItem::new(Line::from(vec![
                     Span::styled(format!("{marker} "), Style::default().fg(RED)),
                     Span::styled(name, Style::default().fg(WHITE)),
+                    Span::styled(
+                        if saved_official_account(provider) {
+                            format!(" [{}]", i18n.text("official_saved"))
+                        } else {
+                            String::new()
+                        },
+                        Style::default().fg(MUTED),
+                    ),
                     Span::styled(
                         if model_mapping_active(provider) {
                             format!(" {}", i18n.text("model_mapping_badge"))
@@ -116,11 +124,11 @@ pub(super) fn draw_details(frame: &mut Frame<'_>, area: Rect, state: &State, i18
         );
         return;
     };
-    let name = if provider.official {
-        i18n.text("official")
-    } else {
-        &provider.name
-    };
+    let name = provider_display_name(
+        provider,
+        state.client_auth.official_account_display(provider.client),
+        i18n,
+    );
     let description = if provider.official {
         match provider.client {
             hsin_core::ClientKind::Codex => i18n.text("official_codex_description"),
@@ -259,6 +267,41 @@ pub(super) fn draw_details(frame: &mut Frame<'_>, area: Rect, state: &State, i18
         ),
         area,
     );
+}
+
+pub(super) fn provider_display_name(
+    provider: &Provider,
+    display: OfficialAccountDisplay,
+    i18n: &I18n,
+) -> String {
+    if !provider.official {
+        return provider.name.clone();
+    }
+    let Some(account) = &provider.official_account else {
+        return i18n.text("official").to_owned();
+    };
+    let native_name = account
+        .native_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty());
+    let email = account
+        .email
+        .as_deref()
+        .filter(|email| !email.trim().is_empty());
+    let provider_name = (!provider.name.trim().is_empty()).then_some(provider.name.as_str());
+    let name = if account.saved {
+        provider_name.or(native_name).or(email)
+    } else {
+        native_name.or(email)
+    }
+    .unwrap_or_else(|| i18n.text("official"));
+    match (display, email) {
+        (OfficialAccountDisplay::Email, Some(email)) => email.to_owned(),
+        (OfficialAccountDisplay::NameAndEmail, Some(email)) if email != name => {
+            format!("{name} · {email}")
+        }
+        _ => name.to_owned(),
+    }
 }
 
 fn detail_line<'a>(label: &'a str, value: &'a str) -> Line<'a> {

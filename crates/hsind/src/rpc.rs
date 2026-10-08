@@ -52,6 +52,7 @@ async fn serve_connection(
     mut stream: interprocess::local_socket::tokio::Stream,
 ) -> Result<()> {
     let mut hello_complete = false;
+    let mut config_release_only = false;
     loop {
         let read_result = if hello_complete {
             read_frame(&mut stream).await
@@ -87,45 +88,24 @@ async fn serve_connection(
                 ),
             )
         } else if request.method == method::SYSTEM_HELLO {
-            match parse::<HelloParams>(request.params).and_then(|params| {
-                if params.protocol_version != PROTOCOL_VERSION {
-                    return Err(DaemonError::Protocol(format!(
-                        "protocol {} is incompatible with {}",
-                        params.protocol_version, PROTOCOL_VERSION
-                    )));
-                }
-                if params.version_code != VERSION_CODE {
-                    return Err(DaemonError::Protocol(format!(
-                        "version code {} is incompatible with {}",
-                        params.version_code, VERSION_CODE
-                    )));
-                }
-                Ok(HelloResult {
-                    protocol_version: PROTOCOL_VERSION,
-                    version_code: VERSION_CODE,
-                    daemon_version: env!("CARGO_PKG_VERSION").into(),
-                    instance_id: Some(app.instance.instance_id.clone()),
-                    capabilities: vec![
-                        capability::PROVIDERS.into(),
-                        capability::LOCAL_PROXY.into(),
-                        capability::SECURITY.into(),
-                        capability::CONFIG_SAGA.into(),
-                        capability::MODEL_DISCOVERY.into(),
-                        capability::CODEX_IMAGE.into(),
-                        capability::USAGE_STATS.into(),
-                        capability::USAGE_PRICING.into(),
-                        capability::CONTEXT_PRESETS.into(),
-                        capability::PLAN_MODE_REASONING.into(),
-                        capability::CONFIG_OWNERSHIP.into(),
-                    ],
-                })
-            }) {
-                Ok(result) => {
+            match parse::<HelloParams>(request.params)
+                .and_then(|params| negotiate_hello(&app, &params))
+            {
+                Ok((result, handoff)) => {
                     hello_complete = true;
+                    config_release_only = handoff;
                     success(id, result)
                 }
                 Err(error) => failure(id, &error),
             }
+        } else if config_release_only && request.method != method::CONFIG_RELEASE {
+            JsonRpcResponse::failure(
+                id,
+                RpcError::protocol(
+                    RpcError::INVALID_REQUEST,
+                    "configuration handoff connection permits only config.release",
+                ),
+            )
         } else {
             dispatch(app.clone(), id, &request.method, request.params).await
         };
@@ -137,6 +117,49 @@ async fn serve_connection(
         .map_err(|_| DaemonError::Protocol("IPC response timed out".into()))?
         .map_err(|error| DaemonError::Protocol(error.to_string()))?;
     }
+}
+
+fn negotiate_hello(app: &App, params: &HelloParams) -> Result<(HelloResult, bool)> {
+    if params.protocol_version != PROTOCOL_VERSION {
+        return Err(DaemonError::Protocol(format!(
+            "protocol {} is incompatible with {}",
+            params.protocol_version, PROTOCOL_VERSION
+        )));
+    }
+    let handoff = params
+        .capabilities
+        .iter()
+        .any(|item| item == capability::CONFIG_HANDOFF);
+    if params.version_code != VERSION_CODE && !handoff {
+        return Err(DaemonError::Protocol(format!(
+            "version code {} is incompatible with {}",
+            params.version_code, VERSION_CODE
+        )));
+    }
+    Ok((
+        HelloResult {
+            protocol_version: PROTOCOL_VERSION,
+            version_code: VERSION_CODE,
+            daemon_version: env!("CARGO_PKG_VERSION").into(),
+            instance_id: Some(app.instance.instance_id.clone()),
+            capabilities: vec![
+                capability::OFFICIAL_ACCOUNTS.into(),
+                capability::PROVIDERS.into(),
+                capability::LOCAL_PROXY.into(),
+                capability::SECURITY.into(),
+                capability::CONFIG_SAGA.into(),
+                capability::MODEL_DISCOVERY.into(),
+                capability::CODEX_IMAGE.into(),
+                capability::USAGE_STATS.into(),
+                capability::USAGE_PRICING.into(),
+                capability::CONTEXT_PRESETS.into(),
+                capability::PLAN_MODE_REASONING.into(),
+                capability::CONFIG_OWNERSHIP.into(),
+                capability::CONFIG_HANDOFF.into(),
+            ],
+        },
+        handoff,
+    ))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -158,6 +181,21 @@ async fn dispatch(
         };
     }
     match method_name {
+        method::OFFICIAL_LOGIN_START => {
+            call!(async { app.start_official_login(parse(params)?).await }.await)
+        }
+        method::OFFICIAL_LOGIN_STATUS => {
+            call!(parse(params).and_then(|params| app.official_login_status(params)))
+        }
+        method::OFFICIAL_LOGIN_SUBMIT => {
+            call!(async { app.submit_official_login(parse(params)?).await }.await)
+        }
+        method::OFFICIAL_LOGIN_CANCEL => {
+            call!(async { app.cancel_official_login(parse(params)?).await }.await)
+        }
+        method::OFFICIAL_ACCOUNT_RENAME => {
+            call!(async { app.rename_official_account(parse(params)?).await }.await)
+        }
         method::CONFIG_TAKEOVER => {
             call!(async { app.takeover_configuration(parse(params)?).await }.await)
         }
@@ -235,9 +273,13 @@ async fn dispatch(
                 .map(|recovery_key| json!({"recovery_key":recovery_key}))
         ),
         method::SECURITY_IMPORT_RECOVERY_KEY => call!(
-            parse::<RecoveryKeyParams>(params)
-                .and_then(|params| app.import_recovery_key(&params.recovery_key))
-                .map(|()| json!({"imported":true}))
+            async {
+                let params = parse::<RecoveryKeyParams>(params)?;
+                app.import_recovery_key(&params.recovery_key)
+                    .await
+                    .map(|()| json!({"imported":true}))
+            }
+            .await
         ),
         method::SECURITY_ROTATE_KEY => call!(
             async {

@@ -5,7 +5,7 @@ use super::*;
 
 use hsin_core::{
     ClaudeModelMapping, ConfigOwnershipStatus, ConfigReleaseParams, ConfigTakeoverParams,
-    ConfigTakeoverTarget, ModelSlot, ProviderDraft, ProviderPatch,
+    ConfigTakeoverTarget, ModelSlot, ProviderDraft, ProviderPatch, VERSION_CODE,
 };
 use hsin_ipc::{HelloParams, IpcClient, IpcEndpoint, capability};
 use parking_lot::Mutex as ParkingMutex;
@@ -245,6 +245,60 @@ async fn stop_peer(task: tokio::task::JoinHandle<Result<()>>) {
     let _ = task.await;
 }
 
+#[tokio::test]
+async fn cross_version_handoff_is_scoped_and_still_restores_before_claiming() {
+    let fixture = Instances::new();
+    let custom = add(&fixture.first, draft(ClientKind::Codex, "Owner")).await;
+    let auth_before = fs::read(fixture.codex_auth()).unwrap();
+    activate(&fixture.first, &custom).await;
+    let server = peer(fixture.first.clone()).await;
+    let endpoint = fixture.first.endpoint.read().clone();
+    let mut strict = IpcClient::connect(endpoint.clone()).await.unwrap();
+    let mut params = HelloParams::new("foreign-version-test", "next-version");
+    params.version_code = VERSION_CODE + 1;
+    assert!(matches!(
+        strict.hello(&params).await,
+        Err(hsin_ipc::TransportError::Rpc(_))
+    ));
+    let mut wrong_protocol = IpcClient::connect(endpoint.clone()).await.unwrap();
+    params.capabilities.push(capability::CONFIG_HANDOFF.into());
+    params.protocol_version = hsin_core::PROTOCOL_VERSION + 1;
+    assert!(matches!(
+        wrong_protocol.hello(&params).await,
+        Err(hsin_ipc::TransportError::Rpc(_))
+    ));
+    params.protocol_version = hsin_core::PROTOCOL_VERSION;
+    let mut scoped = IpcClient::connect(endpoint).await.unwrap();
+    let hello = scoped.hello(&params).await.unwrap();
+    assert_eq!(
+        hello.instance_id.as_deref(),
+        Some(fixture.first.instance.instance_id.as_str())
+    );
+    assert!(
+        matches!(scoped.call::<_, Value>(hsin_ipc::method::STATUS, &json!({})).await, Err(hsin_ipc::TransportError::Rpc(error)) if error.code == hsin_ipc::RpcError::INVALID_REQUEST)
+    );
+    let request = takeover(&fixture.second, &[ClientKind::Codex]);
+    let release = ConfigReleaseParams {
+        request_id: request.request_id.clone(),
+        target: request.targets[0].clone(),
+        requester: fixture.second.instance.clone(),
+    };
+    let result: hsin_core::ConfigReleaseResult = scoped
+        .call(hsin_ipc::method::CONFIG_RELEASE, &release)
+        .await
+        .unwrap();
+    assert_eq!(result.request_id, request.request_id);
+    assert!(fs::read(fixture.codex_auth()).unwrap() == auth_before);
+    assert!(!ownership(&fixture.first, ClientKind::Codex).owner_is_self);
+    fixture
+        .second
+        .takeover_configuration(request)
+        .await
+        .unwrap();
+    assert!(ownership(&fixture.second, ClientKind::Codex).owner_is_self);
+    stop_peer(server).await;
+}
+
 fn read_json(path: &Path) -> Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
@@ -254,6 +308,574 @@ fn assert_ownership_conflict<T>(result: Result<T>) {
         .err()
         .expect("configuration mutation unexpectedly succeeded");
     assert!(matches!(error, DaemonError::Ownership(_)));
+}
+
+fn remove_codex_ownership_for_legacy_upgrade(fixture: &Instances) {
+    let app = &fixture.first;
+    let status = ownership(app, ClientKind::Codex);
+    let mut configured: ConfigTarget = serde_json::from_str(
+        &app.db
+            .latest_completed_configuration(ClientKind::Codex)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    configured.ownership_lease = None;
+    // The old journal and encrypted snapshot genuinely lacked lease fields.
+    let mut journal = serde_json::to_value(configured).unwrap();
+    journal.as_object_mut().unwrap().remove("ownership_lease");
+    journal["provider"]
+        .as_object_mut()
+        .unwrap()
+        .remove("codex_tuning");
+    let operation = app
+        .db
+        .begin_operation(
+            "apply_config",
+            ClientKind::Codex,
+            None,
+            &serde_json::to_string(&journal).unwrap(),
+        )
+        .unwrap();
+    app.db
+        .finish_operation(&operation, "complete", None)
+        .unwrap();
+    if let Some(mut snapshot) = app.codex_auth_backup().unwrap() {
+        snapshot.lease = None;
+        let mut snapshot = serde_json::to_value(&snapshot).unwrap();
+        snapshot.as_object_mut().unwrap().remove("lease");
+        let serialized = Zeroizing::new(serde_json::to_vec(&snapshot).unwrap());
+        app.db
+            .put_protected_value(
+                &app.crypto
+                    .encrypt_protected(CODEX_AUTH_BACKUP_KEY, &serialized)
+                    .unwrap(),
+            )
+            .unwrap();
+    }
+    app.db
+        .delete_setting(&format!("config_lease:{}", status.target_id))
+        .unwrap();
+    app.db
+        .delete_setting(&format!(
+            "config_auth_backup_required:{}:{}",
+            status.target_id, status.generation
+        ))
+        .unwrap();
+    fs::remove_file(fixture.temporary.0.join("codex/.hsin-config-owner.json")).unwrap();
+}
+
+fn stage_legacy_codex_claim(fixture: &Instances) -> (Target, Record) {
+    let app = &fixture.first;
+    let target = Target::new(ClientKind::Codex, fixture.codex_config()).unwrap();
+    let configured: ConfigTarget = serde_json::from_str(
+        &app.db
+            .latest_completed_configuration(ClientKind::Codex)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let scope = App::managed_scope(&configured);
+    let mut record = Record::unclaimed(
+        1,
+        scope.clone(),
+        config::ownership_fingerprints(ClientKind::Codex, &target.config_path, &scope).unwrap(),
+    );
+    record.owner = Some(app.instance.clone());
+    record.endpoint = Some(app.endpoint.read().clone());
+    let mut backup = app.codex_auth_backup().unwrap().unwrap();
+    backup.lease = Some(config::AuthBackupLease {
+        instance_id: app.instance.instance_id.clone(),
+        target_id: target.id.clone(),
+        generation: 1,
+    });
+    let encrypted = app
+        .crypto
+        .encrypt_protected(
+            CODEX_AUTH_BACKUP_KEY,
+            &Zeroizing::new(serde_json::to_vec(&backup).unwrap()),
+        )
+        .unwrap();
+    app.db
+        .stage_legacy_config_claim(
+            &target.id,
+            1,
+            &serde_json::to_string(&record).unwrap(),
+            Some(&encrypted),
+        )
+        .unwrap();
+    (target, record)
+}
+
+#[tokio::test]
+async fn legacy_codex_upgrade_preserves_api_only_and_absent_auth_without_official_login() {
+    for mode in [ConnectionMode::Direct, ConnectionMode::Proxy] {
+        for (disabled, preserve, had_auth) in [
+            (false, false, true),
+            (true, false, true),
+            (false, false, false),
+            (false, true, true),
+        ] {
+            let fixture = Instances::new();
+            let original_auth = "{\"auth_mode\":\"apikey\",\"OPENAI_API_KEY\":\"original-api-fixture\",\"account_id\":\"untouched\"}\n";
+            if had_auth {
+                fs::write(fixture.codex_auth(), original_auth).unwrap();
+            } else {
+                fs::remove_file(fixture.codex_auth()).unwrap();
+            }
+            fixture
+                .first
+                .update_settings(SettingsPatch {
+                    client_auth: Some(ClientAuthUpdate {
+                        client: ClientKind::Codex,
+                        disable_custom_auth: disabled,
+                    }),
+                    codex_preserve_official_auth: Some(preserve),
+                    ..SettingsPatch::default()
+                })
+                .await
+                .unwrap();
+            let custom = add(&fixture.first, draft(ClientKind::Codex, "API-only upgrade")).await;
+            fixture.first.db.set_mode(ClientKind::Codex, mode).unwrap();
+            activate(&fixture.first, &custom).await;
+            remove_codex_ownership_for_legacy_upgrade(&fixture);
+            let configured = fs::read(fixture.codex_config()).unwrap();
+            let auth = fs::read(fixture.codex_auth()).unwrap();
+            let upgraded = fixture.reopen_first();
+            upgraded
+                .db
+                .set_config_status(ClientKind::Codex, "conflict")
+                .unwrap();
+            upgraded.migrate_legacy_codex_configuration().unwrap();
+            let status = ownership(&upgraded, ClientKind::Codex);
+            assert!(status.owner_is_self);
+            assert!(status.takeover_unavailable_reason.is_none());
+            assert_eq!(
+                upgraded
+                    .db
+                    .client_state(ClientKind::Codex)
+                    .unwrap()
+                    .config_status,
+                hsin_core::ConfigStatus::Synchronized
+            );
+            assert_eq!(fs::read(fixture.codex_config()).unwrap(), configured);
+            assert!(fs::read(fixture.codex_auth()).unwrap() == auth);
+            assert_eq!(
+                upgraded
+                    .db
+                    .client_state(ClientKind::Codex)
+                    .unwrap()
+                    .active_provider_id,
+                Some(custom.id.clone())
+            );
+            if !preserve {
+                assert!(
+                    upgraded
+                        .codex_auth_backup()
+                        .unwrap()
+                        .unwrap()
+                        .lease
+                        .is_some()
+                );
+            }
+            let owner_record = fixture.owner_record(ClientKind::Codex);
+            upgraded.migrate_legacy_codex_configuration().unwrap();
+            assert_eq!(fixture.owner_record(ClientKind::Codex), owner_record);
+            let imported = upgraded
+                .import_current(ImportCurrentParams {
+                    client: ClientKind::Codex,
+                    name: String::new(),
+                })
+                .await
+                .unwrap();
+            assert!(!imported.imported);
+            assert_eq!(imported.provider.id, custom.id);
+            let official = upgraded
+                .ensure_official_provider(ClientKind::Codex)
+                .unwrap();
+            activate(&upgraded, &official).await;
+            let restored = read_json(&fixture.codex_auth());
+            assert!(restored.get("tokens").is_none());
+            if had_auth {
+                assert!(restored["auth_mode"] == "apikey");
+                assert!(restored["OPENAI_API_KEY"] == "original-api-fixture");
+                assert!(restored["account_id"] == "untouched");
+            } else {
+                assert!(restored.get("OPENAI_API_KEY").is_none());
+                assert!(restored.get("auth_mode").is_none());
+            }
+            assert!(upgraded.codex_auth_backup().unwrap().is_none());
+        }
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn legacy_codex_upgrade_rejects_foreign_or_changed_configuration_and_backup() {
+    for corruption in [
+        "helper",
+        "revision",
+        "endpoint",
+        "auth",
+        "missing_backup",
+        "backup_path",
+        "backup_lease",
+        "polluted_backup",
+        "unreadable_backup",
+        "journal",
+        "pending",
+    ] {
+        let fixture = Instances::new();
+        let custom = add(&fixture.first, draft(ClientKind::Codex, "Legacy upgrade")).await;
+        activate(&fixture.first, &custom).await;
+        remove_codex_ownership_for_legacy_upgrade(&fixture);
+        match corruption {
+            "helper" | "revision" | "endpoint" => {
+                let mut configured: ConfigTarget = serde_json::from_str(
+                    &fixture
+                        .first
+                        .db
+                        .latest_completed_configuration(ClientKind::Codex)
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+                match corruption {
+                    "helper" => configured.credential_command = "/foreign/hsin".into(),
+                    "revision" => configured.provider.revision += 1,
+                    _ => configured.provider.base_url = "https://changed.example.test/v1".into(),
+                }
+                let changed = config::patch_text_with_credential(
+                    &fs::read_to_string(fixture.codex_config()).unwrap(),
+                    &configured,
+                    None,
+                )
+                .unwrap();
+                fs::write(fixture.codex_config(), changed).unwrap();
+            }
+            "auth" => {
+                fs::write(
+                    fixture.codex_auth(),
+                    "{\"auth_mode\":\"apikey\",\"OPENAI_API_KEY\":\"external-fixture-key\"}\n",
+                )
+                .unwrap();
+            }
+            "missing_backup" => fixture
+                .first
+                .db
+                .delete_protected_value(CODEX_AUTH_BACKUP_KEY)
+                .unwrap(),
+            "backup_path" | "backup_lease" | "polluted_backup" => {
+                let mut backup = fixture.first.codex_auth_backup().unwrap().unwrap();
+                match corruption {
+                    "backup_path" => backup.auth_path = "/foreign/auth.json".into(),
+                    "backup_lease" => {
+                        backup.lease = Some(config::AuthBackupLease {
+                            instance_id: "foreign".into(),
+                            target_id: "foreign".into(),
+                            generation: 1,
+                        });
+                    }
+                    _ => backup.openai_api_key = Some(config::HSIN_MANAGED_KEY.into()),
+                }
+                let encrypted = fixture
+                    .first
+                    .crypto
+                    .encrypt_protected(
+                        CODEX_AUTH_BACKUP_KEY,
+                        &Zeroizing::new(serde_json::to_vec(&backup).unwrap()),
+                    )
+                    .unwrap();
+                fixture.first.db.put_protected_value(&encrypted).unwrap();
+            }
+            "unreadable_backup" => {
+                let encrypted = fixture
+                    .first
+                    .crypto
+                    .encrypt_protected(CODEX_AUTH_BACKUP_KEY, b"damaged snapshot")
+                    .unwrap();
+                fixture.first.db.put_protected_value(&encrypted).unwrap();
+            }
+            "journal" => {
+                fixture
+                    .first
+                    .db
+                    .connection
+                    .lock()
+                    .execute("DELETE FROM operations", [])
+                    .unwrap();
+            }
+            _ => {
+                fixture
+                    .first
+                    .db
+                    .begin_operation("apply_config", ClientKind::Codex, None, "{}")
+                    .unwrap();
+            }
+        }
+        let configured = fs::read(fixture.codex_config()).unwrap();
+        let auth = fs::read(fixture.codex_auth()).unwrap();
+        fixture.first.migrate_legacy_codex_configuration().unwrap();
+        assert!(
+            !fixture
+                .temporary
+                .0
+                .join("codex/.hsin-config-owner.json")
+                .exists()
+        );
+        assert_eq!(fs::read(fixture.codex_config()).unwrap(), configured);
+        assert!(fs::read(fixture.codex_auth()).unwrap() == auth);
+        assert!(!ownership(&fixture.first, ClientKind::Codex).takeover_available);
+        fixture.second.migrate_legacy_codex_configuration().unwrap();
+        assert!(!ownership(&fixture.second, ClientKind::Codex).owner_is_self);
+    }
+}
+
+#[tokio::test]
+async fn legacy_codex_upgrade_resumes_on_both_sides_of_sidecar_publication() {
+    for sidecar_written in [false, true] {
+        let fixture = Instances::new();
+        let custom = add(&fixture.first, draft(ClientKind::Codex, "Legacy crash")).await;
+        activate(&fixture.first, &custom).await;
+        remove_codex_ownership_for_legacy_upgrade(&fixture);
+        let (target, record) = stage_legacy_codex_claim(&fixture);
+        if sidecar_written {
+            target.lock().unwrap().set_record(record.clone()).unwrap();
+        }
+        let configured = fs::read(fixture.codex_config()).unwrap();
+        let auth = fs::read(fixture.codex_auth()).unwrap();
+        let upgraded = fixture.reopen_first();
+        upgraded.migrate_legacy_codex_configuration().unwrap();
+        assert_eq!(target.read_record().unwrap(), Some(record));
+        assert!(
+            upgraded
+                .db
+                .setting(&format!("config_legacy_claim:{}", target.id))
+                .unwrap()
+                .is_none()
+        );
+        assert!(ownership(&upgraded, ClientKind::Codex).owner_is_self);
+        assert_eq!(fs::read(fixture.codex_config()).unwrap(), configured);
+        assert!(fs::read(fixture.codex_auth()).unwrap() == auth);
+        let official = upgraded
+            .ensure_official_provider(ClientKind::Codex)
+            .unwrap();
+        activate(&upgraded, &official).await;
+        assert!(read_json(&fixture.codex_auth())["auth_mode"] == "chatgpt");
+    }
+}
+
+#[tokio::test]
+async fn legacy_codex_upgrade_cannot_publish_a_staged_claim_after_foreign_changes() {
+    for foreign_owner in [false, true] {
+        let fixture = Instances::new();
+        let custom = add(
+            &fixture.first,
+            draft(ClientKind::Codex, "Legacy interrupted"),
+        )
+        .await;
+        activate(&fixture.first, &custom).await;
+        remove_codex_ownership_for_legacy_upgrade(&fixture);
+        let (target, mut record) = stage_legacy_codex_claim(&fixture);
+        if foreign_owner {
+            record.owner = Some(fixture.second.instance.clone());
+            target.lock().unwrap().set_record(record.clone()).unwrap();
+        } else {
+            fs::write(
+                fixture.codex_auth(),
+                "{\"auth_mode\":\"chatgpt\",\"tokens\":{\"access_token\":\"fresh-login\"}}\n",
+            )
+            .unwrap();
+        }
+        let configured = fs::read(fixture.codex_config()).unwrap();
+        let auth = fs::read(fixture.codex_auth()).unwrap();
+        fixture
+            .reopen_first()
+            .migrate_legacy_codex_configuration()
+            .unwrap();
+        assert_eq!(
+            target.read_record().unwrap(),
+            foreign_owner.then_some(record)
+        );
+        assert_eq!(fs::read(fixture.codex_config()).unwrap(), configured);
+        assert!(fs::read(fixture.codex_auth()).unwrap() == auth);
+        assert!(
+            fixture
+                .first
+                .db
+                .setting(&format!("config_legacy_claim:{}", target.id))
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test]
+async fn legacy_codex_upgrade_database_failure_rolls_back_lease_and_backup() {
+    let fixture = Instances::new();
+    let custom = add(&fixture.first, draft(ClientKind::Codex, "Legacy rollback")).await;
+    activate(&fixture.first, &custom).await;
+    remove_codex_ownership_for_legacy_upgrade(&fixture);
+    fixture.first.db.connection.lock().execute_batch("CREATE TRIGGER fail_legacy_lease BEFORE INSERT ON settings WHEN NEW.key LIKE 'config_lease:%' BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
+    assert!(fixture.first.migrate_legacy_codex_configuration().is_err());
+    assert!(
+        fixture
+            .first
+            .codex_auth_backup()
+            .unwrap()
+            .unwrap()
+            .lease
+            .is_none()
+    );
+    let target = Target::new(ClientKind::Codex, fixture.codex_config()).unwrap();
+    assert!(target.read_record().unwrap().is_none());
+    assert!(
+        fixture
+            .first
+            .db
+            .setting(&format!("config_legacy_claim:{}", target.id))
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fixture
+            .first
+            .db
+            .setting(&format!("config_lease:{}", target.id))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn legacy_codex_upgrade_preserves_a_proxy_route_switched_without_rewriting_the_helper() {
+    let fixture = Instances::new();
+    let previous = add(
+        &fixture.first,
+        draft(ClientKind::Codex, "Previous proxy route"),
+    )
+    .await;
+    fixture
+        .first
+        .db
+        .set_mode(ClientKind::Codex, ConnectionMode::Proxy)
+        .unwrap();
+    activate(&fixture.first, &previous).await;
+    remove_codex_ownership_for_legacy_upgrade(&fixture);
+    let selected = add(
+        &fixture.first,
+        draft(ClientKind::Codex, "Selected proxy route"),
+    )
+    .await;
+    fixture
+        .first
+        .db
+        .set_active(ClientKind::Codex, &selected.id, "synchronized")
+        .unwrap();
+    let configured = fs::read(fixture.codex_config()).unwrap();
+    let auth = fs::read(fixture.codex_auth()).unwrap();
+    let upgraded = fixture.reopen_first();
+    upgraded.migrate_legacy_codex_configuration().unwrap();
+    assert!(ownership(&upgraded, ClientKind::Codex).owner_is_self);
+    assert_eq!(fs::read(fixture.codex_config()).unwrap(), configured);
+    assert!(fs::read(fixture.codex_auth()).unwrap() == auth);
+    assert_eq!(
+        upgraded
+            .db
+            .client_state(ClientKind::Codex)
+            .unwrap()
+            .active_provider_id,
+        Some(selected.id.clone())
+    );
+    upgraded.reconcile_proxy_configurations().unwrap();
+    let provider = upgraded
+        .current_configuration_provider(ClientKind::Codex)
+        .unwrap()
+        .unwrap();
+    assert_eq!(provider.id, selected.id);
+}
+
+#[tokio::test]
+async fn legacy_codex_upgrade_waits_for_the_original_key_before_binding_its_backup() {
+    let fixture = Instances::new();
+    let custom = add(
+        &fixture.first,
+        draft(ClientKind::Codex, "Locked legacy owner"),
+    )
+    .await;
+    activate(&fixture.first, &custom).await;
+    remove_codex_ownership_for_legacy_upgrade(&fixture);
+    let recovery = fixture.first.crypto.export_recovery_key().unwrap();
+    fixture.first_store.0.lock().clear();
+    let upgraded = fixture.reopen_first();
+    assert!(matches!(
+        upgraded.migrate_legacy_codex_configuration(),
+        Err(DaemonError::Locked)
+    ));
+    assert!(!ownership(&upgraded, ClientKind::Codex).owner_is_self);
+    upgraded
+        .import_recovery_key(recovery.expose_secret())
+        .await
+        .unwrap();
+    assert!(ownership(&upgraded, ClientKind::Codex).owner_is_self);
+    assert!(
+        upgraded
+            .codex_auth_backup()
+            .unwrap()
+            .unwrap()
+            .lease
+            .is_some()
+    );
+    activate(&upgraded, &custom).await;
+}
+
+#[tokio::test]
+async fn legacy_codex_upgrade_discards_an_interrupted_claim_after_native_recovery() {
+    let fixture = Instances::new();
+    let custom = add(
+        &fixture.first,
+        draft(ClientKind::Codex, "Legacy native recovery"),
+    )
+    .await;
+    activate(&fixture.first, &custom).await;
+    remove_codex_ownership_for_legacy_upgrade(&fixture);
+    let (target, _) = stage_legacy_codex_claim(&fixture);
+    fs::write(fixture.codex_config(), "model_provider = \"openai\"\n").unwrap();
+    fs::write(
+        fixture.codex_auth(),
+        "{\"auth_mode\":\"chatgpt\",\"tokens\":{\"access_token\":\"fresh-official-login\"}}\n",
+    )
+    .unwrap();
+    let upgraded = fixture.reopen_first();
+    upgraded.migrate_legacy_codex_configuration().unwrap();
+    assert!(target.read_record().unwrap().is_none());
+    let official = upgraded
+        .ensure_official_provider(ClientKind::Codex)
+        .unwrap();
+    activate(&upgraded, &official).await;
+    assert!(
+        upgraded
+            .db
+            .setting(&format!("config_legacy_claim:{}", target.id))
+            .unwrap()
+            .is_none()
+    );
+    let restarted = fixture.reopen_first();
+    restarted.migrate_legacy_codex_configuration().unwrap();
+    assert!(
+        ownership(&restarted, ClientKind::Codex)
+            .takeover_unavailable_reason
+            .is_none()
+    );
+    assert_eq!(
+        restarted
+            .db
+            .client_state(ClientKind::Codex)
+            .unwrap()
+            .config_status,
+        hsin_core::ConfigStatus::Synchronized
+    );
+    assert!(read_json(&fixture.codex_auth())["tokens"]["access_token"] == "fresh-official-login");
 }
 
 fn stage_release(app: &App, params: &ConfigReleaseParams) -> (Target, Record) {

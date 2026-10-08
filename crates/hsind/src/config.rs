@@ -15,6 +15,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use toml_edit::{DocumentMut, ImDocument, Item, Table, value};
+use unicode_normalization::UnicodeNormalization;
 use zeroize::{Zeroize, Zeroizing};
 
 use hsin_core::{
@@ -43,6 +44,8 @@ pub struct DetectedProvider {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ConfigTarget {
+    #[serde(default)]
+    pub official_auth_transition: Option<OfficialAuthTransition>,
     pub client: ClientKind,
     pub mode: ConnectionMode,
     pub provider: Provider,
@@ -70,6 +73,21 @@ pub struct ConfigTarget {
     pub claude_model_env_before: Option<ClaudeModelEnvSnapshot>,
     #[serde(default)]
     pub ownership_lease: Option<AuthBackupLease>,
+}
+
+/// Immutable encrypted snapshots make an OAuth switch recoverable without
+/// putting tokens in the public operation journal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfficialAuthTransition {
+    pub store_id: String,
+    pub before_key: String,
+    pub after_key: String,
+    pub before_fingerprint: String,
+    #[serde(default)]
+    pub before_source: Option<String>,
+    pub after_fingerprint: String,
+    pub state: Option<String>,
+    pub restoring_native: bool,
 }
 
 const fn default_true() -> bool {
@@ -221,9 +239,13 @@ pub fn default_config_path(client: ClientKind, home_override: Option<&Path>) -> 
         ClientKind::Codex => client_home
             .unwrap_or_else(|| home.join(".codex"))
             .join("config.toml"),
-        ClientKind::Claude => client_home
-            .unwrap_or_else(|| home.join(".claude"))
-            .join("settings.json"),
+        ClientKind::Claude => {
+            // Claude normalizes its directory expression before resolving files
+            // and the Keychain namespace. Do the same for configuration writes.
+            let directory = client_home.unwrap_or_else(|| home.join(".claude"));
+            PathBuf::from(directory.to_string_lossy().nfc().collect::<String>())
+                .join("settings.json")
+        }
     })
 }
 
@@ -609,7 +631,11 @@ pub fn ownership_fingerprints(
     } else {
         None
     };
-    Ok(crate::ownership::Fingerprints { config, auth })
+    Ok(crate::ownership::Fingerprints {
+        config,
+        auth,
+        official_auth: None,
+    })
 }
 
 fn toml_projection(item: &Item) -> serde_json::Value {
@@ -734,10 +760,24 @@ pub fn patch_codex_with_credential(
     credential: Option<&str>,
 ) -> Result<String> {
     if target.provider.official {
-        return patch_codex_tuning(
-            remove_codex_hsin_configuration(text)?,
-            target.provider.codex_tuning,
-        );
+        let mut native = remove_codex_hsin_configuration(text)?;
+        if target
+            .provider
+            .official_account
+            .as_ref()
+            .is_some_and(|account| account.saved)
+        {
+            let document = parse_toml(&native)?;
+            if let Some(selector) = document.get("model_provider")
+                && selector.as_str() != Some("openai")
+            {
+                let span = selector.span().ok_or_else(|| {
+                    DaemonError::Config("model_provider has no source span".into())
+                })?;
+                native.replace_range(span, "\"openai\"");
+            }
+        }
+        return patch_codex_tuning(native, target.provider.codex_tuning);
     }
 
     let mut output = text.to_owned();
@@ -1852,6 +1892,19 @@ mod tests {
 
     type NamedItems = Vec<(String, String)>;
 
+    #[test]
+    fn claude_configuration_directory_matches_native_unicode_normalization() {
+        let expression = Path::new("/test/claude-e\u{301}");
+        assert_eq!(
+            default_config_path(ClientKind::Claude, Some(expression)).unwrap(),
+            PathBuf::from("/test/claude-é/settings.json")
+        );
+        assert_eq!(
+            default_config_path(ClientKind::Codex, Some(expression)).unwrap(),
+            expression.join("config.toml")
+        );
+    }
+
     fn target(client: ClientKind) -> ConfigTarget {
         ConfigTarget {
             client,
@@ -1864,6 +1917,7 @@ mod tests {
                 base_url: "https://example.test/v1".into(),
                 auth_scheme: AuthScheme::Bearer,
                 official: false,
+                official_account: None,
                 credential_configured: true,
                 credential_preview: None,
                 model: None,
@@ -1887,6 +1941,7 @@ mod tests {
             codex_auth_before_hash: None,
             claude_model_env_before: None,
             ownership_lease: None,
+            official_auth_transition: None,
         }
     }
 
@@ -2095,6 +2150,7 @@ mod tests {
             base_url: CODEX_OFFICIAL_URL.into(),
             auth_scheme: AuthScheme::OAuth,
             official: true,
+            official_account: None,
             credential_configured: false,
             credential_preview: None,
             model: None,
@@ -2148,6 +2204,7 @@ mod tests {
             base_url: CLAUDE_OFFICIAL_URL.into(),
             auth_scheme: AuthScheme::OAuth,
             official: true,
+            official_account: None,
             credential_configured: false,
             credential_preview: None,
             model: None,
@@ -2457,6 +2514,7 @@ mod tests {
             base_url: CLAUDE_OFFICIAL_URL.into(),
             auth_scheme: AuthScheme::OAuth,
             official: true,
+            official_account: None,
             credential_configured: false,
             credential_preview: None,
             model: None,

@@ -4,13 +4,15 @@ use hsin_core::{
     CodexImageConfigUpdate, CodexImageListParams, CodexImageSwitchParams, ConfigConflictDetails,
     ConfigTakeoverParams, ConfigTakeoverResult, ConnectionMode, ErrorCode, ImportCurrentParams,
     ImportCurrentResult, ModeSetParams, ModelDiscoverParams, ModelPriceInput, ModelPriceList,
-    ModelUpdate, Provider, ProviderAddParams, ProviderDraft, ProviderEditParams, ProviderPatch,
-    ProviderRemoveParams, ProviderSwitchParams, SecretInput, Settings, SettingsPatch,
-    UsageStatsQuery, UsageStatsReport,
+    ModelUpdate, OfficialAccountDisplay, OfficialAccountDisplayUpdate, OfficialAccountRenameParams,
+    OfficialLoginStartParams, OfficialLoginStatus, OfficialLoginStatusParams,
+    OfficialLoginSubmitParams, Provider, ProviderAddParams, ProviderDraft, ProviderEditParams,
+    ProviderPatch, ProviderRemoveParams, ProviderSwitchParams, SecretInput, Settings,
+    SettingsPatch, UsageStatsQuery, UsageStatsReport,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::rpc::{DaemonClient, StatusSnapshot};
 
@@ -37,6 +39,23 @@ pub(super) enum Effect {
     },
     SetCodexOfficialAuthPreservation(bool),
     SetClaudeModelNames(bool),
+    SetOfficialAccountDisplay {
+        client: ClientKind,
+        display: OfficialAccountDisplay,
+    },
+    OfficialLoginStart(ClientKind),
+    OfficialLoginStatus(String),
+    OfficialLoginSubmit {
+        login_id: String,
+        code: Zeroizing<String>,
+    },
+    OfficialLoginCancel(String),
+    OpenOfficialBrowser(String),
+    RenameOfficialAccount {
+        id: String,
+        expected_revision: u64,
+        name: String,
+    },
     ImportCurrent(ClientKind),
     Add(FormSubmission),
     Edit(FormSubmission),
@@ -115,7 +134,44 @@ pub(super) async fn worker(
     mut effects: mpsc::Receiver<Effect>,
     actions: mpsc::Sender<Action>,
 ) {
+    let mut official_login_jobs = std::collections::BTreeSet::new();
     while let Some(effect) = effects.recv().await {
+        if actions.is_closed() {
+            break;
+        }
+        if let Effect::OpenOfficialBrowser(url) = effect {
+            if open_official_browser(&url).await.is_err() {
+                let _ = actions
+                    .send(Action::Notice("official_login_browser_failed"))
+                    .await;
+            }
+            continue;
+        }
+        if matches!(
+            effect,
+            Effect::OfficialLoginStart(_)
+                | Effect::OfficialLoginStatus(_)
+                | Effect::OfficialLoginSubmit { .. }
+                | Effect::OfficialLoginCancel(_)
+        ) {
+            let action = match official_login(&client, effect).await {
+                Ok(status) => {
+                    if matches!(
+                        status.state,
+                        hsin_core::OfficialLoginState::Starting
+                            | hsin_core::OfficialLoginState::AwaitingBrowser
+                    ) {
+                        official_login_jobs.insert(status.login_id.clone());
+                    } else {
+                        official_login_jobs.remove(&status.login_id);
+                    }
+                    Action::OfficialLoginUpdated(status)
+                }
+                Err(error) => Action::OfficialLoginFailed(error_notice(&error)),
+            };
+            let _ = actions.send(action).await;
+            continue;
+        }
         if let Effect::DiscoverModels(form) = effect {
             let request = discovery_request_for_form(&form);
             let action = match discover(&client, &request).await {
@@ -239,6 +295,96 @@ pub(super) async fn worker(
             }
         }
     }
+    // The UI can disappear while login.start is in flight. Cancel every unfinished job once
+    // the worker has received its ID, even when there is no receiver left for the response.
+    for login_id in official_login_jobs {
+        let _ = client
+            .call::<_, OfficialLoginStatus>(
+                hsin_ipc::method::OFFICIAL_LOGIN_CANCEL,
+                &OfficialLoginStatusParams { login_id },
+            )
+            .await;
+    }
+}
+
+async fn official_login(client: &DaemonClient, effect: Effect) -> Result<OfficialLoginStatus> {
+    use hsin_ipc::method;
+    match effect {
+        Effect::OfficialLoginStart(client_kind) => {
+            client
+                .call(
+                    method::OFFICIAL_LOGIN_START,
+                    &OfficialLoginStartParams {
+                        client: client_kind,
+                    },
+                )
+                .await
+        }
+        Effect::OfficialLoginStatus(login_id) => {
+            client
+                .call(
+                    method::OFFICIAL_LOGIN_STATUS,
+                    &OfficialLoginStatusParams { login_id },
+                )
+                .await
+        }
+        Effect::OfficialLoginCancel(login_id) => {
+            client
+                .call(
+                    method::OFFICIAL_LOGIN_CANCEL,
+                    &OfficialLoginStatusParams { login_id },
+                )
+                .await
+        }
+        Effect::OfficialLoginSubmit { login_id, code } => {
+            let request = SensitiveLoginSubmit(OfficialLoginSubmitParams {
+                login_id,
+                code: code.to_string(),
+            });
+            client.call(method::OFFICIAL_LOGIN_SUBMIT, &request.0).await
+        }
+        _ => unreachable!("official login effects are handled separately"),
+    }
+}
+
+struct SensitiveLoginSubmit(OfficialLoginSubmitParams);
+
+impl Drop for SensitiveLoginSubmit {
+    fn drop(&mut self) {
+        self.0.code.zeroize();
+    }
+}
+
+/// Pass the URL as a single argument and never include it in errors or logs.
+async fn open_official_browser(url: &str) -> Result<()> {
+    let parsed = url::Url::parse(url)?;
+    ensure!(
+        matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some(),
+        "invalid login URL"
+    );
+    #[cfg(target_os = "macos")]
+    let mut command = tokio::process::Command::new("open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = tokio::process::Command::new("xdg-open");
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = tokio::process::Command::new("rundll32.exe");
+        command.arg("url.dll,FileProtocolHandler");
+        command
+    };
+    command.kill_on_drop(true);
+    let status = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        command
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status(),
+    )
+    .await??;
+    ensure!(status.success(), "browser unavailable");
+    Ok(())
 }
 
 /// Runs a price-rule change and returns the list as it stands afterwards.
@@ -406,6 +552,41 @@ async fn execute_effect(client: &DaemonClient, effect: &Effect) -> Result<Option
             update_codex_official_auth_preservation(client, *enabled).await
         }
         Effect::SetClaudeModelNames(enabled) => update_claude_model_names(client, *enabled).await,
+        Effect::SetOfficialAccountDisplay {
+            client: kind,
+            display,
+        } => {
+            let _: Value = client
+                .call(
+                    "settings.set",
+                    &SettingsPatch {
+                        official_account_display: Some(OfficialAccountDisplayUpdate {
+                            client: *kind,
+                            display: *display,
+                        }),
+                        ..SettingsPatch::default()
+                    },
+                )
+                .await?;
+            Ok(None)
+        }
+        Effect::RenameOfficialAccount {
+            id,
+            expected_revision,
+            name,
+        } => {
+            let _: Value = client
+                .call(
+                    hsin_ipc::method::OFFICIAL_ACCOUNT_RENAME,
+                    &OfficialAccountRenameParams {
+                        provider_id: id.clone(),
+                        expected_revision: *expected_revision,
+                        name: name.clone(),
+                    },
+                )
+                .await?;
+            Ok(Some("provider_updated"))
+        }
         Effect::ImportCurrent(kind) => {
             let imported = import_current(client, *kind).await?;
             Ok(Some(if imported {
@@ -476,6 +657,11 @@ async fn execute_effect(client: &DaemonClient, effect: &Effect) -> Result<Option
             unreachable!("price rules are handled by the worker")
         }
         Effect::Takeover { .. } => unreachable!("takeover is handled by the worker"),
+        Effect::OfficialLoginStart(_)
+        | Effect::OfficialLoginStatus(_)
+        | Effect::OfficialLoginSubmit { .. }
+        | Effect::OfficialLoginCancel(_)
+        | Effect::OpenOfficialBrowser(_) => unreachable!("official login is handled by the worker"),
     }
 }
 
@@ -620,6 +806,7 @@ async fn update_proxy_enabled(
                 proxy_host: None,
                 proxy_port: None,
                 proxy_enabled: Some(enabled),
+                official_account_display: None,
                 clients: None,
                 client_auth: None,
                 codex_preserve_official_auth: None,
@@ -643,6 +830,7 @@ async fn update_proxy_host(client: &DaemonClient, host: String) -> Result<Option
             &SettingsPatch {
                 language: None,
                 proxy_host: Some(host),
+                official_account_display: None,
                 proxy_port: None,
                 proxy_enabled: None,
                 clients: None,
@@ -665,6 +853,7 @@ async fn update_proxy_port(client: &DaemonClient, port: u16) -> Result<Option<&'
                 language: None,
                 proxy_host: None,
                 proxy_port: Some(port),
+                official_account_display: None,
                 proxy_enabled: None,
                 clients: None,
                 client_auth: None,
@@ -684,6 +873,7 @@ async fn update_language(client: &DaemonClient, language: String) -> Result<Opti
             "settings.set",
             &SettingsPatch {
                 language: Some(language),
+                official_account_display: None,
                 proxy_host: None,
                 proxy_port: None,
                 proxy_enabled: None,
@@ -732,6 +922,7 @@ async fn update_clients(
                 proxy_port: None,
                 proxy_enabled: None,
                 clients: Some(clients.clone()),
+                official_account_display: None,
                 client_auth: None,
                 codex_preserve_official_auth: None,
                 stats_chart_style: None,
@@ -762,9 +953,11 @@ async fn update_client_auth(
                 proxy_enabled: None,
                 clients: None,
                 client_auth: Some(ClientAuthUpdate {
+                    // This toggle does not change the account label preference.
                     client: kind,
                     disable_custom_auth,
                 }),
+                official_account_display: None,
                 codex_preserve_official_auth: None,
                 stats_chart_style: None,
                 claude_model_names_enabled: None,
@@ -790,6 +983,7 @@ async fn update_codex_official_auth_preservation(
                 clients: None,
                 client_auth: None,
                 codex_preserve_official_auth: Some(enabled),
+                official_account_display: None,
                 stats_chart_style: None,
                 claude_model_names_enabled: None,
                 upstream_proxy: None,
@@ -816,6 +1010,7 @@ async fn update_claude_model_names(
                 codex_preserve_official_auth: None,
                 stats_chart_style: None,
                 claude_model_names_enabled: Some(enabled),
+                official_account_display: None,
                 upstream_proxy: None,
             },
         )
@@ -842,6 +1037,92 @@ async fn load(client: &DaemonClient) -> Result<(Vec<Provider>, StatusSnapshot, S
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn closing_ui_during_login_start_cancels_returned_job_before_worker_exits() {
+        use hsin_ipc::{
+            HelloParams, HelloResult, IpcClient, IpcEndpoint, IpcListener, JsonRpcRequest,
+            JsonRpcResponse, read_frame, write_frame,
+        };
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("hsin-login-worker-{}-{nonce}", std::process::id()));
+        #[cfg(not(windows))]
+        let endpoint = IpcEndpoint::filesystem(root.join("hsind.sock"));
+        #[cfg(windows)]
+        let endpoint = IpcEndpoint::namespaced(format!("hsin-login-worker-{nonce}"));
+        let listener = IpcListener::bind(endpoint.clone()).unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let hello: JsonRpcRequest = read_frame(&mut stream).await.unwrap();
+            write_frame(
+                &mut stream,
+                &JsonRpcResponse::success(
+                    hello.id,
+                    HelloResult {
+                        protocol_version: hsin_ipc::PROTOCOL_VERSION,
+                        version_code: hsin_core::VERSION_CODE,
+                        daemon_version: env!("CARGO_PKG_VERSION").into(),
+                        capabilities: Vec::new(),
+                        instance_id: None,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+            let start: JsonRpcRequest = read_frame(&mut stream).await.unwrap();
+            assert_eq!(start.method, hsin_ipc::method::OFFICIAL_LOGIN_START);
+            started_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            let mut status = OfficialLoginStatus {
+                login_id: "unfinished-login".into(),
+                client: ClientKind::Codex,
+                state: hsin_core::OfficialLoginState::AwaitingBrowser,
+                browser_url: None,
+                provider_id: None,
+                error: None,
+            };
+            write_frame(&mut stream, &JsonRpcResponse::success(start.id, &status))
+                .await
+                .unwrap();
+            let cancel: JsonRpcRequest = read_frame(&mut stream).await.unwrap();
+            assert_eq!(cancel.method, hsin_ipc::method::OFFICIAL_LOGIN_CANCEL);
+            assert_eq!(cancel.params["login_id"], "unfinished-login");
+            status.state = hsin_core::OfficialLoginState::Cancelled;
+            write_frame(&mut stream, &JsonRpcResponse::success(cancel.id, &status))
+                .await
+                .unwrap();
+        });
+        let mut ipc = IpcClient::connect(endpoint).await.unwrap();
+        ipc.hello(&HelloParams::new("hsin-test", env!("CARGO_PKG_VERSION")))
+            .await
+            .unwrap();
+        let client = DaemonClient::from_test_ipc(ipc);
+        let (effect_tx, effect_rx) = mpsc::channel(4);
+        let (action_tx, action_rx) = mpsc::channel(4);
+        let task = tokio::spawn(worker(client, effect_rx, action_tx));
+        effect_tx
+            .send(Effect::OfficialLoginStart(ClientKind::Codex))
+            .await
+            .unwrap();
+        started_rx.await.unwrap();
+        drop(action_rx);
+        drop(effect_tx);
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+        if root.exists() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
 
     #[test]
     fn ordinary_cas_and_transport_errors_are_never_takeover_candidates() {

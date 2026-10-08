@@ -16,9 +16,11 @@ use crate::{
     },
 };
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
+mod official_accounts;
+pub use official_accounts::OfficialAccountRecord;
 
-const PROVIDER_COLUMNS: &str = "p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,EXISTS(SELECT 1 FROM provider_secrets configured WHERE configured.provider_id=p.id),p.claude_model_mapping,p.codex_config_name,p.scope,p.codex_image_enabled,p.codex_image_models,p.codex_image_preferred_model,p.network_proxy,EXISTS(SELECT 1 FROM protected_values proxy_secret WHERE proxy_secret.key='provider_proxy_password:' || p.id),p.codex_tuning";
+const PROVIDER_COLUMNS: &str = "p.id,p.client,p.name,p.description,p.base_url,p.auth_scheme,p.model,p.revision,p.official,(EXISTS(SELECT 1 FROM provider_secrets configured WHERE configured.provider_id=p.id) OR EXISTS(SELECT 1 FROM official_accounts a WHERE a.provider_id=p.id)),p.claude_model_mapping,p.codex_config_name,p.scope,p.codex_image_enabled,p.codex_image_models,p.codex_image_preferred_model,p.network_proxy,EXISTS(SELECT 1 FROM protected_values proxy_secret WHERE proxy_secret.key='provider_proxy_password:' || p.id),p.codex_tuning,(SELECT a.summary FROM official_accounts a WHERE a.provider_id=p.id)";
 
 pub struct Database {
     pub(crate) connection: Mutex<Connection>,
@@ -165,6 +167,7 @@ impl Database {
             base_url: input.base_url.trim().trim_end_matches('/').to_owned(),
             auth_scheme: input.auth_scheme,
             official: false,
+            official_account: None,
             credential_configured: false,
             credential_preview: None,
             model: input.model.as_ref().map(|model| model.trim().to_owned()),
@@ -258,6 +261,7 @@ impl Database {
 
     pub fn remove_provider(&self, id: &str) -> Result<()> {
         let provider = self.get_provider(id)?;
+        let account = self.official_account(id)?;
         let connection = self.connection.lock();
         let transaction = connection.unchecked_transaction()?;
         let active: i64 = transaction.query_row(
@@ -283,8 +287,19 @@ impl Database {
             "DELETE FROM protected_values WHERE key=?1",
             [provider_proxy_password_key(id)],
         )?;
+        transaction.execute(
+            "DELETE FROM protected_values WHERE key=?1",
+            [official_accounts::credential_key(id)],
+        )?;
+        transaction.execute(
+            "DELETE FROM settings WHERE key=?1",
+            [format!("official_native_revision:{id}")],
+        )?;
         if transaction.execute("DELETE FROM providers WHERE id=?1", [id])? == 0 {
             return Err(DaemonError::NotFound(format!("provider {id}")));
+        }
+        if let Some(account) = account {
+            transaction.execute("INSERT INTO settings(key,value,updated_at) VALUES(?1,'1',?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", params![official_accounts::removed_account_key(provider.client, &account.account_id, &account.organization_id), unix_time()?])?;
         }
         transaction.commit()?;
         Ok(())
@@ -653,6 +668,71 @@ impl Database {
             .map_err(Into::into)
     }
 
+    pub fn latest_completed_configuration(&self, client: ClientKind) -> Result<Option<String>> {
+        self.connection
+            .lock()
+            .query_row(
+                "SELECT target_json FROM operations WHERE client=?1 AND state='complete' AND kind IN ('apply_config','edit_active_config') ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                [client.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Commit the recovery intent, lease receipt and rebound backup together,
+    /// before publishing the claim in the shared configuration directory.
+    pub fn stage_legacy_config_claim(
+        &self,
+        target_id: &str,
+        generation: u64,
+        record_json: &str,
+        backup: Option<&EncryptedProtectedValue>,
+    ) -> Result<()> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = unix_time()?;
+        for (key, value) in [
+            (
+                format!("config_legacy_claim:{target_id}"),
+                record_json.to_owned(),
+            ),
+            (format!("config_lease:{target_id}"), generation.to_string()),
+        ] {
+            transaction.execute(
+                "INSERT INTO settings(key,value,updated_at) VALUES(?1,?2,?3)",
+                params![key, value, now],
+            )?;
+        }
+        if let Some(backup) = backup {
+            upsert_protected_value(&transaction, backup, now)?;
+            transaction.execute(
+                "INSERT INTO settings(key,value,updated_at) VALUES(?1,'true',?2)",
+                params![
+                    format!("config_auth_backup_required:{target_id}:{generation}"),
+                    now
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn finish_legacy_config_claim(&self, target_id: &str) -> Result<()> {
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM settings WHERE key=?1",
+            [format!("config_legacy_claim:{target_id}")],
+        )?;
+        transaction.execute(
+            "UPDATE client_state SET config_status='synchronized',updated_at=?1 WHERE client='codex'",
+            [unix_time()?],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn integrity_check(&self) -> Result<String> {
         self.connection
             .lock()
@@ -852,6 +932,15 @@ fn migrate(connection: &Connection) -> Result<()> {
         }
     }
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 14 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE official_accounts(provider_id TEXT PRIMARY KEY REFERENCES providers(id) ON DELETE CASCADE,client TEXT NOT NULL CHECK(client IN ('codex','claude')),account_id TEXT NOT NULL,organization_id TEXT NOT NULL,summary TEXT NOT NULL,credential_revision INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(client,account_id,organization_id));
+             PRAGMA user_version=15;
+             COMMIT;",
+        )?;
+    }
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version != SCHEMA_VERSION {
         return Err(DaemonError::Database(rusqlite::Error::InvalidQuery));
     }
@@ -948,6 +1037,17 @@ fn provider_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Provider> {
         model: row.get(6)?,
         revision: row.get(7)?,
         official: row.get(8)?,
+        official_account: row
+            .get::<_, Option<String>>(19)?
+            .map(|json| serde_json::from_str(&json))
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    19,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
         credential_configured: row.get(9)?,
         credential_preview: None,
         codex_config_name: row.get(11)?,
@@ -1017,10 +1117,10 @@ fn provider_secret_from_row(
 ) -> rusqlite::Result<(Provider, EncryptedSecret)> {
     let provider = provider_from_row(row)?;
     let secret = EncryptedSecret {
-        provider_id: row.get(19)?,
-        key_version: row.get(20)?,
-        nonce: row.get(21)?,
-        ciphertext: row.get(22)?,
+        provider_id: row.get(20)?,
+        key_version: row.get(21)?,
+        nonce: row.get(22)?,
+        ciphertext: row.get(23)?,
     };
     Ok((provider, secret))
 }
@@ -1091,6 +1191,7 @@ mod tests {
         connection
             .execute_batch(
                 "ALTER TABLE providers DROP COLUMN codex_tuning;
+                 DROP TABLE official_accounts;
                  DROP TABLE usage_hourly;
                  DROP TABLE usage_rollup_dirty;
                  DROP TABLE model_prices;

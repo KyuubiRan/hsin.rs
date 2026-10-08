@@ -140,6 +140,15 @@ pub struct DaemonClient {
 }
 
 impl DaemonClient {
+    #[cfg(test)]
+    pub(crate) fn from_test_ipc(inner: hsin_ipc::IpcClient) -> Self {
+        Self {
+            inner: tokio::sync::Mutex::new(inner),
+            daemon_version: env!("CARGO_PKG_VERSION").into(),
+            required_capabilities_supported: true,
+        }
+    }
+
     pub async fn connect() -> Result<Self> {
         let mut inner = hsin_ipc::IpcClient::connect_default()
             .await
@@ -277,6 +286,8 @@ fn has_required_capabilities(capabilities: &[String]) -> bool {
         hsin_ipc::capability::CONTEXT_PRESETS,
         hsin_ipc::capability::PLAN_MODE_REASONING,
         hsin_ipc::capability::CONFIG_OWNERSHIP,
+        hsin_ipc::capability::CONFIG_HANDOFF,
+        hsin_ipc::capability::OFFICIAL_ACCOUNTS,
     ]
     .iter()
     .all(|required| capabilities.iter().any(|capability| capability == required))
@@ -462,11 +473,36 @@ mod tests {
             hsin_ipc::capability::CONTEXT_PRESETS.into(),
             hsin_ipc::capability::PLAN_MODE_REASONING.into(),
             hsin_ipc::capability::CONFIG_OWNERSHIP.into(),
+            hsin_ipc::capability::CONFIG_HANDOFF.into(),
+            hsin_ipc::capability::OFFICIAL_ACCOUNTS.into(),
         ]));
         assert!(!has_required_capabilities(&[
             hsin_ipc::capability::CONTEXT_PRESETS.into(),
             hsin_ipc::capability::PLAN_MODE_REASONING.into(),
         ]));
+    }
+
+    #[test]
+    fn daemon_without_official_account_support_is_reinstalled_at_same_version() {
+        let supported = has_required_capabilities(&[
+            hsin_ipc::capability::CONTEXT_PRESETS.into(),
+            hsin_ipc::capability::PLAN_MODE_REASONING.into(),
+            hsin_ipc::capability::CONFIG_OWNERSHIP.into(),
+        ]);
+        assert!(!supported);
+        assert!(daemon_needs_reinstall(env!("CARGO_PKG_VERSION"), supported));
+    }
+
+    #[test]
+    fn daemon_without_stable_handoff_support_is_reinstalled_at_same_version() {
+        let supported = has_required_capabilities(&[
+            hsin_ipc::capability::CONTEXT_PRESETS.into(),
+            hsin_ipc::capability::PLAN_MODE_REASONING.into(),
+            hsin_ipc::capability::CONFIG_OWNERSHIP.into(),
+            hsin_ipc::capability::OFFICIAL_ACCOUNTS.into(),
+        ]);
+        assert!(!supported);
+        assert!(daemon_needs_reinstall(env!("CARGO_PKG_VERSION"), supported));
     }
 
     #[test]

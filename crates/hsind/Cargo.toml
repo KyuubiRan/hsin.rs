@@ -11,6 +11,7 @@ description = "hsin daemon: storage, secrets, configuration, and proxy"
 hsin-core = { path = "../hsin-core" }
 hsin-ipc = { path = "../hsin-ipc" }
 anyhow = "1"
+age = { version = "0.11", default-features = false }
 atomic-write-file = "0.3"
 axum = "0.8"
 base64 = "0.22"
@@ -42,6 +43,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
+unicode-normalization = "0.1"
 zeroize = { version = "1", features = ["derive"] }
 
 [[bin]]

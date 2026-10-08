@@ -41,8 +41,16 @@ pub const DEFAULT_SOCKET_FILE: &str = "hsind.sock";
 pub const INSTALL_HOME_MARKER: &str = ".hsin-home";
 pub const INSTALL_HOME_MARKER_CONTENT: &str = "hsin-home-v1\n";
 
+#[cfg(test)]
+mod handoff_tests;
+
 /// Stable RPC method names. Renaming one is a protocol-breaking change.
 pub mod method {
+    pub const OFFICIAL_LOGIN_START: &str = "official_account.login.start";
+    pub const OFFICIAL_LOGIN_STATUS: &str = "official_account.login.status";
+    pub const OFFICIAL_LOGIN_SUBMIT: &str = "official_account.login.submit";
+    pub const OFFICIAL_LOGIN_CANCEL: &str = "official_account.login.cancel";
+    pub const OFFICIAL_ACCOUNT_RENAME: &str = "official_account.rename";
     pub const SYSTEM_HELLO: &str = "system.hello";
     pub const PROVIDER_LIST: &str = "provider.list";
     pub const PROVIDER_ADD: &str = "provider.add";
@@ -76,11 +84,14 @@ pub mod method {
 
 /// Optional capabilities negotiated during the mandatory hello exchange.
 pub mod capability {
+    pub const OFFICIAL_ACCOUNTS: &str = "official_accounts.v1";
     pub const PROVIDERS: &str = "providers.v1";
     pub const LOCAL_PROXY: &str = "local_proxy.v1";
     pub const SECURITY: &str = "security.v1";
     pub const CONFIG_SAGA: &str = "config_saga.v1";
     pub const CONFIG_OWNERSHIP: &str = "config_ownership.v1";
+    /// A version-independent hello restricted to the stable config.release RPC.
+    pub const CONFIG_HANDOFF: &str = "config_handoff.v1";
     pub const MODEL_DISCOVERY: &str = "model_discovery.v1";
     pub const CODEX_IMAGE: &str = "codex_image.v1";
     pub const USAGE_STATS: &str = "usage_stats.v1";
@@ -614,6 +625,7 @@ pub struct IpcClient {
     stream: TokioLocalStream,
     next_id: u64,
     handshake_complete: bool,
+    config_release_only: bool,
     call_timeout: Duration,
 }
 
@@ -622,6 +634,7 @@ impl fmt::Debug for IpcClient {
         f.debug_struct("IpcClient")
             .field("next_id", &self.next_id)
             .field("handshake_complete", &self.handshake_complete)
+            .field("config_release_only", &self.config_release_only)
             .field("call_timeout", &self.call_timeout)
             .finish_non_exhaustive()
     }
@@ -656,6 +669,7 @@ impl IpcClient {
             stream,
             next_id: 1,
             handshake_complete: false,
+            config_release_only: false,
             call_timeout: DEFAULT_CALL_TIMEOUT,
         }
     }
@@ -690,6 +704,86 @@ impl IpcClient {
             });
         }
         self.handshake_complete = true;
+        self.config_release_only = false;
+        Ok(result)
+    }
+
+    /// Negotiate only the stable configuration-release protocol with an owner.
+    /// Ordinary CLI hello still requires the exact workspace version code.
+    ///
+    /// # Errors
+    /// Returns transport, protocol, identity or capability errors. The only
+    /// legacy retry is v0.2.9's known version code 33 and ownership-v1 contract.
+    pub async fn hello_for_config_release(
+        &mut self,
+        params: &HelloParams,
+    ) -> Result<HelloResult, TransportError> {
+        const LEGACY_OWNER_CODE: u32 = 33;
+        const HANDOFF_INTRODUCED_CODE: u32 = 34;
+        self.handshake_complete = false;
+        self.config_release_only = true;
+        let mut request = params.clone();
+        request.version_code = VERSION_CODE;
+        if !request
+            .capabilities
+            .iter()
+            .any(|item| item == capability::CONFIG_HANDOFF)
+        {
+            request.capabilities.push(capability::CONFIG_HANDOFF.into());
+        }
+        let first: Result<HelloResult, _> =
+            self.call_inner(method::SYSTEM_HELLO, &request, true).await;
+        let (result, legacy_retry) = match first {
+            Err(TransportError::Rpc(error))
+                if error.data.as_ref().is_some_and(|data| {
+                    data.code == hsin_core::ErrorCode::ProtocolMismatch
+                        && data.args.get("message").is_some_and(|message| {
+                            message == &format!("protocol error: version code {VERSION_CODE} is incompatible with {LEGACY_OWNER_CODE}")
+                        })
+                }) =>
+            {
+                request.version_code = LEGACY_OWNER_CODE;
+                (self.call_inner(method::SYSTEM_HELLO, &request, true).await?, true)
+            }
+            other => (other?, false),
+        };
+        if result.protocol_version != PROTOCOL_VERSION {
+            return Err(TransportError::ProtocolMismatch {
+                expected: PROTOCOL_VERSION,
+                actual: result.protocol_version,
+            });
+        }
+        let supports_handoff = result
+            .capabilities
+            .iter()
+            .any(|item| item == capability::CONFIG_HANDOFF);
+        let compatible = if legacy_retry {
+            result.version_code == LEGACY_OWNER_CODE
+        } else {
+            result.version_code == VERSION_CODE
+                || supports_handoff && result.version_code >= HANDOFF_INTRODUCED_CODE
+        };
+        if !compatible {
+            return Err(TransportError::VersionCodeMismatch {
+                expected: if legacy_retry {
+                    LEGACY_OWNER_CODE
+                } else {
+                    VERSION_CODE
+                },
+                actual: result.version_code,
+            });
+        }
+        if result.instance_id.as_ref().is_none_or(String::is_empty)
+            || !result
+                .capabilities
+                .iter()
+                .any(|item| item == capability::CONFIG_OWNERSHIP)
+        {
+            return Err(TransportError::InvalidRequest(
+                "configuration owner identity or release capability is missing",
+            ));
+        }
+        self.handshake_complete = true;
         Ok(result)
     }
 
@@ -704,6 +798,11 @@ impl IpcClient {
         P: Serialize + ?Sized,
         R: DeserializeOwned,
     {
+        if self.config_release_only && method != method::CONFIG_RELEASE {
+            return Err(TransportError::InvalidRequest(
+                "configuration handoff connection permits only config.release",
+            ));
+        }
         self.call_inner(method, params, false).await
     }
 

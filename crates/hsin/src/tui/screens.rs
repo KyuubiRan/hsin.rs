@@ -19,6 +19,7 @@ mod image_picker;
 mod mapping_models;
 mod model_mapping;
 mod model_picker;
+mod official_account;
 mod provider_form;
 mod settings;
 mod stats;
@@ -163,6 +164,11 @@ fn draw_frame(frame: &mut Frame<'_>, state: &mut State, i18n: &I18n, hits: &mut 
                 &mut HitMap::default(),
             );
             draw_mapping_models(frame, overlay, picker, i18n, hits);
+        }
+        InputMode::OfficialLogin(_)
+        | InputMode::OfficialRename { .. }
+        | InputMode::OfficialSwitch { .. } => {
+            official_account::draw(frame, rows[2], &state.input, i18n);
         }
         InputMode::Settings(_) => unreachable!("settings screen is drawn before the home page"),
         InputMode::Stats(_) => unreachable!("stats screen is drawn before the home page"),

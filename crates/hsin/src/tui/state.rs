@@ -12,13 +12,14 @@ use hsin_core::{
     CodexTuningSettings, ConfigConflictDetails, ConnectionMode, DEFAULT_CODEX_CONFIG_NAME,
     HSIN_CODEX_CONFIG_NAME, LANGUAGE_EN_US, LANGUAGE_SYSTEM, LANGUAGE_ZH_CN, ModelDiscoverParams,
     ModelDiscovery, ModelPrice, ModelPriceInput, ModelPriceList, ModelPriceSource, ModelSlot,
-    ModelUpdate, OPENAI_CODEX_CONFIG_NAME, Provider, ProviderProxyConfig, ProviderProxyMode,
-    ProviderScope, ProxyProtocol, SecretInput, Settings, UpstreamProxyConfig, UpstreamProxyMode,
-    UsageStatsQuery, UsageStatsReport, convert_provider_base_url,
-    normalize_generated_provider_name, provider_name_from_url,
+    ModelUpdate, OPENAI_CODEX_CONFIG_NAME, OfficialAccountDisplay, OfficialLoginState,
+    OfficialLoginStatus, Provider, ProviderProxyConfig, ProviderProxyMode, ProviderScope,
+    ProxyProtocol, SecretInput, Settings, UpstreamProxyConfig, UpstreamProxyMode, UsageStatsQuery,
+    UsageStatsReport, convert_provider_base_url, normalize_generated_provider_name,
+    provider_name_from_url,
 };
 use ratatui::layout::Position;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::rpc::StatusSnapshot;
 
@@ -62,6 +63,8 @@ pub(super) enum Action {
     /// The report for the day the heatmap popup shows.
     DayUsageLoaded(UsageStatsReport),
     PricesLoaded(ModelPriceList),
+    OfficialLoginUpdated(OfficialLoginStatus),
+    OfficialLoginFailed(String),
     /// Drives the timers the UI owns; today only the delete confirmation, which lapses on its own.
     Tick,
 }
@@ -103,6 +106,8 @@ pub(super) struct State {
     pub(super) startup_config_checked: bool,
     /// The model/mapping page that submitted a provider, retained until the mutation completes.
     pub(super) config_origin: Option<InputMode>,
+    /// Selected after a completed login's refresh, without changing the active provider.
+    pub(super) added_official_account: Option<String>,
     /// Filter committed with enter; survives leaving [`InputMode::Search`].
     pub(super) search: String,
     /// Where the cursor sat in each client left behind, so returning to one resumes there instead
@@ -138,6 +143,7 @@ impl Default for State {
             config_takeover: None,
             startup_config_checked: false,
             config_origin: None,
+            added_official_account: None,
             search: String::new(),
             parked: HashMap::new(),
             hits: HitMap::default(),
@@ -191,6 +197,30 @@ pub(super) enum InputMode {
     },
     Settings(SettingsScreen),
     Stats(StatsScreen),
+    OfficialLogin(OfficialLoginDialog),
+    OfficialRename {
+        id: String,
+        revision: u64,
+        name: String,
+        cursor: usize,
+    },
+    OfficialSwitch {
+        client: ClientKind,
+        id: String,
+    },
+}
+
+pub(super) struct OfficialLoginDialog {
+    pub(super) client: ClientKind,
+    pub(super) login_id: Option<String>,
+    pub(super) state: OfficialLoginState,
+    pub(super) browser_url: Option<String>,
+    pub(super) code: Zeroizing<String>,
+    pub(super) cursor: usize,
+    pub(super) error: Option<String>,
+    pub(super) request_pending: bool,
+    pub(super) cancel_requested: bool,
+    pub(super) next_poll: Instant,
 }
 
 pub(super) struct StatsScreen {
@@ -818,6 +848,19 @@ impl State {
             }
             Action::Mouse(mouse) => return self.reduce_mouse(mouse),
             Action::Tick => {
+                if self.pending_effect.is_none()
+                    && let InputMode::OfficialLogin(dialog) = &mut self.input
+                    && !dialog.request_pending
+                    && matches!(
+                        dialog.state,
+                        OfficialLoginState::Starting | OfficialLoginState::AwaitingBrowser
+                    )
+                    && Instant::now() >= dialog.next_poll
+                    && let Some(login_id) = &dialog.login_id
+                {
+                    self.pending_effect = Some(Effect::OfficialLoginStatus(login_id.clone()));
+                    dialog.request_pending = true;
+                }
                 if let InputMode::DeleteConfirm { expires_at, .. } = &self.input
                     && Instant::now() >= *expires_at
                 {
@@ -853,6 +896,18 @@ impl State {
                     *dirty = true;
                 }
                 self.notice = Some(message);
+                self.loading = false;
+            }
+            Action::OfficialLoginUpdated(status) => self.apply_official_login(status),
+            Action::OfficialLoginFailed(message) => {
+                if let InputMode::OfficialLogin(dialog) = &mut self.input {
+                    dialog.error = Some(message);
+                    dialog.request_pending = false;
+                    dialog.state = OfficialLoginState::Failed;
+                    if dialog.cancel_requested && dialog.login_id.is_none() {
+                        self.input = InputMode::Normal;
+                    }
+                }
                 self.loading = false;
             }
             Action::ConfigConflict { operation, details } => {
@@ -956,6 +1011,57 @@ impl State {
         Transition::Continue
     }
 
+    fn apply_official_login(&mut self, status: OfficialLoginStatus) {
+        let InputMode::OfficialLogin(dialog) = &mut self.input else {
+            return;
+        };
+        if dialog
+            .login_id
+            .as_ref()
+            .is_some_and(|id| id != &status.login_id)
+        {
+            return;
+        }
+        dialog.login_id = Some(status.login_id.clone());
+        dialog.request_pending = false;
+        dialog.next_poll = Instant::now() + Duration::from_secs(1);
+        if dialog.cancel_requested
+            && matches!(
+                status.state,
+                OfficialLoginState::Starting | OfficialLoginState::AwaitingBrowser
+            )
+        {
+            dialog.request_pending = true;
+            self.pending_effect = Some(Effect::OfficialLoginCancel(status.login_id));
+            return;
+        }
+        dialog.state = status.state;
+        dialog.error = status
+            .error
+            .map(|error| format!("@error.{}", error.code.as_str()));
+        match status.state {
+            OfficialLoginState::Completed => {
+                self.added_official_account = status.provider_id;
+                self.input = InputMode::Normal;
+                self.queue_without_mode_change(Effect::Refresh);
+                self.notice = Some("@official_account_added".into());
+            }
+            OfficialLoginState::Cancelled => {
+                self.input = InputMode::Normal;
+                self.loading = false;
+            }
+            _ => {
+                if let Some(url) = status.browser_url
+                    && dialog.browser_url.as_ref() != Some(&url)
+                {
+                    dialog.browser_url = Some(url.clone());
+                    self.pending_effect = Some(Effect::OpenOfficialBrowser(url));
+                }
+                self.loading = false;
+            }
+        }
+    }
+
     /// Fold a finished lookup into the dialog that asked for it.
     ///
     /// The dialog has been up the whole time — it ignores keys while `discovering` — so this fills
@@ -1047,6 +1153,16 @@ impl State {
         self.clamp_selection();
         if let Some(index) = self.active_index() {
             self.selected = index;
+        }
+        if let Some(id) = self.added_official_account.take() {
+            self.search.clear();
+            if let Some(index) = self
+                .visible_providers()
+                .iter()
+                .position(|provider| provider.id == id)
+            {
+                self.selected = index;
+            }
         }
         self.prompt_startup_config_takeover();
     }
@@ -2082,7 +2198,20 @@ impl State {
                     }
                     KeyCode::Down | KeyCode::Char('k') => {
                         *selected =
-                            (*selected + 1).min(if *client == ClientKind::Codex { 4 } else { 2 });
+                            (*selected + 1).min(if *client == ClientKind::Codex { 5 } else { 3 });
+                    }
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter
+                        if *selected == if *client == ClientKind::Codex { 5 } else { 3 } =>
+                    {
+                        let display = next_official_account_display(
+                            client_auth.official_account_display(*client),
+                            key.code == KeyCode::Left,
+                        );
+                        self.pending_effect = Some(Effect::SetOfficialAccountDisplay {
+                            client: *client,
+                            display,
+                        });
+                        self.loading = true;
                     }
                     KeyCode::Enter
                         if *client == ClientKind::Codex && matches!(*selected, 2 | 3) =>
@@ -2435,6 +2564,23 @@ impl State {
                         query: self.search.clone(),
                     };
                 }
+                KeyCode::Char('a' | 'A') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    if !self.image_section {
+                        self.input = InputMode::OfficialLogin(OfficialLoginDialog {
+                            client: self.client,
+                            login_id: None,
+                            state: OfficialLoginState::Starting,
+                            browser_url: None,
+                            code: Zeroizing::new(String::new()),
+                            cursor: 0,
+                            error: None,
+                            request_pending: true,
+                            cancel_requested: false,
+                            next_poll: Instant::now() + Duration::from_secs(1),
+                        });
+                        self.pending_effect = Some(Effect::OfficialLoginStart(self.client));
+                    }
+                }
                 KeyCode::Char('a') => {
                     self.input = if self.image_section {
                         InputMode::ImageSource { selected: 0 }
@@ -2445,7 +2591,16 @@ impl State {
                 KeyCode::Char('e') => {
                     if let Some(provider) = self.selected_provider().cloned() {
                         if provider.official {
-                            self.notice = Some("@official_read_only".into());
+                            if saved_official_account(&provider) {
+                                self.input = InputMode::OfficialRename {
+                                    id: provider.id,
+                                    revision: provider.revision,
+                                    cursor: caret_end(&provider.name),
+                                    name: provider.name,
+                                };
+                            } else {
+                                self.notice = Some("@official_read_only".into());
+                            }
                             return Transition::Continue;
                         }
                         if self.image_section && provider.scope == ProviderScope::Primary {
@@ -2553,8 +2708,14 @@ impl State {
                 }
                 KeyCode::Char('d') => {
                     if let Some(provider) = self.selected_provider().cloned() {
-                        if provider.official {
+                        if provider.official && !saved_official_account(&provider) {
                             self.notice = Some("@official_read_only".into());
+                            return Transition::Continue;
+                        }
+                        if saved_official_account(&provider)
+                            && self.active_id() == Some(provider.id.as_str())
+                        {
+                            self.notice = Some("@official_account_active_delete".into());
                             return Transition::Continue;
                         }
                         if !self.image_section
@@ -2581,6 +2742,18 @@ impl State {
                 }
                 KeyCode::Enter => {
                     if let Some(provider) = self.selected_provider() {
+                        let leaving_saved_account = !self.image_section
+                            && self.providers.iter().any(|active| {
+                                self.active_id() == Some(active.id.as_str())
+                                    && saved_official_account(active)
+                            });
+                        if saved_official_account(provider) || leaving_saved_account {
+                            self.input = InputMode::OfficialSwitch {
+                                client: self.client,
+                                id: provider.id.clone(),
+                            };
+                            return Transition::Continue;
+                        }
                         self.queue(if self.image_section {
                             Effect::SwitchImage(provider.id.clone())
                         } else {
@@ -2597,6 +2770,80 @@ impl State {
             InputMode::MappingModels(_) => {
                 unreachable!("mapping model input is handled before home input")
             }
+            InputMode::OfficialLogin(dialog) => match key.code {
+                KeyCode::Esc => {
+                    dialog.code.zeroize();
+                    dialog.cancel_requested = true;
+                    if let Some(login_id) = &dialog.login_id {
+                        self.pending_effect = Some(Effect::OfficialLoginCancel(login_id.clone()));
+                        dialog.request_pending = true;
+                    } else if !dialog.request_pending {
+                        self.input = InputMode::Normal;
+                    }
+                }
+                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(url) = &dialog.browser_url {
+                        self.pending_effect = Some(Effect::OpenOfficialBrowser(url.clone()));
+                    }
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    dialog.code.zeroize();
+                    dialog.cursor = 0;
+                }
+                KeyCode::Enter
+                    if dialog.client == ClientKind::Claude
+                        && !dialog.code.is_empty()
+                        && !dialog.request_pending =>
+                {
+                    if let Some(login_id) = &dialog.login_id {
+                        self.pending_effect = Some(Effect::OfficialLoginSubmit {
+                            login_id: login_id.clone(),
+                            code: std::mem::take(&mut dialog.code),
+                        });
+                        dialog.cursor = 0;
+                        dialog.request_pending = true;
+                    }
+                }
+                _ if dialog.client == ClientKind::Claude
+                    && !dialog.cancel_requested
+                    && (dialog.code.len() < 4096 || !matches!(key.code, KeyCode::Char(_))) =>
+                {
+                    edit_text(&mut dialog.code, &mut dialog.cursor, key);
+                }
+                _ => {}
+            },
+            InputMode::OfficialRename {
+                id,
+                revision,
+                name,
+                cursor,
+            } => match key.code {
+                KeyCode::Esc => self.input = InputMode::Normal,
+                KeyCode::Enter if !name.trim().is_empty() && name.chars().count() <= 128 => {
+                    let effect = Effect::RenameOfficialAccount {
+                        id: id.clone(),
+                        expected_revision: *revision,
+                        name: name.trim().to_owned(),
+                    };
+                    self.input = InputMode::Normal;
+                    self.queue(effect);
+                }
+                _ => {
+                    edit_text(name, cursor, key);
+                }
+            },
+            InputMode::OfficialSwitch { client, id } => match key.code {
+                KeyCode::Esc => self.input = InputMode::Normal,
+                KeyCode::Enter if key.kind != crossterm::event::KeyEventKind::Repeat => {
+                    let effect = Effect::Switch {
+                        client: *client,
+                        id: id.clone(),
+                    };
+                    self.input = InputMode::Normal;
+                    self.queue(effect);
+                }
+                _ => {}
+            },
         }
         Transition::Continue
     }
@@ -3183,6 +3430,11 @@ impl State {
                 query.as_ref().is_none_or(|query| {
                     provider.name.to_ascii_lowercase().contains(query)
                         || provider.base_url.to_ascii_lowercase().contains(query)
+                        || provider
+                            .official_account
+                            .as_ref()
+                            .and_then(|account| account.email.as_ref())
+                            .is_some_and(|email| email.to_ascii_lowercase().contains(query))
                 })
             })
             .collect()
@@ -3312,6 +3564,29 @@ impl State {
             ClientKind::Codex => self.status.codex_active_provider.as_deref(),
             ClientKind::Claude => self.status.claude_active_provider.as_deref(),
         }
+    }
+}
+
+pub(super) fn saved_official_account(provider: &Provider) -> bool {
+    provider.official
+        && provider
+            .official_account
+            .as_ref()
+            .is_some_and(|account| account.saved)
+}
+
+fn next_official_account_display(
+    display: OfficialAccountDisplay,
+    backwards: bool,
+) -> OfficialAccountDisplay {
+    match (display, backwards) {
+        (OfficialAccountDisplay::Email, false) | (OfficialAccountDisplay::NameAndEmail, true) => {
+            OfficialAccountDisplay::Name
+        }
+        (OfficialAccountDisplay::Name, false) | (OfficialAccountDisplay::Email, true) => {
+            OfficialAccountDisplay::NameAndEmail
+        }
+        _ => OfficialAccountDisplay::Email,
     }
 }
 

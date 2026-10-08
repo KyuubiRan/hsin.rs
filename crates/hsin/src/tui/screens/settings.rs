@@ -1,6 +1,6 @@
 use hsin_core::{
-    ClientKind, LANGUAGE_EN_US, LANGUAGE_ZH_CN, ModelPrice, ModelPriceSource, ProxyProtocol,
-    UpstreamProxyMode,
+    ClientKind, LANGUAGE_EN_US, LANGUAGE_ZH_CN, ModelPrice, ModelPriceSource,
+    OfficialAccountDisplay, ProxyProtocol, UpstreamProxyMode,
 };
 use ratatui::{
     Frame,
@@ -345,7 +345,16 @@ pub(super) fn draw_settings_screen(
         SettingsPage::ClientConfig { client, selected } => {
             let disabled = state.client_auth.disable_custom_auth(*client);
             let model_names = state.claude_model_names_enabled;
+            let account_display = official_account_display_label(
+                state.client_auth.official_account_display(*client),
+                i18n,
+            );
             let (detail_title, description, current) = match (*client, *selected) {
+                (ClientKind::Codex, 5) | (ClientKind::Claude, 3) => (
+                    i18n.text("official_account_display"),
+                    i18n.text("settings_official_account_display_description"),
+                    Some(account_display),
+                ),
                 (_, 0) => (
                     i18n.text("disable_custom_auth"),
                     i18n.text("settings_disable_custom_auth_description"),
@@ -423,6 +432,11 @@ pub(super) fn draw_settings_screen(
                 items.push(ListItem::new(i18n.text("context_compact_presets")));
             }
             items.push(ListItem::new(i18n.text("import_current")));
+            items.push(settings_option_item(
+                i18n.text("official_account_display"),
+                account_display,
+                option_width,
+            ));
             (
                 items,
                 *selected,
@@ -609,6 +623,14 @@ pub(super) fn draw_settings_screen(
             true,
         );
     }
+}
+
+fn official_account_display_label(display: OfficialAccountDisplay, i18n: &I18n) -> &str {
+    i18n.text(match display {
+        OfficialAccountDisplay::Email => "official_display_email",
+        OfficialAccountDisplay::Name => "official_display_name",
+        OfficialAccountDisplay::NameAndEmail => "official_display_name_email",
+    })
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]

@@ -594,6 +594,7 @@ fn example_provider() -> Provider {
         base_url: String::from("https://api.example.test/v1"),
         auth_scheme: AuthScheme::Bearer,
         official: false,
+        official_account: None,
         credential_configured: true,
         credential_preview: Some(String::from("sk-abc***de")),
         model: Some(String::from("gpt-5")),
@@ -4965,6 +4966,387 @@ fn footer_hints_name_the_keys_they_press() {
     );
     assert_eq!(hint_key("↑/↓"), None);
     assert_eq!(hint_key("type"), None);
+    assert_eq!(
+        hint_key("alt+a"),
+        Some(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT))
+    );
+}
+
+fn official_account_provider(id: &str) -> Provider {
+    let mut provider = example_provider();
+    provider.id = id.into();
+    provider.name = "Work account".into();
+    provider.official = true;
+    provider.auth_scheme = AuthScheme::OAuth;
+    provider.base_url = "https://api.openai.com/v1".into();
+    provider.official_account = Some(hsin_core::OfficialAccountSummary {
+        email: Some("work@example.test".into()),
+        native_name: Some("Native Name".into()),
+        saved: true,
+    });
+    provider
+}
+
+fn start_official_login(state: &mut State) {
+    state.reduce(Action::Key(KeyEvent::new(
+        KeyCode::Char('a'),
+        KeyModifiers::ALT,
+    )));
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::OfficialLoginStart(_))
+    ));
+}
+
+fn login_status(
+    client: ClientKind,
+    state: hsin_core::OfficialLoginState,
+) -> hsin_core::OfficialLoginStatus {
+    hsin_core::OfficialLoginStatus {
+        login_id: "test-login".into(),
+        client,
+        state,
+        browser_url: None,
+        provider_id: None,
+        error: None,
+    }
+}
+
+#[test]
+fn alt_a_starts_oauth_and_plain_a_still_opens_provider_form() {
+    for client in ClientKind::ALL {
+        let mut state = State {
+            loading: false,
+            client,
+            ..State::default()
+        };
+        start_official_login(&mut state);
+        assert!(
+            matches!(state.input, InputMode::OfficialLogin(ref dialog) if dialog.client == client)
+        );
+        state.reduce(Action::OfficialLoginFailed("failure".into()));
+        state.reduce(key(KeyCode::Esc));
+        assert!(matches!(state.input, InputMode::Normal));
+        state.reduce(key(KeyCode::Char('a')));
+        assert!(matches!(state.input, InputMode::Form(_)));
+    }
+    let mut state = State {
+        image_section: true,
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(Action::Key(KeyEvent::new(
+        KeyCode::Char('a'),
+        KeyModifiers::ALT,
+    )));
+    assert!(matches!(state.input, InputMode::Normal));
+    assert!(state.take_effect().is_none());
+    state.reduce(key(KeyCode::Char('a')));
+    assert!(matches!(state.input, InputMode::ImageSource { .. }));
+}
+
+#[test]
+fn oauth_opens_browser_once_and_supports_explicit_retry() {
+    let mut state = State::default();
+    start_official_login(&mut state);
+    let mut status = login_status(
+        ClientKind::Codex,
+        hsin_core::OfficialLoginState::AwaitingBrowser,
+    );
+    status.browser_url = Some("https://auth.example.test/login".into());
+    state.reduce(Action::OfficialLoginUpdated(status.clone()));
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::OpenOfficialBrowser(_))
+    ));
+    state.reduce(Action::OfficialLoginUpdated(status));
+    assert!(state.take_effect().is_none());
+    state.reduce(Action::Key(KeyEvent::new(
+        KeyCode::Char('o'),
+        KeyModifiers::CONTROL,
+    )));
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::OpenOfficialBrowser(_))
+    ));
+}
+
+#[test]
+fn oauth_tick_polls_at_most_once_while_request_is_pending() {
+    let mut state = State::default();
+    start_official_login(&mut state);
+    state.reduce(Action::OfficialLoginUpdated(login_status(
+        ClientKind::Codex,
+        hsin_core::OfficialLoginState::AwaitingBrowser,
+    )));
+    let InputMode::OfficialLogin(dialog) = &mut state.input else {
+        panic!("login dialog")
+    };
+    dialog.next_poll = std::time::Instant::now();
+    state.reduce(Action::Tick);
+    assert!(
+        matches!(state.take_effect(), Some(Effect::OfficialLoginStatus(id)) if id == "test-login")
+    );
+    state.reduce(Action::Tick);
+    assert!(state.take_effect().is_none());
+}
+
+#[test]
+fn claude_oauth_code_is_masked_then_removed_on_submit() {
+    let mut state = State {
+        client: ClientKind::Claude,
+        ..State::default()
+    };
+    start_official_login(&mut state);
+    state.reduce(Action::OfficialLoginUpdated(login_status(
+        ClientKind::Claude,
+        hsin_core::OfficialLoginState::AwaitingBrowser,
+    )));
+    type_query(&mut state, "private-test-code#state");
+    let text = render(&mut state, 110, 32);
+    assert!(!text.contains("private-test-code"));
+    assert!(text.contains("••••"));
+    state.reduce(key(KeyCode::Enter));
+    assert!(
+        matches!(state.take_effect(), Some(Effect::OfficialLoginSubmit { login_id, code }) if login_id == "test-login" && code.as_str() == "private-test-code#state")
+    );
+    assert!(
+        matches!(state.input, InputMode::OfficialLogin(ref dialog) if dialog.code.is_empty() && dialog.request_pending)
+    );
+}
+
+#[test]
+fn oauth_cancel_before_start_response_cancels_the_returned_job() {
+    let mut state = State::default();
+    start_official_login(&mut state);
+    state.reduce(key(KeyCode::Esc));
+    assert!(matches!(state.input, InputMode::OfficialLogin(ref dialog) if dialog.cancel_requested));
+    state.reduce(Action::OfficialLoginUpdated(login_status(
+        ClientKind::Codex,
+        hsin_core::OfficialLoginState::AwaitingBrowser,
+    )));
+    assert!(
+        matches!(state.take_effect(), Some(Effect::OfficialLoginCancel(id)) if id == "test-login")
+    );
+    state.reduce(Action::OfficialLoginUpdated(login_status(
+        ClientKind::Codex,
+        hsin_core::OfficialLoginState::Cancelled,
+    )));
+    assert!(matches!(state.input, InputMode::Normal));
+}
+
+#[test]
+fn oauth_cancel_clears_code_and_ignores_further_typing() {
+    let mut state = State {
+        client: ClientKind::Claude,
+        ..State::default()
+    };
+    start_official_login(&mut state);
+    state.reduce(Action::OfficialLoginUpdated(login_status(
+        ClientKind::Claude,
+        hsin_core::OfficialLoginState::AwaitingBrowser,
+    )));
+    type_query(&mut state, "private-code");
+    state.reduce(key(KeyCode::Esc));
+    assert!(matches!(
+        state.take_effect(),
+        Some(Effect::OfficialLoginCancel(_))
+    ));
+    type_query(&mut state, "ignored");
+    assert!(matches!(state.input, InputMode::OfficialLogin(ref dialog) if dialog.code.is_empty()));
+}
+
+#[test]
+fn oauth_completion_selects_saved_account_and_keeps_active_provider() {
+    let mut state = State {
+        loading: false,
+        startup_config_checked: true,
+        ..State::default()
+    };
+    state.providers = vec![example_provider()];
+    state.status.codex_active_provider = Some("provider-1".into());
+    start_official_login(&mut state);
+    let mut status = login_status(ClientKind::Codex, hsin_core::OfficialLoginState::Completed);
+    status.provider_id = Some("account-a".into());
+    state.reduce(Action::OfficialLoginUpdated(status));
+    assert!(matches!(state.input, InputMode::Normal));
+    assert!(matches!(state.take_effect(), Some(Effect::Refresh)));
+    state.reduce(Action::Loaded {
+        providers: vec![example_provider(), official_account_provider("account-a")],
+        status: state.status.clone(),
+        settings: Settings::default(),
+    });
+    assert_eq!(state.active_id(), Some("provider-1"));
+    assert_eq!(
+        state
+            .selected_provider()
+            .map(|provider| provider.id.as_str()),
+        Some("account-a")
+    );
+    assert!(state.take_effect().is_none());
+}
+
+#[test]
+fn completed_login_wins_cancel_race_without_repeated_cancellation() {
+    let mut state = State::default();
+    start_official_login(&mut state);
+    state.reduce(key(KeyCode::Esc));
+    let mut status = login_status(ClientKind::Codex, hsin_core::OfficialLoginState::Completed);
+    status.provider_id = Some("account-a".into());
+    state.reduce(Action::OfficialLoginUpdated(status));
+    assert!(matches!(state.input, InputMode::Normal));
+    assert!(matches!(state.take_effect(), Some(Effect::Refresh)));
+}
+
+#[test]
+fn saved_account_name_edit_uses_dedicated_rpc_effect() {
+    let mut state = State {
+        providers: vec![official_account_provider("account-a")],
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Char('e')));
+    assert!(matches!(state.input, InputMode::OfficialRename { .. }));
+    state.reduce(key(KeyCode::Enter));
+    assert!(
+        matches!(state.take_effect(), Some(Effect::RenameOfficialAccount { id, expected_revision: 1, name }) if id == "account-a" && name == "Work account")
+    );
+}
+
+#[test]
+fn saved_account_delete_requires_inactive_and_native_remains_read_only() {
+    let mut state = State {
+        providers: vec![official_account_provider("account-a")],
+        loading: false,
+        ..State::default()
+    };
+    state.status.codex_active_provider = Some("account-a".into());
+    state.reduce(key(KeyCode::Char('d')));
+    assert!(matches!(state.input, InputMode::Normal));
+    assert_eq!(
+        state.notice.as_deref(),
+        Some("@official_account_active_delete")
+    );
+    state.status.codex_active_provider = None;
+    state.reduce(key(KeyCode::Char('d')));
+    state.reduce(key(KeyCode::Char('d')));
+    assert!(matches!(state.take_effect(), Some(Effect::Remove { id, .. }) if id == "account-a"));
+    state.providers[0].official_account.as_mut().unwrap().saved = false;
+    state.reduce(key(KeyCode::Char('e')));
+    assert!(matches!(state.input, InputMode::Normal));
+    state.reduce(key(KeyCode::Char('d')));
+    assert!(matches!(state.input, InputMode::Normal));
+}
+
+#[test]
+fn saved_account_switch_warns_then_uses_existing_switch_effect() {
+    let mut state = State {
+        providers: vec![official_account_provider("account-a")],
+        loading: false,
+        ..State::default()
+    };
+    state.reduce(key(KeyCode::Enter));
+    assert!(matches!(state.input, InputMode::OfficialSwitch { .. }));
+    assert!(state.take_effect().is_none());
+    assert!(render(&mut state, 110, 30).contains("Close this client's existing sessions"));
+    let mut repeat = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    repeat.kind = KeyEventKind::Repeat;
+    state.reduce(Action::Key(repeat));
+    assert!(state.take_effect().is_none());
+    state.reduce(key(KeyCode::Enter));
+    assert!(
+        matches!(state.take_effect(), Some(Effect::Switch { client: ClientKind::Codex, id }) if id == "account-a")
+    );
+}
+
+#[test]
+fn leaving_saved_account_warns_for_api_and_native_official_destinations() {
+    for native_official in [false, true] {
+        let mut destination = example_provider();
+        destination.id = "destination".into();
+        destination.official = native_official;
+        destination.auth_scheme = if native_official {
+            AuthScheme::OAuth
+        } else {
+            AuthScheme::Bearer
+        };
+        let mut state = State {
+            providers: vec![destination, official_account_provider("account-a")],
+            loading: false,
+            ..State::default()
+        };
+        state.status.codex_active_provider = Some("account-a".into());
+        state.reduce(key(KeyCode::Enter));
+        assert!(matches!(state.input, InputMode::OfficialSwitch { .. }));
+        assert!(state.take_effect().is_none());
+        state.reduce(key(KeyCode::Enter));
+        assert!(
+            matches!(state.take_effect(), Some(Effect::Switch { client: ClientKind::Codex, id }) if id == "destination")
+        );
+    }
+}
+
+#[test]
+fn official_display_settings_and_email_search_follow_each_client() {
+    use hsin_core::OfficialAccountDisplay;
+    let mut state = State {
+        providers: vec![official_account_provider("account-a")],
+        loading: false,
+        ..State::default()
+    };
+    for (display, expected) in [
+        (OfficialAccountDisplay::Email, "work@example.test"),
+        (OfficialAccountDisplay::Name, "Work account"),
+        (
+            OfficialAccountDisplay::NameAndEmail,
+            "Work account · work@example.test",
+        ),
+    ] {
+        state.client_auth.codex_official_account_display = display;
+        assert!(render(&mut state, 180, 35).contains(expected));
+    }
+    state.providers[0].official_account.as_mut().unwrap().saved = false;
+    for (display, expected) in [
+        (OfficialAccountDisplay::Email, "work@example.test"),
+        (OfficialAccountDisplay::Name, "Native Name"),
+        (
+            OfficialAccountDisplay::NameAndEmail,
+            "Native Name · work@example.test",
+        ),
+    ] {
+        state.client_auth.codex_official_account_display = display;
+        let screen = render(&mut state, 180, 35);
+        assert!(screen.contains(expected));
+        assert!(!screen.contains("Native login / restore"));
+    }
+    state.providers[0]
+        .official_account
+        .as_mut()
+        .unwrap()
+        .native_name = None;
+    state.client_auth.codex_official_account_display = OfficialAccountDisplay::Name;
+    assert!(render(&mut state, 180, 35).contains("work@example.test"));
+    state.providers[0].official_account.as_mut().unwrap().saved = true;
+    state.providers[0].official_account.as_mut().unwrap().email = None;
+    state.client_auth.codex_official_account_display = OfficialAccountDisplay::Email;
+    assert!(render(&mut state, 180, 35).contains("Work account"));
+    state.providers[0].official_account.as_mut().unwrap().email = Some("work@example.test".into());
+    state.search = "work@example".into();
+    assert_eq!(state.visible_providers().len(), 1);
+    for client in ClientKind::ALL {
+        state.input = InputMode::Settings(SettingsScreen {
+            selected: 0,
+            page: SettingsPage::ClientConfig {
+                client,
+                selected: if client == ClientKind::Codex { 5 } else { 3 },
+            },
+        });
+        state.client_auth.codex_official_account_display = OfficialAccountDisplay::Email;
+        state.reduce(key(KeyCode::Right));
+        assert!(
+            matches!(state.take_effect(), Some(Effect::SetOfficialAccountDisplay { client: changed, display: OfficialAccountDisplay::Name }) if changed == client)
+        );
+    }
 }
 
 #[test]

@@ -128,14 +128,23 @@ first restores the previous instance's preserved settings and authentication,
 then transfers ownership. That instance will not reapply the relinquished client
 on restart.
 If the previous instance cannot safely restore its state, takeover is refused.
+Configuration handoff negotiates its own stable release protocol, so compatible
+instances can transfer ownership even when their release version codes differ.
+This connection permits only `config.release`; ordinary CLI connections still
+require an exact daemon version code and reinstall their own daemon on mismatch.
+The v0.2.9 owner (version code 33) has a narrowly validated compatibility path.
+An incompatible wire protocol or ownership format still requires an owner upgrade.
 
 When upgrading an older instance, an existing hsin configuration may have no
-ownership record yet. Safe takeover is blocked until the previous managing
-instance switches the client to Official and restores its native configuration,
-or the client is signed in again to establish a native baseline. An old local
-authentication backup alone is not proof that it belongs to the current shared
-configuration. If an owner is offline, start it; if its key store is locked,
-unlock it; if it lacks the handoff protocol, upgrade it before retrying.
+ownership record yet. At startup, Codex configuration is migrated when its last
+completed local write, provider, helper, current configuration and preserved
+authentication can be verified together. Migration preserves the selected
+provider and client files, including third-party API authentication; official
+login is not required. An old local authentication backup alone is not proof
+that it belongs to the current shared configuration. Unverified legacy state
+still requires restoration by the previous managing instance or a fresh native
+baseline before takeover. If an owner is offline, start it; if its key store is
+locked, unlock it; if it lacks the handoff protocol, upgrade it before retrying.
 
 ## Usage
 
@@ -194,6 +203,36 @@ credential through `[model_providers.hsin.auth]`. Hsin never writes the real
 provider key or an environment-variable value into Codex configuration. Enable
 this only after signing in through the Official provider; enabling it also turns
 Hsin Auth back on. Enabling **Disable custom Auth** later turns preservation off.
+
+Codex and Claude Code support saved official accounts. On a client provider
+list, press **Alt+A** to start OAuth using the installed official CLI. Codex uses
+its app server; Claude uses `claude auth login --claudeai` and requires Claude
+Code 2.1.126 or newer. Claude Pro, Max, Team, and Enterprise accounts are supported;
+Console OAuth is excluded. Hsin shows the browser login progress and accepts a
+Claude authorization code when needed. Cancel stops the isolated login and
+removes its temporary credentials. Missing or incompatible CLIs produce an
+upgrade hint; hsin does not install them.
+
+Windows official-account operations require Codex 0.161 or newer so its native
+encrypted secrets backend matches the account adapter. Native storage is based
+on Codex 0.161 and Claude Code 2.1.293; real browser login and new-session account
+switching still need platform acceptance before a release.
+
+Login adds the account without changing your active provider. Close existing
+client sessions, select a saved account, and press **Enter** to enable it for
+new sessions. **e** edits its name; **d** removes an inactive saved account from
+the local vault. Switch away before deleting the active account. Client settings
+offer **Email** (default), **Name**, or **Name + email** display, with a fallback
+when an account has no email or name.
+
+Hsin automatically saves persistent native official logins in its encrypted
+vault. API-only configurations do not create an official account. Signing in
+again with the same identity and organization refreshes its credentials and
+keeps your custom name. The fixed **Official** entry remains separate and
+restores the native login present before account switching. Codex supports
+file, keyring, and auto auth storage; Claude preserves unrelated credentials
+and account configuration. External account changes produce a conflict so
+hsin cannot silently overwrite the new login.
 
 Each primary Codex Provider's add/edit form has **Context override**,
 **Reasoning effort**, and **Plan mode reasoning effort** above
