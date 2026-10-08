@@ -1206,18 +1206,41 @@ fn snapshot_rejects_unowned_fields_and_wrong_client() {
 
 #[test]
 fn separate_store_guards_conflict_and_nested_guard_is_safe() {
+    for client in ClientKind::ALL {
+        let fixture = Fixture::new();
+        let first = match client {
+            ClientKind::Codex => fixture.codex(""),
+            ClientKind::Claude => fixture.claude(false),
+        };
+        let second = match client {
+            ClientKind::Codex => fixture.codex(""),
+            ClientKind::Claude => fixture.claude(false),
+        };
+        let assert_conflict = || match second.lock_for_switch() {
+            Err(DaemonError::Conflict(_)) => {}
+            Err(error) => panic!("native {client:?} lock contention was misclassified: {error:?}"),
+            Ok(_) => panic!("native {client:?} lock allowed a second owner"),
+        };
+        let guard = first.lock_for_switch().unwrap();
+        assert_conflict();
+        let nested = first.lock_for_switch().unwrap();
+        drop(nested);
+        assert_conflict();
+        drop(guard);
+        assert!(second.lock_for_switch().is_ok());
+    }
+}
+
+#[test]
+fn native_lock_io_failure_is_not_reported_as_contention() {
     let fixture = Fixture::new();
-    let first = fixture.codex("");
-    let second = fixture.codex("");
-    let guard = first.lock_for_switch().unwrap();
-    assert!(matches!(
-        second.lock_for_switch(),
-        Err(DaemonError::Conflict(_))
-    ));
-    let nested = first.lock_for_switch().unwrap();
-    drop(nested);
-    drop(guard);
-    assert!(second.lock_for_switch().is_ok());
+    let store = fixture.codex("");
+    fs::create_dir(&store.lock_path).unwrap();
+    match store.lock_for_switch() {
+        Err(DaemonError::Io(_)) => {}
+        Err(error) => panic!("native lock I/O failure was misclassified: {error:?}"),
+        Ok(_) => panic!("native lock unexpectedly opened a directory as its lock file"),
+    }
 }
 
 #[test]

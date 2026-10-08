@@ -333,7 +333,9 @@ impl NativeAuthStore {
                 }
                 let file = options.open(&self.lock_path)?;
                 FileExt::try_lock_exclusive(&file).map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::WouldBlock {
+                    // Windows reports ERROR_LOCK_VIOLATION rather than WouldBlock.
+                    // Match fs2's native contention code, as ownership locks do.
+                    if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
                         DaemonError::Conflict("native authentication is being switched".into())
                     } else {
                         DaemonError::Io(error)

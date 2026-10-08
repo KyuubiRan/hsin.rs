@@ -13,6 +13,11 @@ mod sync_output;
 #[cfg(windows)]
 mod windows_tree;
 
+// Cold PowerShell startup can exceed five seconds while the system is busy.
+// Metadata probes remain bounded and never authorize cleanup on a timeout.
+#[cfg(windows)]
+const WINDOWS_METADATA_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub(super) fn process_start(pid: u32) -> Result<String> {
     if pid == 0 {
         return Err(unavailable());
@@ -52,7 +57,7 @@ pub(super) fn process_start(pid: u32) -> Result<String> {
 #[cfg(not(target_os = "linux"))]
 fn read_command(command: &mut Command) -> Result<String> {
     #[cfg(windows)]
-    let output = sync_output::bounded_output(command, Duration::from_secs(5))?;
+    let output = sync_output::bounded_output(command, WINDOWS_METADATA_TIMEOUT)?;
     #[cfg(not(windows))]
     let output = command
         .stdin(Stdio::null())
@@ -242,7 +247,9 @@ fn signal_kill(pid: u32, group: bool) -> Result<std::process::ExitStatus> {
         pid.to_string()
     };
     Ok(Command::new("/bin/kill")
-        .args(["-KILL", &target])
+        // Linux kill otherwise parses a negative process-group id as another
+        // signal option, so separate the target from the options explicitly.
+        .args(["-KILL", "--", &target])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

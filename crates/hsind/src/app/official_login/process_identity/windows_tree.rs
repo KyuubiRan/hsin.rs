@@ -2,7 +2,7 @@
 use std::process::{Command, ExitStatus, Stdio};
 
 use super::sync_output::bounded_output;
-use super::{is_absent, process_start, unavailable};
+use super::{WINDOWS_METADATA_TIMEOUT, is_absent, process_start, unavailable};
 use crate::error::Result;
 
 #[derive(serde::Deserialize)]
@@ -20,7 +20,7 @@ pub(super) fn capture(root: u32) -> Result<Vec<Member>> {
             .args(["-NoProfile", "-NonInteractive", "-Command", &expression])
             .stdin(Stdio::null())
             .stderr(Stdio::null()),
-        std::time::Duration::from_secs(5),
+        WINDOWS_METADATA_TIMEOUT,
     )?;
     if !output.status.success() {
         return Err(unavailable());
