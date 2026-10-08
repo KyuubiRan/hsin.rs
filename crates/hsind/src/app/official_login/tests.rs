@@ -613,13 +613,14 @@ echo 'Login successful.'
     })
     .await
     .unwrap();
-    assert!(
+    assert_eq!(
         fixture
             .app
             .db
             .list_providers(Some(ClientKind::Claude))
             .unwrap()
-            .is_empty()
+            .len(),
+        0
     );
     fixture
         .app

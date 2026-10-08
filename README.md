@@ -215,8 +215,9 @@ upgrade hint; hsin does not install them.
 
 Windows official-account operations require Codex 0.161 or newer so its native
 encrypted secrets backend matches the account adapter. Native storage is based
-on Codex 0.161 and Claude Code 2.1.293; real browser login and new-session account
-switching still need platform acceptance before a release.
+on Codex 0.161 and Claude Code 2.1.293. Automated tests cover storage and login
+lifecycle; real browser login and new-session account switching remain manual
+platform acceptance items.
 
 Login adds the account without changing your active provider. Close existing
 client sessions, select a saved account, and press **Enter** to enable it for

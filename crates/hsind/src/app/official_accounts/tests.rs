@@ -514,7 +514,7 @@ async fn official_api_round_trip_preserves_refresh_and_restores_native_login() {
                 .account_id,
             "native"
         );
-        assert!(fixture.app.db.pending_operations().unwrap().is_empty());
+        assert_eq!(fixture.app.db.pending_operations().unwrap().len(), 0);
     }
 }
 
@@ -674,7 +674,7 @@ async fn interrupted_native_switch_recovers_from_encrypted_snapshots() {
                 .account_id,
             "a"
         );
-        assert!(fixture.app.db.pending_operations().unwrap().is_empty());
+        assert_eq!(fixture.app.db.pending_operations().unwrap().len(), 0);
     }
 }
 
@@ -819,7 +819,7 @@ async fn a_half_written_claude_switch_recovers_both_resources() {
             .account_id,
         "a"
     );
-    assert!(fixture.app.db.pending_operations().unwrap().is_empty());
+    assert_eq!(fixture.app.db.pending_operations().unwrap().len(), 0);
 }
 
 fn handoff(fixture: &Fixture, other: &App, client: ClientKind) -> hsin_core::ConfigTakeoverParams {
@@ -996,7 +996,7 @@ async fn interrupted_handoff_reuses_the_original_restore_snapshot() {
             "native"
         );
         assert!(fixture.app.db.setting(&restore_key).unwrap().is_none());
-        assert!(fixture.app.db.pending_operations().unwrap().is_empty());
+        assert_eq!(fixture.app.db.pending_operations().unwrap().len(), 0);
         other.takeover_configuration(request).await.unwrap();
     }
 }
