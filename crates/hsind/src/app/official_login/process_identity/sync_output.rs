@@ -18,11 +18,14 @@ pub(super) fn bounded_output(command: &mut Command, timeout: Duration) -> Result
         // The daemon has no console. Creating one for a metadata probe can
         // stall its host initialization and must never display a window.
         .creation_flags(0x0800_0000)
-        .stdin(Stdio::null())
+        // NUL is a character-device handle on Windows. Give console hosts
+        // actual redirected input with EOF instead of a console-like device.
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
-    let Some(stdout) = child.stdout.take() else {
+    drop(child.stdin.take());
+    let (Some(stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
         let _ = child.kill();
         let _ = child.wait();
         return Err(unavailable());
@@ -35,6 +38,13 @@ pub(super) fn bounded_output(command: &mut Command, timeout: Duration) -> Result
             .read_to_end(&mut output)
             .map(|_| output);
         let _ = sender.send(result);
+    });
+    let (stderr_sender, stderr_receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        // Drain both redirected streams so the probe cannot block on a full
+        // pipe. Diagnostics stay discarded and never enter daemon errors.
+        let result = std::io::copy(&mut stderr, &mut std::io::sink()).map(|_| ());
+        let _ = stderr_sender.send(result);
     });
     let deadline = Instant::now() + timeout;
     let status = loop {
@@ -51,6 +61,9 @@ pub(super) fn bounded_output(command: &mut Command, timeout: Duration) -> Result
         }
     };
     let output = receiver
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|_| DaemonError::Config("isolated process metadata output timed out".into()))??;
+    stderr_receiver
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))
         .map_err(|_| DaemonError::Config("isolated process metadata output timed out".into()))??;
     if output.len() as u64 > MAX_OUTPUT {
@@ -83,13 +96,37 @@ mod tests {
     fn redirected_dotnet_output_is_drained_and_the_exit_status_is_retained() {
         for code in [0, 7] {
             let output = bounded_output(
-                &mut dotnet_command(&format!("[Console]::Out.Write('hsin-probe'); exit {code}")),
+                &mut dotnet_command(&format!(
+                    "[Console]::Error.Write(('x' * 131072)); [Console]::Out.Write('hsin-probe'); exit {code}"
+                )),
                 super::super::WINDOWS_METADATA_TIMEOUT,
             )
             .unwrap();
             assert_eq!(output.status.code(), Some(code));
             assert_eq!(output.stdout, b"hsin-probe");
+            assert_eq!(output.stderr.len(), 0);
         }
+    }
+
+    #[test]
+    fn redirected_dotnet_input_reaches_eof_without_a_console() {
+        let output = bounded_output(
+            &mut dotnet_command("[Console]::Out.Write([Console]::In.ReadToEnd().Length); exit 0"),
+            super::super::WINDOWS_METADATA_TIMEOUT,
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"0");
+    }
+
+    #[test]
+    fn cmd_output_uses_the_same_bounded_pipe_capture() {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/C", "echo hsin-cmd-probe"]);
+        let output = bounded_output(&mut command, super::super::WINDOWS_METADATA_TIMEOUT).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"hsin-cmd-probe\r\n");
+        assert_eq!(output.stderr.len(), 0);
     }
 
     #[test]
