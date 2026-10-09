@@ -342,6 +342,7 @@ fn remove_codex_ownership_for_legacy_upgrade(fixture: &Instances) {
         .unwrap();
     if let Some(mut snapshot) = app.codex_auth_backup().unwrap() {
         snapshot.lease = None;
+        snapshot.auth_path = legacy_auth_spelling(fixture).to_string_lossy().into_owned();
         let mut snapshot = serde_json::to_value(&snapshot).unwrap();
         snapshot.as_object_mut().unwrap().remove("lease");
         let serialized = Zeroizing::new(serde_json::to_vec(&snapshot).unwrap());
@@ -363,6 +364,40 @@ fn remove_codex_ownership_for_legacy_upgrade(fixture: &Instances) {
         ))
         .unwrap();
     fs::remove_file(fixture.temporary.0.join("codex/.hsin-config-owner.json")).unwrap();
+}
+
+/// Releases before configuration ownership recorded the auth path as the
+/// environment spelled it, never in the normalized form current releases use;
+/// on Windows that form also gains the verbatim `\\?\` prefix.
+fn legacy_auth_spelling(fixture: &Instances) -> PathBuf {
+    let spelled = fixture
+        .temporary
+        .0
+        .join("codex")
+        .join("..")
+        .join("codex")
+        .join("auth.json");
+    assert_ne!(
+        spelled,
+        config::codex_auth_path(&fixture.first.config_path(ClientKind::Codex).unwrap()).unwrap()
+    );
+    spelled
+}
+
+/// Legacy proxy mode journaled only provider edits that rewrote the configuration.
+fn edit_without_journal(app: &App, id: &str, edit: impl FnOnce(&mut Provider), key: Option<&str>) {
+    let mut provider = app.db.get_provider(id).unwrap();
+    let expected_revision = provider.revision;
+    edit(&mut provider);
+    let secret = key.map(|key| app.crypto.encrypt_for(&provider, key).unwrap());
+    app.db
+        .update_provider(
+            &provider,
+            expected_revision,
+            secret.as_ref(),
+            ProtectedValueMutation::Preserve,
+        )
+        .unwrap();
 }
 
 fn stage_legacy_codex_claim(fixture: &Instances) -> (Target, Record) {
@@ -469,13 +504,12 @@ async fn legacy_codex_upgrade_preserves_api_only_and_absent_auth_without_officia
                 Some(custom.id.clone())
             );
             if !preserve {
-                assert!(
-                    upgraded
-                        .codex_auth_backup()
+                let backup = upgraded.codex_auth_backup().unwrap().unwrap();
+                assert!(backup.lease.is_some());
+                assert_eq!(
+                    PathBuf::from(&backup.auth_path),
+                    config::codex_auth_path(&upgraded.config_path(ClientKind::Codex).unwrap())
                         .unwrap()
-                        .unwrap()
-                        .lease
-                        .is_some()
                 );
             }
             let owner_record = fixture.owner_record(ClientKind::Codex);
@@ -625,9 +659,106 @@ async fn legacy_codex_upgrade_rejects_foreign_or_changed_configuration_and_backu
         );
         assert_eq!(fs::read(fixture.codex_config()).unwrap(), configured);
         assert!(fs::read(fixture.codex_auth()).unwrap() == auth);
-        assert!(!ownership(&fixture.first, ClientKind::Codex).takeover_available);
+        let status = ownership(&fixture.first, ClientKind::Codex);
+        assert!(!status.takeover_available);
+        assert!(status.owner.is_none());
+        let block = match corruption {
+            "helper" | "revision" | "endpoint" | "auth" => "files_changed",
+            "unreadable_backup" => "migration_failed",
+            "journal" => "no_journal",
+            "pending" => "in_flight",
+            _ => "backup_mismatch",
+        };
+        assert!(
+            status
+                .takeover_unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(&format!("legacy_unclaimed:{block}:"))),
+            "{corruption}: {:?}",
+            status.takeover_unavailable_reason
+        );
         fixture.second.migrate_legacy_codex_configuration().unwrap();
         assert!(!ownership(&fixture.second, ClientKind::Codex).owner_is_self);
+    }
+}
+
+#[tokio::test]
+async fn legacy_codex_state_recovers_from_a_manual_third_party_native_baseline() {
+    for keep_api_key in [false, true] {
+        let fixture = Instances::new();
+        fs::write(
+            fixture.codex_auth(),
+            "{\"auth_mode\":\"apikey\",\"OPENAI_API_KEY\":\"original-api-fixture\"}\n",
+        )
+        .unwrap();
+        let custom = add(&fixture.first, draft(ClientKind::Codex, "Unproven legacy")).await;
+        activate(&fixture.first, &custom).await;
+        remove_codex_ownership_for_legacy_upgrade(&fixture);
+        // A managed field edited outside hsin leaves the ownership unprovable.
+        fs::write(
+            fixture.codex_auth(),
+            "{\"auth_mode\":\"apikey\",\"OPENAI_API_KEY\":\"external-fixture-key\"}\n",
+        )
+        .unwrap();
+        let upgraded = fixture.reopen_first();
+        upgraded.migrate_legacy_codex_configuration().unwrap();
+        assert!(
+            ownership(&upgraded, ClientKind::Codex)
+                .takeover_unavailable_reason
+                .is_some_and(|reason| reason.starts_with("legacy_unclaimed:files_changed:"))
+        );
+        // The documented recovery: remove hsin's selector and provider table,
+        // and the API key from auth.json, keeping every other field.
+        fs::write(
+            fixture.codex_config(),
+            "# user configuration\nmodel = \"user-model\"\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.codex_auth(),
+            if keep_api_key {
+                "{\"auth_mode\":\"apikey\",\"OPENAI_API_KEY\":\"external-fixture-key\"}\n"
+            } else {
+                "{\"auth_mode\":\"apikey\"}\n"
+            },
+        )
+        .unwrap();
+        let status = ownership(&upgraded, ClientKind::Codex);
+        if keep_api_key {
+            // An API key may have been left by another managing instance.
+            assert!(
+                status
+                    .takeover_unavailable_reason
+                    .is_some_and(|reason| reason.starts_with("legacy_unclaimed:"))
+            );
+            assert_ownership_conflict(
+                upgraded
+                    .switch_provider(ProviderSwitchParams {
+                        client: ClientKind::Codex,
+                        provider_id: custom.id.clone(),
+                    })
+                    .await,
+            );
+            continue;
+        }
+        assert!(status.takeover_unavailable_reason.is_none());
+        activate(&upgraded, &custom).await;
+        assert!(ownership(&upgraded, ClientKind::Codex).owner_is_self);
+        assert!(
+            config::has_legacy_hsin_configuration(ClientKind::Codex, &fixture.codex_config())
+                .unwrap()
+        );
+        let restarted = fixture.reopen_first();
+        restarted.migrate_legacy_codex_configuration().unwrap();
+        assert!(ownership(&restarted, ClientKind::Codex).owner_is_self);
+        let official = restarted
+            .ensure_official_provider(ClientKind::Codex)
+            .unwrap();
+        activate(&restarted, &official).await;
+        // The fresh baseline, not the quarantined legacy snapshot, is restored.
+        let restored = read_json(&fixture.codex_auth());
+        assert!(restored["auth_mode"] == "apikey");
+        assert!(restored.get("OPENAI_API_KEY").is_none());
     }
 }
 
@@ -793,6 +924,116 @@ async fn legacy_codex_upgrade_preserves_a_proxy_route_switched_without_rewriting
         .unwrap()
         .unwrap();
     assert_eq!(provider.id, selected.id);
+}
+
+#[tokio::test]
+async fn legacy_codex_upgrade_accepts_unjournaled_proxy_edits_that_never_reached_the_file() {
+    for edit in ["rename", "rekey", "clear_model", "removed"] {
+        let fixture = Instances::new();
+        let mut journaled = draft(ClientKind::Codex, "Journaled route");
+        journaled.model = Some("journaled-model".into());
+        let journaled = add(&fixture.first, journaled).await;
+        fixture
+            .first
+            .db
+            .set_mode(ClientKind::Codex, ConnectionMode::Proxy)
+            .unwrap();
+        activate(&fixture.first, &journaled).await;
+        remove_codex_ownership_for_legacy_upgrade(&fixture);
+        let mut active = journaled.id.clone();
+        match edit {
+            // Clearing the model never removed the line hsin had written.
+            "clear_model" => edit_without_journal(
+                &fixture.first,
+                &journaled.id,
+                |provider| provider.model = None,
+                None,
+            ),
+            "rename" => edit_without_journal(
+                &fixture.first,
+                &journaled.id,
+                |provider| provider.name = "Renamed route".into(),
+                None,
+            ),
+            "rekey" => edit_without_journal(
+                &fixture.first,
+                &journaled.id,
+                |_| {},
+                Some("rotated-fixture-key"),
+            ),
+            _ => {
+                let selected =
+                    add(&fixture.first, draft(ClientKind::Codex, "Selected route")).await;
+                fixture
+                    .first
+                    .db
+                    .set_active(ClientKind::Codex, &selected.id, "synchronized")
+                    .unwrap();
+                fixture.first.db.remove_provider(&journaled.id).unwrap();
+                active = selected.id;
+            }
+        }
+        let configured = fs::read(fixture.codex_config()).unwrap();
+        let auth = fs::read(fixture.codex_auth()).unwrap();
+        let upgraded = fixture.reopen_first();
+        upgraded.migrate_legacy_codex_configuration().unwrap();
+        assert!(
+            ownership(&upgraded, ClientKind::Codex).owner_is_self,
+            "{edit}"
+        );
+        assert_eq!(fs::read(fixture.codex_config()).unwrap(), configured);
+        assert!(fs::read(fixture.codex_auth()).unwrap() == auth);
+        upgraded.reconcile_proxy_configurations().unwrap();
+        let provider = upgraded
+            .current_configuration_provider(ClientKind::Codex)
+            .unwrap()
+            .unwrap();
+        assert_eq!(provider.id, active);
+        assert_eq!(
+            provider.revision,
+            upgraded.db.get_provider(&active).unwrap().revision
+        );
+    }
+}
+
+#[tokio::test]
+async fn legacy_codex_upgrade_rejects_unjournaled_edits_that_change_the_written_configuration() {
+    for (edit, mode) in [
+        ("config_name", ConnectionMode::Proxy),
+        ("model", ConnectionMode::Proxy),
+        ("rename", ConnectionMode::Direct),
+    ] {
+        let fixture = Instances::new();
+        let journaled = add(&fixture.first, draft(ClientKind::Codex, "Journaled route")).await;
+        fixture.first.db.set_mode(ClientKind::Codex, mode).unwrap();
+        activate(&fixture.first, &journaled).await;
+        remove_codex_ownership_for_legacy_upgrade(&fixture);
+        edit_without_journal(
+            &fixture.first,
+            &journaled.id,
+            |provider| match edit {
+                "config_name" => provider.codex_config_name = Some("Changed".into()),
+                "model" => provider.model = Some("changed-model".into()),
+                _ => provider.name = "Renamed route".into(),
+            },
+            None,
+        );
+        let configured = fs::read(fixture.codex_config()).unwrap();
+        let auth = fs::read(fixture.codex_auth()).unwrap();
+        let upgraded = fixture.reopen_first();
+        upgraded.migrate_legacy_codex_configuration().unwrap();
+        assert!(
+            !fixture
+                .temporary
+                .0
+                .join("codex/.hsin-config-owner.json")
+                .exists(),
+            "{edit}"
+        );
+        assert!(!ownership(&upgraded, ClientKind::Codex).owner_is_self);
+        assert_eq!(fs::read(fixture.codex_config()).unwrap(), configured);
+        assert!(fs::read(fixture.codex_auth()).unwrap() == auth);
+    }
 }
 
 #[tokio::test]

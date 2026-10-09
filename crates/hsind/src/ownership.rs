@@ -398,6 +398,18 @@ fn set_private_file(file: &File) -> Result<()> {
     Ok(())
 }
 
+/// Compares two spellings of a path by the real location they resolve to.
+///
+/// Releases before configuration ownership recorded client paths as the
+/// environment spelled them; current releases record the normalized real path,
+/// which on Windows carries the verbatim `\\?\` prefix.
+pub fn same_real_path(left: &Path, right: &Path) -> Result<bool> {
+    if left == right {
+        return Ok(true);
+    }
+    Ok(normalize_real_path(&absolute_path(left)?)? == normalize_real_path(&absolute_path(right)?)?)
+}
+
 fn absolute_path(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
         Ok(path.to_owned())

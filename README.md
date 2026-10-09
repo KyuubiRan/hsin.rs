@@ -138,13 +138,28 @@ An incompatible wire protocol or ownership format still requires an owner upgrad
 When upgrading an older instance, an existing hsin configuration may have no
 ownership record yet. At startup, Codex configuration is migrated when its last
 completed local write, provider, helper, current configuration and preserved
-authentication can be verified together. Migration preserves the selected
-provider and client files, including third-party API authentication; official
-login is not required. An old local authentication backup alone is not proof
-that it belongs to the current shared configuration. Unverified legacy state
-still requires restoration by the previous managing instance or a fresh native
-baseline before takeover. If an owner is offline, start it; if its key store is
-locked, unlock it; if it lacks the handoff protocol, upgrade it before retrying.
+authentication can be verified together. Paths recorded by older releases are
+compared by the location they resolve to, and in proxy mode a later rename, key
+rotation or removal of the provider that was last written does not block the
+migration as long as the configuration file still matches. Migration preserves
+the selected provider and client files, including third-party API
+authentication; official login is not required. An old local authentication
+backup alone is not proof that it belongs to the current shared configuration.
+
+Legacy state that cannot be verified belongs to no other instance, and hsin
+shows it as an unclaimed legacy configuration together with the check that
+failed. To recover, restore the client's native configuration by hand, then
+retry; providers and API keys saved in hsin are kept:
+
+- Codex: in `config.toml`, remove `model_provider = "hsin"` and the
+  `[model_providers.hsin]` tables; in `auth.json`, remove `OPENAI_API_KEY`
+  (or sign in to Codex again). An API key left in `auth.json` is never accepted
+  as a fresh baseline, because another instance may have written it.
+- Claude Code: in `settings.json`, remove `env.ANTHROPIC_BASE_URL`,
+  `env.ANTHROPIC_API_KEY`, `env.ANTHROPIC_AUTH_TOKEN` and `apiKeyHelper`.
+
+If an owner is offline, start it; if its key store is locked, unlock it; if it
+lacks the handoff protocol, upgrade it before retrying.
 
 ## Usage
 

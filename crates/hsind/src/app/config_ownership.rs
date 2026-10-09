@@ -115,6 +115,8 @@ impl App {
             // its old generation must not be replayed on the next startup.
             self.db
                 .delete_setting(&format!("config_legacy_claim:{}", target.id))?;
+            self.db
+                .delete_setting(&super::legacy_config::legacy_claim_block_key(&target.id))?;
         }
         Ok(())
     }
@@ -125,7 +127,18 @@ impl App {
         record: Option<&Record>,
     ) -> Result<Option<String>> {
         let Some(record) = record else {
-            return Ok(self.legacy_ownership(target)?.then(|| "recovery_required: restore native configuration with the previous managing instance or sign in again before claiming ownership".into()));
+            if !self.legacy_ownership(target)? {
+                return Ok(None);
+            }
+            // No instance owns this state: it was written before ownership
+            // records existed and could not be proven to be this instance's.
+            let block = self
+                .db
+                .setting(&super::legacy_config::legacy_claim_block_key(&target.id))?
+                .unwrap_or_else(|| "unverified".into());
+            return Ok(Some(format!(
+                "legacy_unclaimed:{block}: this instance cannot prove that it wrote the legacy hsin configuration; restore the client's native configuration before claiming ownership"
+            )));
         };
         if record.pending.is_some() {
             return Ok(Some(

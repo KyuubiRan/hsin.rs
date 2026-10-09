@@ -199,16 +199,10 @@ pub(super) fn draw_details(frame: &mut Frame<'_>, area: Rect, state: &State, i18
         lines.push(detail_line(i18n.text("config_status"), i18n.text(key)));
     }
     if let Some(ownership) = state.status.config_ownership(client) {
-        let owner = if ownership.owner_is_self {
-            i18n.text("config_owner_self").to_owned()
-        } else if let Some(owner) = &ownership.owner {
-            format!("{} · {}", owner.instance_label, owner.instance_home)
-        } else {
-            i18n.text("config_owner_unknown").to_owned()
-        };
         lines.push(Line::from(format!(
-            "{}: {owner}",
-            i18n.text("config_owner")
+            "{}: {}",
+            i18n.text("config_owner"),
+            i18n.owner_label(ownership)
         )));
     }
     if state.image_section {

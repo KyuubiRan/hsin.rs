@@ -394,6 +394,69 @@ fn unavailable_config_takeover_cannot_be_confirmed() {
     assert!(state.take_effect().is_none());
 }
 
+fn legacy_conflict() -> hsin_core::ConfigConflictDetails {
+    let mut details = config_conflict(false);
+    details.targets[0].owner = None;
+    details.targets[0].generation = 0;
+    details.targets[0].takeover_unavailable_reason = Some(
+        "legacy_unclaimed:files_changed: this instance cannot prove that it wrote the legacy hsin configuration".into(),
+    );
+    details
+}
+
+#[test]
+fn unclaimed_legacy_configuration_explains_recovery_instead_of_another_owner() {
+    for (language, expected, forbidden) in [
+        (
+            LANGUAGE_ZH_CN,
+            [
+                "旧版配置待恢复",
+                "旧版hsin配置（归属未确认）",
+                "原因：",
+                "恢复方法：",
+            ],
+            "另一个",
+        ),
+        (
+            LANGUAGE_EN_US,
+            [
+                "Legacyconfigurationneedsrecovery",
+                "Legacyhsinconfiguration(unclaimed)",
+                "Reason:",
+                "Torecover:",
+            ],
+            "Anotherhsininstance",
+        ),
+    ] {
+        let mut state = State::default();
+        state.reduce(Action::ConfigConflict {
+            operation: Effect::SetProxyEnabled(false),
+            details: legacy_conflict(),
+        });
+        let locale = I18n::new(Some(language));
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut state, &locale))
+            .expect("legacy dialog");
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<String>();
+        for fragment in expected {
+            assert!(text.contains(fragment), "{language}: {fragment}");
+        }
+        assert!(!text.contains(forbidden), "{language}");
+        state.reduce(key(KeyCode::Right));
+        state.reduce(key(KeyCode::Enter));
+        assert!(state.take_effect().is_none());
+    }
+}
+
 #[test]
 fn cancelling_config_takeover_returns_to_the_submitted_model_page() {
     let mut state = State {

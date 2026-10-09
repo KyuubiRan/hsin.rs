@@ -23,21 +23,32 @@ pub(super) fn draw(
     i18n: &I18n,
     hits: &mut HitMap,
 ) {
+    // Unclaimed legacy state belongs to no other instance; it needs a manual
+    // native restore, so its explanation and recovery steps replace takeover.
+    let legacy = !dialog.details.targets.is_empty()
+        && dialog.details.targets.iter().all(I18n::ownership_is_legacy);
+    let rows_per_target = if legacy { 11 } else { 6 };
     let popup = centered_fixed(
         area,
         76,
-        12 + u16::try_from(dialog.details.targets.len()).unwrap_or(2) * 6,
+        12 + u16::try_from(dialog.details.targets.len()).unwrap_or(2) * rows_per_target,
     );
     frame.render_widget(Clear, popup);
     let block = Block::default()
-        .title(i18n.text("config_takeover_title"))
+        .title(i18n.text(if legacy {
+            "config_takeover_legacy_title"
+        } else {
+            "config_takeover_title"
+        }))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(RED))
         .style(Style::default().bg(INPUT_BG));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     let mut lines = vec![
-        Line::from(i18n.text(if dialog.startup {
+        Line::from(i18n.text(if legacy {
+            "config_takeover_legacy_description"
+        } else if dialog.startup {
             "config_takeover_startup_description"
         } else {
             "config_takeover_description"
@@ -45,29 +56,24 @@ pub(super) fn draw(
         Line::from(""),
     ];
     for target in &dialog.details.targets {
-        let owner = target.owner.as_ref().map_or_else(
-            || i18n.text("config_owner_unknown").to_owned(),
-            |owner| format!("{} · {}", owner.instance_label, owner.instance_home),
-        );
         lines.push(Line::from(Span::styled(
-            format!("{}: {owner}", target.client),
+            format!("{}: {}", target.client, i18n.owner_label(target)),
             Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(target.config_path.clone()));
-        if let Some(reason) = &target.takeover_unavailable_reason {
-            let reason_code = reason.split(':').next().unwrap_or(reason);
-            let key = format!("config_takeover.reason.{reason_code}");
-            lines.push(Line::from(
-                i18n.get(&key)
-                    .unwrap_or_else(|| i18n.text("config_takeover_unavailable")),
-            ));
-        }
+        lines.extend(
+            i18n.ownership_reason_lines(target)
+                .into_iter()
+                .map(Line::from),
+        );
         lines.push(Line::from(""));
     }
     if dialog.operation.is_none() {
         lines.push(Line::from(i18n.text("config_takeover_working")));
     } else {
-        lines.push(Line::from(i18n.text(if dialog.available() {
+        lines.push(Line::from(i18n.text(if legacy {
+            "config_takeover_legacy_unavailable"
+        } else if dialog.available() {
             if dialog.startup {
                 "config_takeover_startup_restore_notice"
             } else {
