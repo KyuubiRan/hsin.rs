@@ -1727,7 +1727,7 @@ impl App {
         );
         if let Some(snapshot) = self.codex_auth_backup()? {
             self.check_auth_backup_lease(&snapshot)?;
-            if std::path::Path::new(&snapshot.auth_path) != path {
+            if !snapshot.belongs_to(path)? {
                 return Err(DaemonError::Conflict(
                     "Codex auth backup belongs to a different CODEX_HOME".into(),
                 ));
@@ -1822,7 +1822,7 @@ impl App {
             config::apply_codex_auth(&auth_path, target.codex_auth_before_hash.as_deref(), key)?;
         } else if let Some(snapshot) = self.codex_auth_backup()? {
             self.check_auth_backup_lease(&snapshot)?;
-            if std::path::Path::new(&snapshot.auth_path) != auth_path {
+            if !snapshot.belongs_to(&auth_path)? {
                 return Err(DaemonError::Conflict(
                     "Codex auth backup belongs to a different CODEX_HOME".into(),
                 ));
@@ -1862,7 +1862,7 @@ impl App {
             return Ok(true);
         };
         self.check_auth_backup_lease(&snapshot)?;
-        if std::path::Path::new(&snapshot.auth_path) != auth_path {
+        if !snapshot.belongs_to(&auth_path)? {
             return Err(DaemonError::Conflict(
                 "Codex auth backup belongs to a different CODEX_HOME".into(),
             ));

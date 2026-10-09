@@ -211,6 +211,13 @@ pub struct CodexAuthSnapshot {
     pub lease: Option<AuthBackupLease>,
 }
 
+impl CodexAuthSnapshot {
+    /// Whether this backup was captured from `auth_path`, however either path is spelled.
+    pub fn belongs_to(&self, auth_path: &Path) -> Result<bool> {
+        crate::ownership::same_real_path(Path::new(&self.auth_path), auth_path)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Zeroize)]
 pub struct AuthBackupLease {
     pub instance_id: String,
@@ -725,28 +732,29 @@ pub fn has_legacy_hsin_configuration(client: ClientKind, path: &Path) -> Result<
 
 /// A manual return to native authentication can establish a fresh baseline.
 /// Never infer that from an API key left by another managing instance.
+///
+/// For Codex the baseline is a configuration without hsin's selector or
+/// provider table and an `auth.json` without an API key: an official login, or
+/// no stored credential at all, which a third-party API user reaches by
+/// removing what hsin wrote. A managing instance always leaves either the
+/// managed placeholder or a provider key in `auth.json`, so neither state can be
+/// left behind by one.
 pub fn is_native_recovery_baseline(client: ClientKind, path: &Path) -> Result<bool> {
-    if has_legacy_hsin_configuration(client, path)? || !detect_current(path, client)?.official {
+    if has_legacy_hsin_configuration(client, path)? {
         return Ok(false);
     }
     if client == ClientKind::Claude {
-        return Ok(true);
+        return Ok(detect_current(path, client)?.official);
     }
     let auth_path = codex_auth_path(path)?;
     if !auth_path.exists() {
-        return Ok(false);
+        return Ok(true);
     }
     let text = Zeroizing::new(fs::read_to_string(auth_path)?);
     let value = parse_json_object(&text, "Codex auth")?;
-    Ok(
-        value.get("auth_mode").and_then(serde_json::Value::as_str) == Some("chatgpt")
-            && value
-                .get("tokens")
-                .is_some_and(serde_json::Value::is_object)
-            && value
-                .get("OPENAI_API_KEY")
-                .is_none_or(serde_json::Value::is_null),
-    )
+    Ok(value
+        .get("OPENAI_API_KEY")
+        .is_none_or(serde_json::Value::is_null))
 }
 
 #[cfg(test)]
