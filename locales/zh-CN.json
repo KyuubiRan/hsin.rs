@@ -177,6 +177,7 @@
   "config_takeover.legacy.state_changed": "原因：hsin 中的 provider、连接模式或认证设置已与最后一次写入不一致。",
   "config_takeover.legacy.files_changed": "原因：配置或认证文件已与本实例最后一次写入的内容不同。",
   "config_takeover.legacy.backup_mismatch": "原因：Codex 认证备份缺失，或属于其他配置目录。",
+  "config_takeover.legacy.model_snapshot_mismatch": "原因：hsin 保存的 Claude Code 原模型配置已与本实例最后一次写入时不一致。",
   "config_takeover.legacy.migration_failed": "原因：读取或校验旧状态失败，详见守护进程日志。",
   "config_takeover.legacy.unverified": "原因：这类旧配置无法自动接管。",
   "config_takeover.legacy_recovery.codex": "恢复方法：在 config.toml 中删除 model_provider = \"hsin\" 和 [model_providers.hsin] 相关表；在 auth.json 中删除 OPENAI_API_KEY（或重新登录 Codex）。其他内容保持不变。",

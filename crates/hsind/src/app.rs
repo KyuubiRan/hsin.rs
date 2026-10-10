@@ -2769,7 +2769,7 @@ impl App {
             self.crypto.import_recovery_key(value)?;
             // A successful import proves the operator still holds the key.
             self.mark_recovery_key_held()?;
-            self.migrate_legacy_codex_configuration()?;
+            self.migrate_legacy_configurations()?;
         }
         self.capture_existing_official_accounts().await
     }

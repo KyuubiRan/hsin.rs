@@ -46,7 +46,7 @@ impl App {
         Target::new(client, self.config_path(client)?)
     }
 
-    fn legacy_ownership(&self, target: &Target) -> Result<bool> {
+    pub(super) fn legacy_ownership(&self, target: &Target) -> Result<bool> {
         let residual = config::has_legacy_hsin_configuration(target.client, &target.config_path)?;
         if residual {
             return Ok(true);

@@ -275,6 +275,24 @@ mod tests {
     }
 
     #[test]
+    fn legacy_claude_model_snapshot_mismatch_has_its_own_reason() {
+        let i18n = I18n::new(Some("en-US"));
+        let target = legacy_target(
+            ClientKind::Claude,
+            "legacy_unclaimed:model_snapshot_mismatch: unproven",
+        );
+        let lines = i18n.ownership_reason_lines(&target);
+        assert_eq!(
+            lines[1],
+            i18n.text("config_takeover.legacy.model_snapshot_mismatch")
+        );
+        assert_eq!(
+            lines[2],
+            i18n.text("config_takeover.legacy_recovery.claude")
+        );
+    }
+
+    #[test]
     fn owned_conflicts_keep_their_owner_and_generic_reason() {
         let i18n = I18n::new(Some("en-US"));
         let mut target = legacy_target(ClientKind::Codex, "recovery_required: pending");
