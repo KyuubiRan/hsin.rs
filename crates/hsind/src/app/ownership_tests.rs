@@ -481,7 +481,7 @@ async fn legacy_codex_upgrade_preserves_api_only_and_absent_auth_without_officia
                 .db
                 .set_config_status(ClientKind::Codex, "conflict")
                 .unwrap();
-            upgraded.migrate_legacy_codex_configuration().unwrap();
+            upgraded.migrate_legacy_configurations().unwrap();
             let status = ownership(&upgraded, ClientKind::Codex);
             assert!(status.owner_is_self);
             assert!(status.takeover_unavailable_reason.is_none());
@@ -513,7 +513,7 @@ async fn legacy_codex_upgrade_preserves_api_only_and_absent_auth_without_officia
                 );
             }
             let owner_record = fixture.owner_record(ClientKind::Codex);
-            upgraded.migrate_legacy_codex_configuration().unwrap();
+            upgraded.migrate_legacy_configurations().unwrap();
             assert_eq!(fixture.owner_record(ClientKind::Codex), owner_record);
             let imported = upgraded
                 .import_current(ImportCurrentParams {
@@ -649,7 +649,7 @@ async fn legacy_codex_upgrade_rejects_foreign_or_changed_configuration_and_backu
         }
         let configured = fs::read(fixture.codex_config()).unwrap();
         let auth = fs::read(fixture.codex_auth()).unwrap();
-        fixture.first.migrate_legacy_codex_configuration().unwrap();
+        fixture.first.migrate_legacy_configurations().unwrap();
         assert!(
             !fixture
                 .temporary
@@ -677,7 +677,7 @@ async fn legacy_codex_upgrade_rejects_foreign_or_changed_configuration_and_backu
             "{corruption}: {:?}",
             status.takeover_unavailable_reason
         );
-        fixture.second.migrate_legacy_codex_configuration().unwrap();
+        fixture.second.migrate_legacy_configurations().unwrap();
         assert!(!ownership(&fixture.second, ClientKind::Codex).owner_is_self);
     }
 }
@@ -701,7 +701,7 @@ async fn legacy_codex_state_recovers_from_a_manual_third_party_native_baseline()
         )
         .unwrap();
         let upgraded = fixture.reopen_first();
-        upgraded.migrate_legacy_codex_configuration().unwrap();
+        upgraded.migrate_legacy_configurations().unwrap();
         assert!(
             ownership(&upgraded, ClientKind::Codex)
                 .takeover_unavailable_reason
@@ -749,7 +749,7 @@ async fn legacy_codex_state_recovers_from_a_manual_third_party_native_baseline()
                 .unwrap()
         );
         let restarted = fixture.reopen_first();
-        restarted.migrate_legacy_codex_configuration().unwrap();
+        restarted.migrate_legacy_configurations().unwrap();
         assert!(ownership(&restarted, ClientKind::Codex).owner_is_self);
         let official = restarted
             .ensure_official_provider(ClientKind::Codex)
@@ -776,7 +776,7 @@ async fn legacy_codex_upgrade_resumes_on_both_sides_of_sidecar_publication() {
         let configured = fs::read(fixture.codex_config()).unwrap();
         let auth = fs::read(fixture.codex_auth()).unwrap();
         let upgraded = fixture.reopen_first();
-        upgraded.migrate_legacy_codex_configuration().unwrap();
+        upgraded.migrate_legacy_configurations().unwrap();
         assert_eq!(target.read_record().unwrap(), Some(record));
         assert!(
             upgraded
@@ -822,7 +822,7 @@ async fn legacy_codex_upgrade_cannot_publish_a_staged_claim_after_foreign_change
         let auth = fs::read(fixture.codex_auth()).unwrap();
         fixture
             .reopen_first()
-            .migrate_legacy_codex_configuration()
+            .migrate_legacy_configurations()
             .unwrap();
         assert_eq!(
             target.read_record().unwrap(),
@@ -848,7 +848,7 @@ async fn legacy_codex_upgrade_database_failure_rolls_back_lease_and_backup() {
     activate(&fixture.first, &custom).await;
     remove_codex_ownership_for_legacy_upgrade(&fixture);
     fixture.first.db.connection.lock().execute_batch("CREATE TRIGGER fail_legacy_lease BEFORE INSERT ON settings WHEN NEW.key LIKE 'config_lease:%' BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
-    assert!(fixture.first.migrate_legacy_codex_configuration().is_err());
+    assert!(fixture.first.migrate_legacy_configurations().is_err());
     assert!(
         fixture
             .first
@@ -906,7 +906,7 @@ async fn legacy_codex_upgrade_preserves_a_proxy_route_switched_without_rewriting
     let configured = fs::read(fixture.codex_config()).unwrap();
     let auth = fs::read(fixture.codex_auth()).unwrap();
     let upgraded = fixture.reopen_first();
-    upgraded.migrate_legacy_codex_configuration().unwrap();
+    upgraded.migrate_legacy_configurations().unwrap();
     assert!(ownership(&upgraded, ClientKind::Codex).owner_is_self);
     assert_eq!(fs::read(fixture.codex_config()).unwrap(), configured);
     assert!(fs::read(fixture.codex_auth()).unwrap() == auth);
@@ -976,7 +976,7 @@ async fn legacy_codex_upgrade_accepts_unjournaled_proxy_edits_that_never_reached
         let configured = fs::read(fixture.codex_config()).unwrap();
         let auth = fs::read(fixture.codex_auth()).unwrap();
         let upgraded = fixture.reopen_first();
-        upgraded.migrate_legacy_codex_configuration().unwrap();
+        upgraded.migrate_legacy_configurations().unwrap();
         assert!(
             ownership(&upgraded, ClientKind::Codex).owner_is_self,
             "{edit}"
@@ -1021,7 +1021,7 @@ async fn legacy_codex_upgrade_rejects_unjournaled_edits_that_change_the_written_
         let configured = fs::read(fixture.codex_config()).unwrap();
         let auth = fs::read(fixture.codex_auth()).unwrap();
         let upgraded = fixture.reopen_first();
-        upgraded.migrate_legacy_codex_configuration().unwrap();
+        upgraded.migrate_legacy_configurations().unwrap();
         assert!(
             !fixture
                 .temporary
@@ -1033,6 +1033,385 @@ async fn legacy_codex_upgrade_rejects_unjournaled_edits_that_change_the_written_
         assert!(!ownership(&upgraded, ClientKind::Codex).owner_is_self);
         assert_eq!(fs::read(fixture.codex_config()).unwrap(), configured);
         assert!(fs::read(fixture.codex_auth()).unwrap() == auth);
+    }
+}
+
+/// Rewrites the latest Claude write as a pre-ownership release left it: no
+/// lease in the journal, no local lease and no shared ownership record.
+fn remove_claude_ownership_for_legacy_upgrade(fixture: &Instances) {
+    let app = &fixture.first;
+    let status = ownership(app, ClientKind::Claude);
+    let mut journal: Value = serde_json::from_str(
+        &app.db
+            .latest_completed_configuration(ClientKind::Claude)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    journal.as_object_mut().unwrap().remove("ownership_lease");
+    journal
+        .as_object_mut()
+        .unwrap()
+        .remove("official_auth_transition");
+    journal["provider"]
+        .as_object_mut()
+        .unwrap()
+        .remove("codex_tuning");
+    let operation = app
+        .db
+        .begin_operation(
+            "apply_config",
+            ClientKind::Claude,
+            None,
+            &serde_json::to_string(&journal).unwrap(),
+        )
+        .unwrap();
+    app.db
+        .finish_operation(&operation, "complete", None)
+        .unwrap();
+    app.db
+        .delete_setting(&format!("config_lease:{}", status.target_id))
+        .unwrap();
+    fs::remove_file(fixture.temporary.0.join("claude/.hsin-config-owner.json")).unwrap();
+}
+
+fn legacy_claude_mapping() -> ClaudeModelMapping {
+    ClaudeModelMapping {
+        enabled: true,
+        default_model: Some("mapped-default".into()),
+        opus: Some(ModelSlot {
+            model: "mapped-opus".into(),
+            context_1m: false,
+        }),
+        ..ClaudeModelMapping::default()
+    }
+}
+
+async fn legacy_claude_fixture(
+    mode: ConnectionMode,
+    disable_custom_auth: bool,
+    mapped: bool,
+) -> (Instances, Provider) {
+    let fixture = Instances::new();
+    fixture
+        .first
+        .update_settings(SettingsPatch {
+            client_auth: Some(ClientAuthUpdate {
+                client: ClientKind::Claude,
+                disable_custom_auth,
+            }),
+            ..SettingsPatch::default()
+        })
+        .await
+        .unwrap();
+    let mut provider = draft(ClientKind::Claude, "Legacy Claude");
+    if mapped {
+        provider.claude_model_mapping = Some(legacy_claude_mapping());
+    }
+    let custom = add(&fixture.first, provider).await;
+    activate(&fixture.first, &custom).await;
+    if mode == ConnectionMode::Proxy {
+        // Switching in proxy mode only changes the route; entering proxy mode
+        // is the write that leaves the proxy configuration behind.
+        fixture.first.db.set_mode(ClientKind::Claude, mode).unwrap();
+        fixture.first.reconcile_proxy_configurations().unwrap();
+    }
+    remove_claude_ownership_for_legacy_upgrade(&fixture);
+    (fixture, custom)
+}
+
+fn assert_legacy_block(app: &App, client: ClientKind, block: &str) {
+    let status = ownership(app, client);
+    assert!(status.owner.is_none());
+    assert!(!status.takeover_available);
+    assert!(
+        status
+            .takeover_unavailable_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with(&format!("legacy_unclaimed:{block}:"))),
+        "{block}: {:?}",
+        status.takeover_unavailable_reason
+    );
+}
+
+#[tokio::test]
+async fn legacy_claude_upgrade_adopts_the_last_local_write() {
+    for mode in [ConnectionMode::Proxy, ConnectionMode::Direct] {
+        for (disabled, mapped) in [(false, false), (true, false), (false, true), (true, true)] {
+            let case = format!("{mode:?} disabled={disabled} mapped={mapped}");
+            let (fixture, _) = legacy_claude_fixture(mode, disabled, mapped).await;
+            // A direct provider key is not hsin residue; only a retained model
+            // snapshot makes that configuration legacy state.
+            let residue = !(mode == ConnectionMode::Direct && disabled);
+            let legacy = residue || mapped;
+            assert_eq!(
+                config::has_legacy_hsin_configuration(ClientKind::Claude, &fixture.claude_config())
+                    .unwrap(),
+                residue,
+                "{case}"
+            );
+            assert_eq!(
+                fixture
+                    .first
+                    .configuration_ownership(ClientKind::Claude)
+                    .unwrap()
+                    .takeover_unavailable_reason
+                    .is_some(),
+                legacy,
+                "{case}"
+            );
+            let configured = fs::read(fixture.claude_config()).unwrap();
+            let upgraded = fixture.reopen_first();
+            upgraded
+                .db
+                .set_config_status(ClientKind::Claude, "conflict")
+                .unwrap();
+            upgraded.migrate_legacy_configurations().unwrap();
+            let status = ownership(&upgraded, ClientKind::Claude);
+            assert_eq!(status.owner_is_self, legacy, "{case}");
+            assert!(status.takeover_unavailable_reason.is_none(), "{case}");
+            assert_eq!(fs::read(fixture.claude_config()).unwrap(), configured);
+            if legacy {
+                assert_eq!(
+                    upgraded
+                        .db
+                        .client_state(ClientKind::Claude)
+                        .unwrap()
+                        .config_status,
+                    hsin_core::ConfigStatus::Synchronized
+                );
+                let owner_record = fixture.owner_record(ClientKind::Claude);
+                upgraded.migrate_legacy_configurations().unwrap();
+                assert_eq!(fixture.owner_record(ClientKind::Claude), owner_record);
+            }
+            // Leaving hsin restores the user's own model values and keeps
+            // every field hsin does not own.
+            let official = upgraded
+                .ensure_official_provider(ClientKind::Claude)
+                .unwrap();
+            activate(&upgraded, &official).await;
+            let restored = read_json(&fixture.claude_config());
+            assert!(
+                restored["env"]["ANTHROPIC_MODEL"] == "user-default",
+                "{case}"
+            );
+            assert!(
+                restored["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL_NAME"] == "User Opus",
+                "{case}"
+            );
+            assert!(restored["permissions"]["allow"][0] == "Read", "{case}");
+            for key in [
+                "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            ] {
+                assert!(restored["env"].get(key).is_none(), "{case}: {key}");
+            }
+            assert!(restored.get("apiKeyHelper").is_none(), "{case}");
+            assert!(
+                upgraded
+                    .db
+                    .setting(CLAUDE_MODEL_ENV_BEFORE_KEY)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_claude_upgrade_accepts_unjournaled_proxy_edits_that_never_reached_the_file() {
+    for edit in ["rename", "rekey", "removed"] {
+        let (fixture, journaled) = legacy_claude_fixture(ConnectionMode::Proxy, false, false).await;
+        let mut active = journaled.id.clone();
+        match edit {
+            "rename" => edit_without_journal(
+                &fixture.first,
+                &journaled.id,
+                |provider| provider.name = "Renamed Claude".into(),
+                None,
+            ),
+            "rekey" => edit_without_journal(
+                &fixture.first,
+                &journaled.id,
+                |_| {},
+                Some("rotated-fixture-key"),
+            ),
+            _ => {
+                let selected =
+                    add(&fixture.first, draft(ClientKind::Claude, "Selected Claude")).await;
+                fixture
+                    .first
+                    .db
+                    .set_active(ClientKind::Claude, &selected.id, "synchronized")
+                    .unwrap();
+                fixture.first.db.remove_provider(&journaled.id).unwrap();
+                active = selected.id;
+            }
+        }
+        let configured = fs::read(fixture.claude_config()).unwrap();
+        let upgraded = fixture.reopen_first();
+        upgraded.migrate_legacy_configurations().unwrap();
+        assert!(
+            ownership(&upgraded, ClientKind::Claude).owner_is_self,
+            "{edit}"
+        );
+        assert_eq!(fs::read(fixture.claude_config()).unwrap(), configured);
+        upgraded.reconcile_proxy_configurations().unwrap();
+        let provider = upgraded
+            .current_configuration_provider(ClientKind::Claude)
+            .unwrap()
+            .unwrap();
+        assert_eq!(provider.id, active, "{edit}");
+    }
+}
+
+#[tokio::test]
+async fn legacy_claude_upgrade_explains_every_unprovable_state() {
+    for (corruption, mapped, block) in [
+        ("journal", false, "no_journal"),
+        ("pending", false, "in_flight"),
+        ("mode", false, "state_changed"),
+        ("disabled_auth", false, "state_changed"),
+        ("external", false, "files_changed"),
+        ("foreign_helper", false, "files_changed"),
+        ("snapshot", true, "model_snapshot_mismatch"),
+        ("leftover_snapshot", false, "model_snapshot_mismatch"),
+    ] {
+        let (fixture, _) = legacy_claude_fixture(ConnectionMode::Proxy, false, mapped).await;
+        let app = &fixture.first;
+        match corruption {
+            "journal" => {
+                app.db
+                    .connection
+                    .lock()
+                    .execute("DELETE FROM operations WHERE client='claude'", [])
+                    .unwrap();
+            }
+            "pending" => {
+                app.db
+                    .begin_operation("apply_config", ClientKind::Claude, None, "{}")
+                    .unwrap();
+            }
+            "mode" => app
+                .db
+                .set_mode(ClientKind::Claude, ConnectionMode::Direct)
+                .unwrap(),
+            "disabled_auth" => {
+                let mut auth = app.client_auth_settings().unwrap();
+                auth.claude_disable_custom_auth = true;
+                app.db
+                    .set_setting("client_auth", &serde_json::to_string(&auth).unwrap())
+                    .unwrap();
+            }
+            "external" | "foreign_helper" => {
+                let mut settings = read_json(&fixture.claude_config());
+                if corruption == "external" {
+                    settings["env"]["ANTHROPIC_BASE_URL"] = "https://external.example.test".into();
+                } else {
+                    settings["apiKeyHelper"] = "/foreign/hsin credential claude".into();
+                }
+                fs::write(
+                    fixture.claude_config(),
+                    serde_json::to_vec_pretty(&settings).unwrap(),
+                )
+                .unwrap();
+            }
+            _ => {
+                let mut snapshot: Value = app
+                    .db
+                    .setting(CLAUDE_MODEL_ENV_BEFORE_KEY)
+                    .unwrap()
+                    .map_or_else(
+                        || json!({"values": {}}),
+                        |stored| serde_json::from_str(&stored).unwrap(),
+                    );
+                snapshot["values"]["ANTHROPIC_MODEL"] = "tampered".into();
+                app.db
+                    .set_setting(
+                        CLAUDE_MODEL_ENV_BEFORE_KEY,
+                        &serde_json::to_string(&snapshot).unwrap(),
+                    )
+                    .unwrap();
+            }
+        }
+        let configured = fs::read(fixture.claude_config()).unwrap();
+        let upgraded = fixture.reopen_first();
+        upgraded.migrate_legacy_configurations().unwrap();
+        assert!(
+            !fixture
+                .temporary
+                .0
+                .join("claude/.hsin-config-owner.json")
+                .exists(),
+            "{corruption}"
+        );
+        assert_eq!(fs::read(fixture.claude_config()).unwrap(), configured);
+        assert_legacy_block(&upgraded, ClientKind::Claude, block);
+        let official = upgraded
+            .ensure_official_provider(ClientKind::Claude)
+            .unwrap();
+        assert_ownership_conflict(
+            upgraded
+                .switch_provider(ProviderSwitchParams {
+                    client: ClientKind::Claude,
+                    provider_id: official.id,
+                })
+                .await,
+        );
+        // Another instance never adopts this instance's legacy write.
+        fixture.second.migrate_legacy_configurations().unwrap();
+        assert!(!ownership(&fixture.second, ClientKind::Claude).owner_is_self);
+    }
+}
+
+#[tokio::test]
+async fn legacy_claude_upgrade_resumes_on_both_sides_of_sidecar_publication() {
+    for sidecar_written in [false, true] {
+        let (fixture, custom) = legacy_claude_fixture(ConnectionMode::Proxy, false, false).await;
+        let app = &fixture.first;
+        let target = Target::new(ClientKind::Claude, fixture.claude_config()).unwrap();
+        let mut record = Record::unclaimed(
+            1,
+            ManagedScope::default(),
+            config::ownership_fingerprints(
+                ClientKind::Claude,
+                &target.config_path,
+                &ManagedScope::default(),
+            )
+            .unwrap(),
+        );
+        record.owner = Some(app.instance.clone());
+        record.endpoint = Some(app.endpoint.read().clone());
+        app.db
+            .stage_legacy_config_claim(
+                &target.id,
+                1,
+                &serde_json::to_string(&record).unwrap(),
+                None,
+            )
+            .unwrap();
+        if sidecar_written {
+            target.lock().unwrap().set_record(record.clone()).unwrap();
+        }
+        let configured = fs::read(fixture.claude_config()).unwrap();
+        let upgraded = fixture.reopen_first();
+        upgraded.migrate_legacy_configurations().unwrap();
+        assert_eq!(target.read_record().unwrap(), Some(record));
+        assert!(
+            upgraded
+                .db
+                .setting(&format!("config_legacy_claim:{}", target.id))
+                .unwrap()
+                .is_none()
+        );
+        assert!(ownership(&upgraded, ClientKind::Claude).owner_is_self);
+        assert_eq!(fs::read(fixture.claude_config()).unwrap(), configured);
+        let restarted = fixture.reopen_first();
+        restarted.migrate_legacy_configurations().unwrap();
+        assert!(ownership(&restarted, ClientKind::Claude).owner_is_self);
+        activate(&restarted, &custom).await;
     }
 }
 
@@ -1050,7 +1429,7 @@ async fn legacy_codex_upgrade_waits_for_the_original_key_before_binding_its_back
     fixture.first_store.0.lock().clear();
     let upgraded = fixture.reopen_first();
     assert!(matches!(
-        upgraded.migrate_legacy_codex_configuration(),
+        upgraded.migrate_legacy_configurations(),
         Err(DaemonError::Locked)
     ));
     assert!(!ownership(&upgraded, ClientKind::Codex).owner_is_self);
@@ -1068,6 +1447,131 @@ async fn legacy_codex_upgrade_waits_for_the_original_key_before_binding_its_back
             .is_some()
     );
     activate(&upgraded, &custom).await;
+}
+
+async fn recover_native_claude_after_interrupted_claim(
+    mode: ConnectionMode,
+    mapped: bool,
+) -> (Instances, Target) {
+    let (fixture, _) = legacy_claude_fixture(mode, false, mapped).await;
+    let app = &fixture.first;
+    // An installed instance must not re-import providers on restart and mask
+    // the conflict caused by replaying an obsolete claim receipt.
+    app.db
+        .set_setting("providers_initialized_v1", "true")
+        .unwrap();
+    let target = Target::new(ClientKind::Claude, fixture.claude_config()).unwrap();
+    let configured: ConfigTarget = serde_json::from_str(
+        &app.db
+            .latest_completed_configuration(ClientKind::Claude)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let scope = App::managed_scope(&configured);
+    let fingerprints =
+        config::ownership_fingerprints(ClientKind::Claude, &target.config_path, &scope).unwrap();
+    let mut record = Record::unclaimed(1, scope, fingerprints);
+    record.owner = Some(app.instance.clone());
+    record.endpoint = Some(app.endpoint.read().clone());
+    app.db
+        .stage_legacy_config_claim(
+            &target.id,
+            1,
+            &serde_json::to_string(&record).unwrap(),
+            None,
+        )
+        .unwrap();
+    // The daemon stopped before publishing the sidecar; the user then
+    // restored native settings with newer model values of their own.
+    let native = "{\r\n  // 用户恢复的配置\r\n  \"env\": {\"ANTHROPIC_MODEL\": \"fresh-user-model\", \"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"Fresh Opus\"},\r\n  \"permissions\": {\"allow\": [\"Read\"]}\r\n}\r\n";
+    fs::write(fixture.claude_config(), native).unwrap();
+    let upgraded = fixture.reopen_first();
+    upgraded.migrate_legacy_configurations().unwrap();
+    assert!(target.read_record().unwrap().is_none());
+    assert!(
+        upgraded
+            .db
+            .setting(&legacy_config::legacy_claim_block_key(&target.id))
+            .unwrap()
+            .as_deref()
+            == Some("migration_failed")
+    );
+    let official = upgraded
+        .ensure_official_provider(ClientKind::Claude)
+        .unwrap();
+    activate(&upgraded, &official).await;
+    assert!(ownership(&upgraded, ClientKind::Claude).owner_is_self);
+    assert_eq!(ownership(&upgraded, ClientKind::Claude).generation, 2);
+    assert!(fs::read(fixture.claude_config()).unwrap() == native.as_bytes());
+    assert!(
+        upgraded
+            .db
+            .setting(CLAUDE_MODEL_ENV_BEFORE_KEY)
+            .unwrap()
+            .is_none()
+    );
+    (fixture, target)
+}
+
+#[tokio::test]
+async fn legacy_claude_native_recovery_discards_interrupted_claim_receipts() {
+    for mode in [ConnectionMode::Proxy, ConnectionMode::Direct] {
+        for mapped in [false, true] {
+            let (fixture, target) =
+                recover_native_claude_after_interrupted_claim(mode, mapped).await;
+            let recovered = fixture.reopen_first();
+            assert!(
+                recovered
+                    .db
+                    .setting(&format!("config_legacy_claim:{}", target.id))
+                    .unwrap()
+                    .is_none(),
+                "{mode:?} mapped={mapped}: obsolete claim receipt survived native recovery"
+            );
+            assert!(
+                recovered
+                    .db
+                    .setting(&legacy_config::legacy_claim_block_key(&target.id))
+                    .unwrap()
+                    .is_none(),
+                "{mode:?} mapped={mapped}: obsolete claim rejection survived native recovery"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_claude_native_recovery_stays_synchronized_after_restart() {
+    for mode in [ConnectionMode::Proxy, ConnectionMode::Direct] {
+        for mapped in [false, true] {
+            let (fixture, _) = recover_native_claude_after_interrupted_claim(mode, mapped).await;
+            let configured = fs::read(fixture.claude_config()).unwrap();
+            let restarted = fixture.reopen_first();
+            restarted.migrate_legacy_configurations().unwrap();
+            restarted.recover_operations().unwrap();
+            restarted.initialize_providers().unwrap();
+            restarted.reconcile_client_auth_configuration().unwrap();
+            restarted.reconcile_proxy_configurations().unwrap();
+            let status = restarted.status().unwrap();
+            let claude = status
+                .clients
+                .iter()
+                .find(|state| state.client == ClientKind::Claude)
+                .unwrap();
+            assert!(
+                claude.config_status == hsin_core::ConfigStatus::Synchronized,
+                "{mode:?} mapped={mapped}: recovered configuration became conflicted on restart"
+            );
+            assert!(ownership(&restarted, ClientKind::Claude).owner_is_self);
+            assert!(
+                ownership(&restarted, ClientKind::Claude)
+                    .takeover_unavailable_reason
+                    .is_none()
+            );
+            assert!(fs::read(fixture.claude_config()).unwrap() == configured);
+        }
+    }
 }
 
 #[tokio::test]
@@ -1088,7 +1592,7 @@ async fn legacy_codex_upgrade_discards_an_interrupted_claim_after_native_recover
     )
     .unwrap();
     let upgraded = fixture.reopen_first();
-    upgraded.migrate_legacy_codex_configuration().unwrap();
+    upgraded.migrate_legacy_configurations().unwrap();
     assert!(target.read_record().unwrap().is_none());
     let official = upgraded
         .ensure_official_provider(ClientKind::Codex)
@@ -1102,7 +1606,7 @@ async fn legacy_codex_upgrade_discards_an_interrupted_claim_after_native_recover
             .is_none()
     );
     let restarted = fixture.reopen_first();
-    restarted.migrate_legacy_codex_configuration().unwrap();
+    restarted.migrate_legacy_configurations().unwrap();
     assert!(
         ownership(&restarted, ClientKind::Codex)
             .takeover_unavailable_reason

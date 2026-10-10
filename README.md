@@ -136,15 +136,18 @@ The v0.2.9 owner (version code 33) has a narrowly validated compatibility path.
 An incompatible wire protocol or ownership format still requires an owner upgrade.
 
 When upgrading an older instance, an existing hsin configuration may have no
-ownership record yet. At startup, Codex configuration is migrated when its last
-completed local write, provider, helper, current configuration and preserved
-authentication can be verified together. Paths recorded by older releases are
-compared by the location they resolve to, and in proxy mode a later rename, key
-rotation or removal of the provider that was last written does not block the
-migration as long as the configuration file still matches. Migration preserves
-the selected provider and client files, including third-party API
-authentication; official login is not required. An old local authentication
-backup alone is not proof that it belongs to the current shared configuration.
+ownership record yet. At startup, Codex and Claude Code configuration is
+migrated when its last completed local write, provider, helper, current
+configuration and preserved authentication can be verified together; for
+Claude Code, the saved values of the model-mapping keys must also still match
+that write. Paths recorded by older releases are compared by the location they
+resolve to, and in proxy mode a later rename, key rotation or removal of the
+provider that was last written does not block the migration as long as the
+configuration file still matches. Migration preserves the selected provider and
+client files, including third-party API authentication and the values that are
+restored when model mapping ends; official login is not required. An old local
+authentication backup alone is not proof that it belongs to the current shared
+configuration.
 
 Legacy state that cannot be verified belongs to no other instance, and hsin
 shows it as an unclaimed legacy configuration together with the check that

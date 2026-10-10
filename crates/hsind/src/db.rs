@@ -718,7 +718,7 @@ impl Database {
         Ok(())
     }
 
-    pub fn finish_legacy_config_claim(&self, target_id: &str) -> Result<()> {
+    pub fn finish_legacy_config_claim(&self, client: ClientKind, target_id: &str) -> Result<()> {
         let mut connection = self.connection.lock();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
@@ -726,8 +726,8 @@ impl Database {
             [format!("config_legacy_claim:{target_id}")],
         )?;
         transaction.execute(
-            "UPDATE client_state SET config_status='synchronized',updated_at=?1 WHERE client='codex'",
-            [unix_time()?],
+            "UPDATE client_state SET config_status='synchronized',updated_at=?1 WHERE client=?2",
+            params![unix_time()?, client.to_string()],
         )?;
         transaction.commit()?;
         Ok(())

@@ -188,8 +188,8 @@ async fn run(
     let _instance = InstanceGuard::acquire(&paths.lock)?;
     let app = app::App::open(&paths, codex_home, claude_config_dir)?;
     tolerate_locked(
-        "migrate legacy Codex configuration",
-        app.migrate_legacy_codex_configuration(),
+        "migrate legacy client configuration",
+        app.migrate_legacy_configurations(),
     )?;
     tolerate_locked("recover operations", app.recover_operations())?;
     tolerate_locked("initialize providers", app.initialize_providers())?;

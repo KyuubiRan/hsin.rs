@@ -177,6 +177,7 @@
   "config_takeover.legacy.state_changed": "Reason: the provider, connection mode or authentication settings in hsin no longer match its last write.",
   "config_takeover.legacy.files_changed": "Reason: the configuration or authentication file differs from what this instance last wrote.",
   "config_takeover.legacy.backup_mismatch": "Reason: the saved Codex authentication backup is missing or belongs to another configuration directory.",
+  "config_takeover.legacy.model_snapshot_mismatch": "Reason: the saved Claude Code model values no longer match the last write of this instance.",
   "config_takeover.legacy.migration_failed": "Reason: reading or verifying the legacy state failed; see the daemon log.",
   "config_takeover.legacy.unverified": "Reason: this kind of legacy configuration cannot be adopted automatically.",
   "config_takeover.legacy_recovery.codex": "To recover: in config.toml, remove model_provider = \"hsin\" and the [model_providers.hsin] tables; in auth.json, remove OPENAI_API_KEY (or sign in to Codex again). Keep everything else.",
