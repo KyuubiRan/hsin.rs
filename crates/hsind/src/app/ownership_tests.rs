@@ -1449,6 +1449,131 @@ async fn legacy_codex_upgrade_waits_for_the_original_key_before_binding_its_back
     activate(&upgraded, &custom).await;
 }
 
+async fn recover_native_claude_after_interrupted_claim(
+    mode: ConnectionMode,
+    mapped: bool,
+) -> (Instances, Target) {
+    let (fixture, _) = legacy_claude_fixture(mode, false, mapped).await;
+    let app = &fixture.first;
+    // An installed instance must not re-import providers on restart and mask
+    // the conflict caused by replaying an obsolete claim receipt.
+    app.db
+        .set_setting("providers_initialized_v1", "true")
+        .unwrap();
+    let target = Target::new(ClientKind::Claude, fixture.claude_config()).unwrap();
+    let configured: ConfigTarget = serde_json::from_str(
+        &app.db
+            .latest_completed_configuration(ClientKind::Claude)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let scope = App::managed_scope(&configured);
+    let fingerprints =
+        config::ownership_fingerprints(ClientKind::Claude, &target.config_path, &scope).unwrap();
+    let mut record = Record::unclaimed(1, scope, fingerprints);
+    record.owner = Some(app.instance.clone());
+    record.endpoint = Some(app.endpoint.read().clone());
+    app.db
+        .stage_legacy_config_claim(
+            &target.id,
+            1,
+            &serde_json::to_string(&record).unwrap(),
+            None,
+        )
+        .unwrap();
+    // The daemon stopped before publishing the sidecar; the user then
+    // restored native settings with newer model values of their own.
+    let native = "{\r\n  // 用户恢复的配置\r\n  \"env\": {\"ANTHROPIC_MODEL\": \"fresh-user-model\", \"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME\": \"Fresh Opus\"},\r\n  \"permissions\": {\"allow\": [\"Read\"]}\r\n}\r\n";
+    fs::write(fixture.claude_config(), native).unwrap();
+    let upgraded = fixture.reopen_first();
+    upgraded.migrate_legacy_configurations().unwrap();
+    assert!(target.read_record().unwrap().is_none());
+    assert!(
+        upgraded
+            .db
+            .setting(&legacy_config::legacy_claim_block_key(&target.id))
+            .unwrap()
+            .as_deref()
+            == Some("migration_failed")
+    );
+    let official = upgraded
+        .ensure_official_provider(ClientKind::Claude)
+        .unwrap();
+    activate(&upgraded, &official).await;
+    assert!(ownership(&upgraded, ClientKind::Claude).owner_is_self);
+    assert_eq!(ownership(&upgraded, ClientKind::Claude).generation, 2);
+    assert!(fs::read(fixture.claude_config()).unwrap() == native.as_bytes());
+    assert!(
+        upgraded
+            .db
+            .setting(CLAUDE_MODEL_ENV_BEFORE_KEY)
+            .unwrap()
+            .is_none()
+    );
+    (fixture, target)
+}
+
+#[tokio::test]
+async fn legacy_claude_native_recovery_discards_interrupted_claim_receipts() {
+    for mode in [ConnectionMode::Proxy, ConnectionMode::Direct] {
+        for mapped in [false, true] {
+            let (fixture, target) =
+                recover_native_claude_after_interrupted_claim(mode, mapped).await;
+            let recovered = fixture.reopen_first();
+            assert!(
+                recovered
+                    .db
+                    .setting(&format!("config_legacy_claim:{}", target.id))
+                    .unwrap()
+                    .is_none(),
+                "{mode:?} mapped={mapped}: obsolete claim receipt survived native recovery"
+            );
+            assert!(
+                recovered
+                    .db
+                    .setting(&legacy_config::legacy_claim_block_key(&target.id))
+                    .unwrap()
+                    .is_none(),
+                "{mode:?} mapped={mapped}: obsolete claim rejection survived native recovery"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_claude_native_recovery_stays_synchronized_after_restart() {
+    for mode in [ConnectionMode::Proxy, ConnectionMode::Direct] {
+        for mapped in [false, true] {
+            let (fixture, _) = recover_native_claude_after_interrupted_claim(mode, mapped).await;
+            let configured = fs::read(fixture.claude_config()).unwrap();
+            let restarted = fixture.reopen_first();
+            restarted.migrate_legacy_configurations().unwrap();
+            restarted.recover_operations().unwrap();
+            restarted.initialize_providers().unwrap();
+            restarted.reconcile_client_auth_configuration().unwrap();
+            restarted.reconcile_proxy_configurations().unwrap();
+            let status = restarted.status().unwrap();
+            let claude = status
+                .clients
+                .iter()
+                .find(|state| state.client == ClientKind::Claude)
+                .unwrap();
+            assert!(
+                claude.config_status == hsin_core::ConfigStatus::Synchronized,
+                "{mode:?} mapped={mapped}: recovered configuration became conflicted on restart"
+            );
+            assert!(ownership(&restarted, ClientKind::Claude).owner_is_self);
+            assert!(
+                ownership(&restarted, ClientKind::Claude)
+                    .takeover_unavailable_reason
+                    .is_none()
+            );
+            assert!(fs::read(fixture.claude_config()).unwrap() == configured);
+        }
+    }
+}
+
 #[tokio::test]
 async fn legacy_codex_upgrade_discards_an_interrupted_claim_after_native_recovery() {
     let fixture = Instances::new();

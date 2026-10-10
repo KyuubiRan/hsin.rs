@@ -110,14 +110,12 @@ impl App {
                 self.db.finish_operation(&id, "quarantined", None)?;
             }
         }
-        if target.client == ClientKind::Codex {
-            // A fresh native baseline supersedes an interrupted legacy claim;
-            // its old generation must not be replayed on the next startup.
-            self.db
-                .delete_setting(&format!("config_legacy_claim:{}", target.id))?;
-            self.db
-                .delete_setting(&super::legacy_config::legacy_claim_block_key(&target.id))?;
-        }
+        // A fresh native baseline supersedes either client's interrupted
+        // legacy claim; its old generation must not replay on the next startup.
+        self.db
+            .delete_setting(&format!("config_legacy_claim:{}", target.id))?;
+        self.db
+            .delete_setting(&super::legacy_config::legacy_claim_block_key(&target.id))?;
         Ok(())
     }
 
